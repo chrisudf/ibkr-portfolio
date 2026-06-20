@@ -1,5 +1,9 @@
 /* IBKR Portfolio Dashboard — frontend */
 
+// Symbols treated as cash equivalents (money-market / short-T ETFs).
+// They're held in the brokerage account but used as parked cash.
+const CASH_EQUIVALENTS = new Set(["BOXX", "SGOV"]);
+
 const fmtMoney = (v, digits = 0) => {
   const sign = v < 0 ? "-" : "";
   const abs = Math.abs(v);
@@ -27,7 +31,14 @@ async function loadPortfolio() {
 }
 
 function render(data) {
-  const { nav, stocks, options, performance, account, statement } = data;
+  const { nav, options, performance, account, statement } = data;
+  // Split stocks into real positions vs cash equivalents
+  const cashEqHoldings = data.stocks.filter(s => CASH_EQUIVALENTS.has(s.symbol));
+  const stocks = data.stocks.filter(s => !CASH_EQUIVALENTS.has(s.symbol));
+  const cashEqValue = cashEqHoldings.reduce((s, x) => s + x.value, 0);
+  const cashEqCost = cashEqHoldings.reduce((s, x) => s + x.cost_basis, 0);
+  const adjStock = nav.stock - cashEqValue;
+  const adjCash = nav.cash + cashEqValue;
   const totalNav = nav.total || (nav.cash + nav.stock + nav.options);
 
   // Account line — show masked account + period, hide name
@@ -40,20 +51,22 @@ function render(data) {
   $("kpi-nav").textContent = fmtMoney(totalNav);
   $("kpi-twr").textContent = nav.twr ? `时间加权收益率 ${fmtPct(nav.twr, 2)}` : "时间加权收益率 —";
 
-  $("kpi-stock").textContent = fmtMoney(nav.stock);
-  $("kpi-stock-pct").textContent = `占总净值 ${fmtPct(nav.stock / totalNav)}`;
+  $("kpi-stock").textContent = fmtMoney(adjStock);
+  $("kpi-stock-pct").textContent = `占总净值 ${fmtPct(adjStock / totalNav)}`;
 
-  $("kpi-options").textContent = fmtMoney(nav.options);
-  // Bullish: long call or short put; Bearish: short call or long put
-  const isBullish = (o) => (o.quantity > 0 && o.right === "C") || (o.quantity < 0 && o.right === "P");
-  const bullVal = options.filter(isBullish).reduce((s, o) => s + o.value, 0);
-  const bearVal = options.filter(o => !isBullish(o)).reduce((s, o) => s + o.value, 0);
-  $("kpi-options-detail").textContent = `看多 ${fmtMoney(bullVal)} · 看空 ${fmtMoney(bearVal)}`;
+  // Gross exposure: sum of long-contract market value vs sum of |short-contract market value|
+  const grossLong = options.filter(o => o.value > 0).reduce((s, o) => s + o.value, 0);
+  const grossShort = options.filter(o => o.value < 0).reduce((s, o) => s + Math.abs(o.value), 0);
+  $("kpi-options").textContent = fmtMoney(grossLong + grossShort);
+  $("kpi-options-detail").textContent = `买入 ${fmtMoney(grossLong)} · 卖出 ${fmtMoney(grossShort)}`;
 
-  $("kpi-cash").textContent = fmtMoney(nav.cash);
-  $("kpi-cash-pct").textContent = `占总净值 ${fmtPct(nav.cash / totalNav)}`;
+  $("kpi-cash").textContent = fmtMoney(adjCash);
+  const cashEqLabel = cashEqValue > 0
+    ? `含 ${cashEqHoldings.map(h => h.symbol).join("/")} ${fmtMoney(cashEqValue)}`
+    : `占总净值 ${fmtPct(adjCash / totalNav)}`;
+  $("kpi-cash-pct").textContent = cashEqLabel;
 
-  const unr = stocks.reduce((s, x) => s + x.unrealized_pl, 0) + options.reduce((s, x) => s + x.unrealized_pl, 0);
+  const unr = data.stocks.reduce((s, x) => s + x.unrealized_pl, 0) + options.reduce((s, x) => s + x.unrealized_pl, 0);
   const kpiUnr = $("kpi-unrealized");
   kpiUnr.textContent = fmtMoney(unr);
   kpiUnr.classList.toggle("up", unr >= 0);
@@ -63,11 +76,14 @@ function render(data) {
   // Treemap
   renderTreemap(stocks);
 
-  // Allocation bar
-  renderAllocation(nav, totalNav);
+  // Allocation bar — position view: cash, stock, long options (MV)
+  // Short options excluded (their premium is already in cash); shown as a footnote.
+  const longOptMV = options.filter(o => o.value > 0).reduce((s, o) => s + o.value, 0);
+  const shortOptMV = options.filter(o => o.value < 0).reduce((s, o) => s + Math.abs(o.value), 0);
+  renderAllocation({ cash: adjCash, stock: adjStock, longOptions: longOptMV, shortOptionsNote: shortOptMV }, totalNav);
 
-  // Holdings
-  renderHoldings(stocks);
+  // Holdings — show all positions including cash equivalents (tagged)
+  renderHoldings(data.stocks);
 
   // Options
   renderOptions(options);
@@ -134,13 +150,12 @@ function renderTreemap(stocks) {
 function renderAllocation(nav, totalNav) {
   const cashAbs = Math.max(nav.cash, 0);
   const stockAbs = Math.max(nav.stock, 0);
-  // For options use absolute exposure (long + |short|) to surface risk; but use net for share of NAV
-  const optAbs = Math.abs(nav.options);
-  const total = cashAbs + stockAbs + optAbs || 1;
+  const longOptAbs = Math.max(nav.longOptions || 0, 0);
+  const total = cashAbs + stockAbs + longOptAbs || 1;
   const segs = [
     { label: "现金", value: cashAbs, color: "var(--accent-2)" },
     { label: "股票", value: stockAbs, color: "var(--cyan)" },
-    { label: "期权", value: optAbs, color: "var(--amber)" },
+    { label: "期权多头", value: longOptAbs, color: "var(--amber)" },
   ];
 
   const bar = $("alloc-bar");
@@ -166,9 +181,13 @@ function renderAllocation(nav, totalNav) {
     bar.appendChild(div);
   }
   const legend = $("alloc-legend");
-  legend.innerHTML = segs.map(s =>
+  const segLines = segs.map(s =>
     `<div><span class="dot" style="background:${s.color}"></span>${s.label} ${fmtMoney(s.value)} · ${(s.value/total*100).toFixed(1)}%</div>`
-  ).join("");
+  );
+  if (nav.shortOptionsNote > 0) {
+    segLines.push(`<div class="muted" style="margin-left:auto">另有卖方期权义务 ${fmtMoney(nav.shortOptionsNote)}（权利金已在现金中）</div>`);
+  }
+  legend.innerHTML = segLines.join("");
 }
 
 const stocksSort = { key: "value", dir: "desc" };
@@ -188,8 +207,9 @@ function renderHoldings(stocks) {
   });
   for (const s of enriched) {
     const tr = document.createElement("tr");
+    const cashEqTag = CASH_EQUIVALENTS.has(s.symbol) ? ` <span class="tag tag-flow-in">现金等价</span>` : "";
     tr.innerHTML = `
-      <td><b>${s.symbol}</b></td>
+      <td><b>${s.symbol}</b>${cashEqTag}</td>
       <td class="num">${fmtNum(s.quantity, 4)}</td>
       <td class="num">${fmtMoney(s.cost_price, 2)}</td>
       <td class="num">${fmtMoney(s.close_price, 2)}</td>
