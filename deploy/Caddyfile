@@ -1,20 +1,17 @@
 # Replace `your-domain.com` with your actual domain (or use :443 with self-signed
 # if you don't have one yet). Caddy will auto-fetch a Let's Encrypt cert.
 #
-# Generate the basicauth hash on the VPS first:
+# Generate the basic_auth hash on the VPS first:
 #   docker run --rm caddy:2-alpine caddy hash-password --plaintext 'YOUR_PASSWORD'
 # and paste the $2a$14$... output below.
 
 your-domain.com {
     encode gzip
 
-    basicauth /* {
+    basic_auth /* {
         # username   bcrypt-hash
         admin   REPLACE_WITH_HASH
     }
 
-    reverse_proxy app:8000 {
-        header_up X-Forwarded-Proto {scheme}
-        header_up X-Forwarded-For {remote}
-    }
+    reverse_proxy app:8000
 }
