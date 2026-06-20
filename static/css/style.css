@@ -179,6 +179,8 @@ table.holdings tr:hover td { background: rgba(255,255,255,0.02); }
 .tag-short { background: rgba(251, 191, 36, 0.15); color: var(--amber); }
 .tag-bull { background: rgba(34, 255, 122, 0.15); color: var(--green); }
 .tag-bear { background: rgba(255, 51, 85, 0.15); color: var(--red); }
+.tag-flow-in { background: rgba(34, 211, 238, 0.15); color: var(--cyan); }
+.tag-flow-out { background: rgba(167, 139, 250, 0.15); color: var(--accent-2); }
 
 th.sortable { cursor: pointer; user-select: none; transition: color 0.15s; }
 th.sortable:hover { color: var(--accent); }

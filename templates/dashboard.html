@@ -114,10 +114,14 @@
           <table class="holdings">
             <thead>
               <tr>
-                <th>合约</th><th>动作</th><th>观点</th><th class="num">行权价</th><th>到期</th>
-                <th class="num">张数</th><th class="num">成本</th>
-                <th class="num">市值</th>
+                <th>合约</th><th>动作</th><th>观点</th>
+                <th class="num">行权价</th>
+                <th class="sortable" data-sort="expiry_ts">到期 <span class="sort-ind"></span></th>
+                <th class="num sortable" data-sort="abs_qty">张数 <span class="sort-ind"></span></th>
+                <th class="num sortable" data-sort="abs_cost">权利金 <span class="sort-ind"></span></th>
+                <th class="num sortable" data-sort="abs_value">市值 <span class="sort-ind"></span></th>
                 <th class="num sortable" data-sort="unrealized_pl">浮盈/亏 <span class="sort-ind"></span></th>
+                <th class="num sortable" data-sort="ret">回报 <span class="sort-ind"></span></th>
               </tr>
             </thead>
             <tbody id="options-body"></tbody>

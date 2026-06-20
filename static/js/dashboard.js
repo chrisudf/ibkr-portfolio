@@ -212,7 +212,29 @@ function renderOptions(options) {
   panel.hidden = false;
   const tbody = $("options-body");
   tbody.innerHTML = "";
-  const enriched = options.map(o => ({ ...o, abs_value: Math.abs(o.value) }));
+  const MONTHS = { JAN:0,FEB:1,MAR:2,APR:3,MAY:4,JUN:5,JUL:6,AUG:7,SEP:8,OCT:9,NOV:10,DEC:11 };
+  const parseExpiry = (s) => {
+    const m = (s || "").match(/^(\d{1,2})([A-Z]{3})(\d{2})$/);
+    if (!m) return Infinity;
+    return new Date(2000 + parseInt(m[3]), MONTHS[m[2]] ?? 0, parseInt(m[1])).getTime();
+  };
+  const fmtExpiry = (ts) => {
+    if (!isFinite(ts)) return "—";
+    const d = new Date(ts);
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    return `${d.getFullYear()}/${mm}/${dd}`;
+  };
+  const enriched = options.map(o => ({
+    ...o,
+    abs_value: Math.abs(o.value),
+    abs_cost: Math.abs(o.cost_basis),
+    abs_qty: Math.abs(o.quantity),
+    expiry_ts: parseExpiry(o.expiry),
+    expiry_fmt: fmtExpiry(parseExpiry(o.expiry)),
+    // Return = P/L as % of premium basis (works for both long and short options)
+    ret: o.cost_basis ? o.unrealized_pl / Math.abs(o.cost_basis) : 0,
+  }));
   enriched.sort((a, b) => {
     const av = a[optionsSort.key], bv = b[optionsSort.key];
     return optionsSort.dir === "asc" ? av - bv : bv - av;
@@ -228,17 +250,20 @@ function renderOptions(options) {
     const biasLabel = isBullish ? "看多" : "看空";
     const biasClass = isBullish ? "tag-bull" : "tag-bear";
     const rightTag = isCall ? `<span class="tag tag-call">CALL</span>` : `<span class="tag tag-put">PUT</span>`;
+    // Premium cash-flow direction: buy = paid (付), sell = received (收)
+    const flowTag = isBuy ? `<span class="tag tag-flow-out">付</span>` : `<span class="tag tag-flow-in">收</span>`;
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td><b>${o.underlying}</b> ${rightTag}</td>
       <td><span class="tag ${actionClass}">${actionLabel}</span></td>
       <td><span class="tag ${biasClass}">${biasLabel}</span></td>
       <td class="num">${o.strike ? "$" + o.strike : "—"}</td>
-      <td>${o.expiry || "—"}</td>
+      <td>${o.expiry_fmt}</td>
       <td class="num">${o.quantity}</td>
-      <td class="num muted">${fmtMoney(o.cost_basis, 0)}</td>
-      <td class="num">${fmtMoney(o.value, 0)}</td>
+      <td class="num">${fmtMoney(Math.abs(o.cost_basis), 0)} ${flowTag}</td>
+      <td class="num">${fmtMoney(Math.abs(o.value), 0)}</td>
       <td class="num ${o.unrealized_pl >= 0 ? "up" : "down"}">${o.unrealized_pl >= 0 ? "+" : ""}${fmtMoney(o.unrealized_pl, 0)}</td>
+      <td class="num ${o.ret >= 0 ? "up" : "down"}">${o.ret >= 0 ? "+" : ""}${(o.ret * 100).toFixed(1)}%</td>
     `;
     tbody.appendChild(tr);
   }
