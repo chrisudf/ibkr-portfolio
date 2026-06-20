@@ -30,9 +30,11 @@ function render(data) {
   const { nav, stocks, options, performance, account, statement } = data;
   const totalNav = nav.total || (nav.cash + nav.stock + nav.options);
 
-  // Account line — keep period only, hide personal info
+  // Account line — show masked account + period, hide name
+  const acct = account.Account || "";
+  const masked = acct ? acct.slice(0, 4) + "*".repeat(Math.max(0, acct.length - 6)) + acct.slice(-2) : "";
   const period = statement.Period || "";
-  $("account-line").textContent = period || "已导入";
+  $("account-line").textContent = [masked, period].filter(Boolean).join(" · ") || "已导入";
 
   // KPIs
   $("kpi-nav").textContent = fmtMoney(totalNav);
@@ -96,19 +98,32 @@ function renderTreemap(stocks) {
 
   for (const leaf of root.leaves()) {
     const d = leaf.data;
+    const w = leaf.x1 - leaf.x0;
+    const h = leaf.y1 - leaf.y0;
     const div = document.createElement("div");
     div.className = "tile";
     div.style.left = leaf.x0 + "px";
     div.style.top = leaf.y0 + "px";
-    div.style.width = (leaf.x1 - leaf.x0) + "px";
-    div.style.height = (leaf.y1 - leaf.y0) + "px";
+    div.style.width = w + "px";
+    div.style.height = h + "px";
     div.style.background = color(d.unrealized_pl);
-    const small = (leaf.x1 - leaf.x0) < 70 || (leaf.y1 - leaf.y0) < 50;
-    div.innerHTML = small
-      ? `<div class="sym">${d.symbol}</div>`
-      : `<div class="sym">${d.symbol}</div>
-         <div class="meta">${fmtMoney(d.value)}</div>
-         <div class="pnl">${d.unrealized_pl >= 0 ? "+" : ""}${fmtMoney(d.unrealized_pl)}</div>`;
+
+    // Scale font sizes proportionally to tile size, with a floor
+    const symSize = Math.max(8, Math.min(16, Math.min(w / 5, h / 4)));
+    const metaSize = Math.max(8, symSize * 0.7);
+    div.style.padding = w < 60 ? "4px 6px" : "10px 12px";
+
+    if (w < 36 || h < 28) {
+      // Tile too small for any text
+      div.innerHTML = "";
+    } else if (w < 70 || h < 60) {
+      div.innerHTML = `<div class="sym" style="font-size:${symSize}px">${d.symbol}</div>`;
+    } else {
+      div.innerHTML = `
+        <div class="sym" style="font-size:${symSize}px">${d.symbol}</div>
+        <div class="meta" style="font-size:${metaSize}px">${fmtMoney(d.value)}</div>
+        <div class="pnl" style="font-size:${metaSize}px">${d.unrealized_pl >= 0 ? "+" : ""}${fmtMoney(d.unrealized_pl)}</div>`;
+    }
     div.title = `${d.symbol}\n市值 ${fmtMoney(d.value, 2)}\n成本 ${fmtMoney(d.cost_basis, 2)}\n浮盈 ${fmtMoney(d.unrealized_pl, 2)}`;
     el.appendChild(div);
   }
@@ -133,9 +148,19 @@ function renderAllocation(nav, totalNav) {
     const div = document.createElement("div");
     div.className = "alloc-seg";
     div.style.background = s.color;
-    div.style.width = (s.value / total * 100) + "%";
     const pct = (s.value / total * 100);
-    div.textContent = pct > 6 ? `${s.label} ${pct.toFixed(1)}%` : "";
+    div.style.width = pct + "%";
+    // Scale font with segment width so smaller slices still show
+    if (pct >= 6) {
+      div.style.fontSize = "12px";
+      div.textContent = `${s.label} ${pct.toFixed(1)}%`;
+    } else if (pct >= 2.5) {
+      div.style.fontSize = "10px";
+      div.textContent = `${pct.toFixed(1)}%`;
+    } else {
+      div.textContent = "";
+    }
+    div.title = `${s.label} ${fmtMoney(s.value)} · ${pct.toFixed(1)}%`;
     bar.appendChild(div);
   }
   const legend = $("alloc-legend");
