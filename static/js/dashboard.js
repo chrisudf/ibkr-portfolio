@@ -44,9 +44,11 @@ function render(data) {
   $("kpi-stock-pct").textContent = `占总净值 ${fmtPct(nav.stock / totalNav)}`;
 
   $("kpi-options").textContent = fmtMoney(nav.options);
-  const longOpt = options.filter(o => o.value > 0).reduce((s, o) => s + o.value, 0);
-  const shortOpt = options.filter(o => o.value < 0).reduce((s, o) => s + o.value, 0);
-  $("kpi-options-detail").textContent = `多 ${fmtMoney(longOpt)} · 空 ${fmtMoney(shortOpt)}`;
+  // Bullish: long call or short put; Bearish: short call or long put
+  const isBullish = (o) => (o.quantity > 0 && o.right === "C") || (o.quantity < 0 && o.right === "P");
+  const bullVal = options.filter(isBullish).reduce((s, o) => s + o.value, 0);
+  const bearVal = options.filter(o => !isBullish(o)).reduce((s, o) => s + o.value, 0);
+  $("kpi-options-detail").textContent = `看多 ${fmtMoney(bullVal)} · 看空 ${fmtMoney(bearVal)}`;
 
   $("kpi-cash").textContent = fmtMoney(nav.cash);
   $("kpi-cash-pct").textContent = `占总净值 ${fmtPct(nav.cash / totalNav)}`;
