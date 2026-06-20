@@ -300,7 +300,7 @@ function attachSorters(currentDataRef) {
   });
 }
 
-let rankMode = "stocks";
+let rankMode = "underlying";
 
 function optionUnderlying(sym) {
   // "NVDA 17JUL26 155 P" -> "NVDA"
@@ -330,15 +330,39 @@ function buildRankEntries(bySymbol, mode) {
       note: `已实现 ${fmtMoney(v.realized, 0)} · 浮动 ${fmtMoney(v.unrealized, 0)}`,
     }));
   }
+  if (mode === "underlying") {
+    // Strategy P&L: per underlying, sum stock + options (realized + unrealized)
+    const byU = {};
+    for (const x of arr) {
+      const isStock = x.asset_category === "Stocks";
+      const u = isStock ? x.sym : optionUnderlying(x.sym);
+      if (!byU[u]) byU[u] = { sR: 0, sU: 0, oR: 0, oU: 0 };
+      if (isStock) {
+        byU[u].sR += x.realized_total;
+        byU[u].sU += x.unrealized_total;
+      } else {
+        byU[u].oR += x.realized_total;
+        byU[u].oU += x.unrealized_total;
+      }
+    }
+    return Object.entries(byU).map(([u, v]) => {
+      const total = v.sR + v.sU + v.oR + v.oU;
+      const parts = [];
+      if (v.sR || v.sU) parts.push(`股 ${fmtMoney(v.sR + v.sU, 0)}`);
+      if (v.oR || v.oU) parts.push(`期权 ${fmtMoney(v.oR + v.oU, 0)}`);
+      return { key: u, value: total, note: parts.join(" · ") || "—" };
+    });
+  }
   // all realized
   return arr.map(x => ({ key: x.sym, value: x.realized_total, note: "已实现" }));
 }
 
 function renderRankings(bySymbol) {
   const explain = {
+    underlying: "按标的合并：股票 + 期权的「已实现 + 浮动」全部相加，反映你在该 ticker 上的真实 thesis 净盈亏",
     stocks: "仅看股票的已实现盈亏，不受期权展期干扰",
-    options_underlying: "同一标的所有期权合约的「已实现 + 浮动」合并，反映真实策略 P&L（包含未平仓的 premium）",
-    all: "全部标的的原始已实现盈亏",
+    options_underlying: "同一标的所有期权合约的「已实现 + 浮动」合并，包含未平仓的 premium",
+    all: "全部标的的原始已实现盈亏（含展期噪声，仅供对账）",
   };
   $("rank-explain").textContent = explain[rankMode];
 
