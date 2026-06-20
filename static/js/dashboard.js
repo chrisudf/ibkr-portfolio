@@ -248,12 +248,58 @@ function attachSorters(currentDataRef) {
   });
 }
 
-function renderRankings(bySymbol) {
+let rankMode = "stocks";
+
+function optionUnderlying(sym) {
+  // "NVDA 17JUL26 155 P" -> "NVDA"
+  const m = sym.match(/^([A-Z\.]+)\s/);
+  return m ? m[1] : sym;
+}
+
+function buildRankEntries(bySymbol, mode) {
   const arr = Object.entries(bySymbol).map(([sym, p]) => ({ sym, ...p }));
-  const winners = arr.filter(x => x.realized_total > 0).sort((a, b) => b.realized_total - a.realized_total).slice(0, 8);
-  const losers = arr.filter(x => x.realized_total < 0).sort((a, b) => a.realized_total - b.realized_total).slice(0, 8);
-  $("winners").innerHTML = winners.map(w => `<li><span class="sym">${w.sym}</span><span class="up">+${fmtMoney(w.realized_total, 0)}</span></li>`).join("") || '<li class="muted">无</li>';
-  $("losers").innerHTML = losers.map(w => `<li><span class="sym">${w.sym}</span><span class="down">${fmtMoney(w.realized_total, 0)}</span></li>`).join("") || '<li class="muted">无</li>';
+  if (mode === "stocks") {
+    return arr
+      .filter(x => x.asset_category === "Stocks")
+      .map(x => ({ key: x.sym, value: x.realized_total, note: "已实现" }));
+  }
+  if (mode === "options_underlying") {
+    const byU = {};
+    for (const x of arr) {
+      if (!x.asset_category || x.asset_category === "Stocks") continue;
+      const u = optionUnderlying(x.sym);
+      if (!byU[u]) byU[u] = { realized: 0, unrealized: 0 };
+      byU[u].realized += x.realized_total;
+      byU[u].unrealized += x.unrealized_total;
+    }
+    return Object.entries(byU).map(([u, v]) => ({
+      key: u,
+      value: v.realized + v.unrealized,
+      note: `已实现 ${fmtMoney(v.realized, 0)} · 浮动 ${fmtMoney(v.unrealized, 0)}`,
+    }));
+  }
+  // all realized
+  return arr.map(x => ({ key: x.sym, value: x.realized_total, note: "已实现" }));
+}
+
+function renderRankings(bySymbol) {
+  const explain = {
+    stocks: "仅看股票的已实现盈亏，不受期权展期干扰",
+    options_underlying: "同一标的所有期权合约的「已实现 + 浮动」合并，反映真实策略 P&L（包含未平仓的 premium）",
+    all: "全部标的的原始已实现盈亏",
+  };
+  $("rank-explain").textContent = explain[rankMode];
+
+  const entries = buildRankEntries(bySymbol, rankMode);
+  const winners = entries.filter(x => x.value > 0).sort((a, b) => b.value - a.value).slice(0, 10);
+  const losers = entries.filter(x => x.value < 0).sort((a, b) => a.value - b.value).slice(0, 10);
+  const render = (rows, cls, prefix) => rows.map(r =>
+    `<li><span class="sym">${r.key}</span>
+       <span class="${cls}">${prefix}${fmtMoney(r.value, 0)}<span class="muted" style="margin-left:8px;font-weight:400;font-size:11px">${r.note}</span></span>
+     </li>`
+  ).join("") || '<li class="muted">无</li>';
+  $("winners").innerHTML = render(winners, "up", "+");
+  $("losers").innerHTML = render(losers, "down", "");
 }
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -275,5 +321,15 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   attachSorters(currentDataRef);
+
+  document.querySelectorAll("#rank-mode button").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll("#rank-mode button").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      rankMode = btn.dataset.mode;
+      if (currentDataRef.data) renderRankings(currentDataRef.data.performance.by_symbol);
+    });
+  });
+
   loadPortfolio();
 });

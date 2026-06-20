@@ -95,7 +95,7 @@
                 <th>标的</th><th class="num">数量</th><th class="num">成本价</th>
                 <th class="num">现价</th><th class="num">成本</th><th class="num">市值</th>
                 <th class="num sortable" data-sort="unrealized_pl">浮盈/亏 <span class="sort-ind"></span></th>
-                <th class="num">回报</th>
+                <th class="num sortable" data-sort="ret">回报 <span class="sort-ind"></span></th>
                 <th class="num sortable" data-sort="weight">占比 <span class="sort-ind"></span></th>
               </tr>
             </thead>
@@ -128,9 +128,14 @@
       <!-- Realized perf -->
       <section class="panel">
         <div class="panel-head">
-          <h2>已实现盈亏 Top 标的</h2>
-          <span class="panel-note">本期统计周期内</span>
+          <h2>盈亏 Top 标的</h2>
+          <div class="seg-toggle" id="rank-mode">
+            <button data-mode="stocks" class="active">股票（已实现）</button>
+            <button data-mode="options_underlying">期权（按标的·含浮动）</button>
+            <button data-mode="all">全部已实现</button>
+          </div>
         </div>
+        <div class="panel-note" id="rank-explain" style="margin-bottom:12px"></div>
         <div class="dual-list">
           <div>
             <h3 class="up">盈利榜</h3>
