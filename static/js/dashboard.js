@@ -10,6 +10,8 @@ const fmtNum = (v, digits = 2) => Number(v).toLocaleString("en-US", { maximumFra
 
 const $ = (id) => document.getElementById(id);
 
+const currentDataRef = { data: null };
+
 async function loadPortfolio() {
   const res = await fetch("/api/portfolio");
   const data = await res.json();
@@ -20,6 +22,7 @@ async function loadPortfolio() {
   }
   $("empty").hidden = true;
   $("dashboard").hidden = false;
+  currentDataRef.data = data;
   render(data);
 }
 
@@ -27,11 +30,9 @@ function render(data) {
   const { nav, stocks, options, performance, account, statement } = data;
   const totalNav = nav.total || (nav.cash + nav.stock + nav.options);
 
-  // Account line
-  const name = account.Name || "";
-  const acct = account.Account || "";
+  // Account line — keep period only, hide personal info
   const period = statement.Period || "";
-  $("account-line").textContent = [name, acct, period].filter(Boolean).join(" · ");
+  $("account-line").textContent = period || "已导入";
 
   // KPIs
   $("kpi-nav").textContent = fmtMoney(totalNav);
@@ -88,9 +89,9 @@ function renderTreemap(stocks) {
   const maxAbs = d3.max(stocks, d => Math.abs(d.unrealized_pl)) || 1;
   const color = (pl) => {
     const t = Math.max(-1, Math.min(1, pl / maxAbs));
-    // green for positive, red for negative, balanced lightness
-    if (t >= 0) return d3.interpolateRgb("#1e3a2b", "#4ade80")(0.4 + t * 0.6);
-    return d3.interpolateRgb("#3a1e23", "#f87171")(0.4 + Math.abs(t) * 0.6);
+    // vibrant green for positive, vibrant red for negative
+    if (t >= 0) return d3.interpolateRgb("#16a34a", "#22ff7a")(0.3 + t * 0.7);
+    return d3.interpolateRgb("#dc2626", "#ff3355")(0.3 + Math.abs(t) * 0.7);
   };
 
   for (const leaf of root.leaves()) {
@@ -143,12 +144,22 @@ function renderAllocation(nav, totalNav) {
   ).join("");
 }
 
+const stocksSort = { key: "value", dir: "desc" };
+
 function renderHoldings(stocks) {
   const tbody = $("holdings-body");
   tbody.innerHTML = "";
   const totalVal = stocks.reduce((s, x) => s + x.value, 0) || 1;
-  for (const s of stocks) {
-    const ret = s.cost_basis ? s.unrealized_pl / s.cost_basis : 0;
+  const enriched = stocks.map(s => ({
+    ...s,
+    ret: s.cost_basis ? s.unrealized_pl / s.cost_basis : 0,
+    weight: s.value / totalVal,
+  }));
+  enriched.sort((a, b) => {
+    const av = a[stocksSort.key], bv = b[stocksSort.key];
+    return stocksSort.dir === "asc" ? av - bv : bv - av;
+  });
+  for (const s of enriched) {
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td><b>${s.symbol}</b></td>
@@ -158,12 +169,15 @@ function renderHoldings(stocks) {
       <td class="num muted">${fmtMoney(s.cost_basis, 0)}</td>
       <td class="num">${fmtMoney(s.value, 0)}</td>
       <td class="num ${s.unrealized_pl >= 0 ? "up" : "down"}">${s.unrealized_pl >= 0 ? "+" : ""}${fmtMoney(s.unrealized_pl, 0)}</td>
-      <td class="num ${ret >= 0 ? "up" : "down"}">${(ret * 100).toFixed(1)}%</td>
-      <td class="num">${(s.value / totalVal * 100).toFixed(1)}%</td>
+      <td class="num ${s.ret >= 0 ? "up" : "down"}">${(s.ret * 100).toFixed(1)}%</td>
+      <td class="num">${(s.weight * 100).toFixed(1)}%</td>
     `;
     tbody.appendChild(tr);
   }
+  updateSortIndicators("holdings-body", stocksSort);
 }
+
+const optionsSort = { key: "abs_value", dir: "desc" };
 
 function renderOptions(options) {
   const panel = $("options-panel");
@@ -171,13 +185,27 @@ function renderOptions(options) {
   panel.hidden = false;
   const tbody = $("options-body");
   tbody.innerHTML = "";
-  for (const o of options) {
-    const dirTag = o.quantity > 0 ? `<span class="tag tag-long">多</span>` : `<span class="tag tag-short">空</span>`;
-    const rightTag = o.right === "C" ? `<span class="tag tag-call">CALL</span>` : `<span class="tag tag-put">PUT</span>`;
+  const enriched = options.map(o => ({ ...o, abs_value: Math.abs(o.value) }));
+  enriched.sort((a, b) => {
+    const av = a[optionsSort.key], bv = b[optionsSort.key];
+    return optionsSort.dir === "asc" ? av - bv : bv - av;
+  });
+  for (const o of enriched) {
+    const isBuy = o.quantity > 0;
+    const isCall = o.right === "C";
+    // Action: buy/sell × call/put
+    const actionLabel = (isBuy ? "买入" : "卖出") + (isCall ? "看涨" : "看跌");
+    const actionClass = isBuy ? "tag-long" : "tag-short";
+    // Market bias: long call & short put = bullish; short call & long put = bearish
+    const isBullish = (isBuy && isCall) || (!isBuy && !isCall);
+    const biasLabel = isBullish ? "看多" : "看空";
+    const biasClass = isBullish ? "tag-bull" : "tag-bear";
+    const rightTag = isCall ? `<span class="tag tag-call">CALL</span>` : `<span class="tag tag-put">PUT</span>`;
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td><b>${o.underlying}</b> ${rightTag}</td>
-      <td>${dirTag}</td>
+      <td><span class="tag ${actionClass}">${actionLabel}</span></td>
+      <td><span class="tag ${biasClass}">${biasLabel}</span></td>
       <td class="num">${o.strike ? "$" + o.strike : "—"}</td>
       <td>${o.expiry || "—"}</td>
       <td class="num">${o.quantity}</td>
@@ -187,6 +215,37 @@ function renderOptions(options) {
     `;
     tbody.appendChild(tr);
   }
+  updateSortIndicators("options-body", optionsSort);
+}
+
+function updateSortIndicators(tbodyId, state) {
+  const table = document.getElementById(tbodyId).closest("table");
+  table.querySelectorAll("th.sortable").forEach(th => {
+    th.classList.remove("sort-asc", "sort-desc");
+    if (th.dataset.sort === state.key) {
+      th.classList.add(state.dir === "asc" ? "sort-asc" : "sort-desc");
+    }
+  });
+}
+
+function attachSorters(currentDataRef) {
+  document.querySelectorAll("table.holdings").forEach(table => {
+    const isOptions = table.querySelector("#options-body");
+    const state = isOptions ? optionsSort : stocksSort;
+    table.querySelectorAll("th.sortable").forEach(th => {
+      th.addEventListener("click", () => {
+        const key = th.dataset.sort;
+        if (state.key === key) {
+          state.dir = state.dir === "asc" ? "desc" : "asc";
+        } else {
+          state.key = key;
+          state.dir = "desc";
+        }
+        if (isOptions) renderOptions(currentDataRef.data.options);
+        else renderHoldings(currentDataRef.data.stocks);
+      });
+    });
+  });
 }
 
 function renderRankings(bySymbol) {
@@ -215,5 +274,6 @@ document.addEventListener("DOMContentLoaded", () => {
     setTimeout(() => $("status").textContent = "", 2500);
   });
 
+  attachSorters(currentDataRef);
   loadPortfolio();
 });

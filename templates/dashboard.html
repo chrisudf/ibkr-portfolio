@@ -94,7 +94,9 @@
               <tr>
                 <th>标的</th><th class="num">数量</th><th class="num">成本价</th>
                 <th class="num">现价</th><th class="num">成本</th><th class="num">市值</th>
-                <th class="num">浮盈/亏</th><th class="num">回报</th><th class="num">占比</th>
+                <th class="num sortable" data-sort="unrealized_pl">浮盈/亏 <span class="sort-ind"></span></th>
+                <th class="num">回报</th>
+                <th class="num sortable" data-sort="weight">占比 <span class="sort-ind"></span></th>
               </tr>
             </thead>
             <tbody id="holdings-body"></tbody>
@@ -112,9 +114,10 @@
           <table class="holdings">
             <thead>
               <tr>
-                <th>合约</th><th>方向</th><th class="num">行权价</th><th>到期</th>
+                <th>合约</th><th>动作</th><th>观点</th><th class="num">行权价</th><th>到期</th>
                 <th class="num">张数</th><th class="num">成本</th>
-                <th class="num">市值</th><th class="num">浮盈/亏</th>
+                <th class="num">市值</th>
+                <th class="num sortable" data-sort="unrealized_pl">浮盈/亏 <span class="sort-ind"></span></th>
               </tr>
             </thead>
             <tbody id="options-body"></tbody>
