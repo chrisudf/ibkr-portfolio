@@ -1,17 +1,70 @@
 #!/usr/bin/env bash
 #
-# Sync IBKR Activity Flex Query → portfolio dashboard.
+# ============================================================================
+# ibkr_sync.sh — Pull IBKR Activity Flex CSV and push it to the dashboard.
+# ============================================================================
 #
-# Reads credentials from scripts/sync.env (next to this script). Example:
-#     ACCOUNTS="TOKEN_A:QUERY_ID_A TOKEN_B:QUERY_ID_B"
-#     BASIC_AUTH="admin:yourpassword"
-#     UPLOAD_URL="https://nomad403.cc/api/upload"
+# WHAT THIS SCRIPT DOES (high level)
+# -----------------------------------
+#   1. Reads credentials from scripts/sync.env (gitignored).
+#   2. For each (TOKEN, QUERY_ID) pair in $ACCOUNTS:
+#        a. POST  FlexStatementService.SendRequest    → server returns a
+#           ReferenceCode (the queued report's ID).
+#        b. Poll  FlexStatementService.GetStatement   every 5 seconds, up to
+#           30 times (2.5 min total). While IBKR is still building the CSV
+#           the response contains "Statement generation in progress"; once
+#           ready the response *body* is the raw CSV.
+#        c. Save the CSV to a tempdir.
+#        d. POST  the CSV multipart to $UPLOAD_URL with HTTP Basic Auth.
+#           The dashboard's /api/upload route auto-detects format, runs the
+#           Flex parser, splits by ClientAccountID and writes per-account
+#           JSON under uploads/.
+#   3. If a step fails with a *transient* error (1001 throttle, 1019 rate
+#      limit, network blip, …) the whole sync_one() retries after a delay
+#      (see RETRY_DELAYS below). Permanent errors (1011/1014/1015/1018/1020 —
+#      invalid token, invalid query, parameter errors) abort immediately.
 #
-# Then run manually:  ./ibkr_sync.sh
-# Or via cron — see scripts/README.md
+# HOW IT'S AUTO-RUN
+# -----------------
+# Cron on the droplet, one weekly entry. From `crontab -e`:
 #
+#     0 16 * * 6 /opt/ibkr-portfolio/scripts/ibkr_sync.sh \
+#                >> /var/log/ibkr_sync.log 2>&1
+#
+# Field meanings:  minute=0  hour=16  day-of-month=*  month=*  day-of-week=6
+#                  → every Saturday at 16:00 in the droplet's local timezone.
+# Timezone is set with `timedatectl set-timezone Australia/Brisbane` (QLD,
+# no DST) or `Australia/Sydney` (NSW with DST). Saturday 16:00 AEST is the
+# sweet spot: US Friday close + 8–9h (statement ready) and *before* IBKR's
+# weekend maintenance window (which starts ~Sat afternoon US Eastern, ≈
+# Sunday morning AEST).
+#
+# With set -euo pipefail and the retry loop, cron sees:
+#   exit 0 → success (all accounts synced)
+#   exit 1 → at least one account failed after exhausting retries
+#   exit 2 → missing sync.env (configuration error)
+#
+# DEBUGGING
+# ---------
+#   - Tail the log:    tail -f /var/log/ibkr_sync.log
+#   - Manual run:      ./ibkr_sync.sh
+#   - Skip the env:    IBKR_SYNC_ENV=/path/to/other.env ./ibkr_sync.sh
+#
+# EXPECTED sync.env CONTENTS (chmod 600, never commit)
+# -----------------------------------------------------
+#   ACCOUNTS="TOKEN_A:QUERY_ID_A TOKEN_B:QUERY_ID_B"
+#   BASIC_AUTH="admin:yourpassword"
+#   UPLOAD_URL="https://nomad403.cc/api/upload"
+# ============================================================================
+
+# `set -e`  → fail fast on any non-zero exit
+# `set -u`  → unbound vars become errors (catches typo'd env vars)
+# `set -o pipefail` → propagate failures through pipes
 set -euo pipefail
 
+# --- Bootstrap: locate and source sync.env ----------------------------------
+# Script lives at .../scripts/ibkr_sync.sh; sync.env lives next to it unless
+# IBKR_SYNC_ENV is set (handy for testing alternate creds).
 DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="${IBKR_SYNC_ENV:-$DIR/sync.env}"
 
@@ -22,23 +75,39 @@ fi
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 
+# Fail loudly if any required env var is missing — :? prints message & exits.
 : "${ACCOUNTS:?ACCOUNTS not set in $ENV_FILE}"
 : "${BASIC_AUTH:?BASIC_AUTH not set in $ENV_FILE}"
 : "${UPLOAD_URL:?UPLOAD_URL not set in $ENV_FILE}"
 
+# IBKR's Flex Web Service base URL. The two endpoints we use are
+# .SendRequest (queue a report) and .GetStatement (download it).
 API="https://gdcdyn.interactivebrokers.com/Universal/servlet/FlexStatementService"
+
+# Throwaway scratch dir for downloaded CSVs; cleaned up on any exit path.
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
+
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
 
-# Error codes treated as permanent (don't retry).
+# Error codes treated as PERMANENT (don't retry). Space-padded so we can
+# do a substring match like `[[ "$PERMANENT_CODES" == *" $errcode "* ]]`.
+#   1011  parameter error          1014  invalid query
+#   1015  invalid request          1018  authentication problem
+#   1020  invalid token
+# Everything else (1001, 1019, network failures, etc.) is treated as
+# transient and retried.
 PERMANENT_CODES=" 1011 1014 1015 1020 1018 "
 
-# Retry backoff schedule in seconds — at +2h and +4h after the first
-# attempt. Covers typical IBKR weekend maintenance windows without
-# burning cycles on dense early retries.
+# Retry backoff schedule in seconds. Two retries at +2h and +4h after the
+# first attempt, covering a typical IBKR weekend-maintenance window
+# (~3 hours). One initial attempt + this array's length = total tries.
+# Dense early retries don't help when IBKR is actually down — better to
+# spread them out and let the maintenance finish.
 RETRY_DELAYS=(7200 7200)
 
+# sync_one(): top-level per-account driver. Calls try_once() in a loop,
+# honouring the backoff schedule and the permanent-error short circuit.
 sync_one() {
   local token="$1" query_id="$2" tag="$3"
   local out="$WORKDIR/$tag.csv"
@@ -64,10 +133,18 @@ sync_one() {
   done
 }
 
-# Returns: 0 success, 1 transient (retry), 2 permanent (give up)
+# try_once(): exactly one shot at the SendRequest → poll → download → upload
+# pipeline. Returns:
+#   0 success           — CSV downloaded and uploaded
+#   1 transient failure — IBKR throttled, generating slowly, network blip
+#   2 permanent failure — config error, bad token/query/etc. (caller bails)
 try_once() {
   local token="$1" query_id="$2" tag="$3" out="$4"
 
+  # --- Step 1: queue the report ---------------------------------------------
+  # IBKR responds with XML containing <Status>Success</Status> and a
+  # <ReferenceCode>...</ReferenceCode> we use to poll for the file. On
+  # failure the XML contains <ErrorCode> and <ErrorMessage>.
   log "[$tag] requesting statement (query=$query_id)..."
   local resp
   resp=$(curl -sS --max-time 30 "$API.SendRequest?t=$token&q=$query_id&v=3") || {
@@ -90,6 +167,11 @@ try_once() {
   fi
   log "[$tag] ref=$ref, polling..."
 
+  # --- Step 2: poll GetStatement until the report is ready ------------------
+  # Up to 30 attempts × 5s = 2.5 minutes. While IBKR is still building, the
+  # body is an XML envelope containing "Statement generation in progress".
+  # When ready, the body IS the raw CSV (no XML wrapper). If it's an error
+  # we get an XML body with <ErrorCode>.
   local body i
   for i in $(seq 1 30); do
     sleep 5
@@ -108,16 +190,21 @@ try_once() {
       log "[$tag] transient fetch failure: code=$errcode msg=$errmsg"
       return 1
     fi
+    # No XML envelope and no error → body is the actual CSV.
     printf '%s' "$body" > "$out"
     log "[$tag] downloaded $(wc -l <"$out" | tr -d ' ') lines"
     break
   done
 
+  # 30 polls exhausted without a successful body or error → timeout.
   if [[ ! -s "$out" ]]; then
     log "[$tag] timeout waiting for statement"
     return 1
   fi
 
+  # --- Step 3: upload the CSV to the dashboard -------------------------------
+  # Multipart POST. -w "%{http_code}" lets us inspect status without losing
+  # the body (which we dump to a tmp file for error logging).
   log "[$tag] uploading to $UPLOAD_URL..."
   local http
   http=$(curl -sS -o /tmp/upload_resp.$$ -w "%{http_code}" \
@@ -132,11 +219,15 @@ try_once() {
   rm -f /tmp/upload_resp.$$
 }
 
+# --- Main loop: iterate ACCOUNTS and tally failures -------------------------
+# ACCOUNTS is a space-separated list of "TOKEN:QUERY_ID" pairs. We
+# deliberately don't quote $ACCOUNTS in the for-loop — we WANT word
+# splitting on spaces so multiple accounts become multiple iterations.
 fail=0
 for entry in $ACCOUNTS; do
-  token="${entry%%:*}"
-  query="${entry#*:}"
-  tag="${query:0:6}"
+  token="${entry%%:*}"   # everything before the first ':'
+  query="${entry#*:}"    # everything after  the first ':'
+  tag="${query:0:6}"     # first 6 chars of query id, just for log readability
   sync_one "$token" "$query" "$tag" || fail=$((fail + 1))
 done
 
