@@ -26,16 +26,33 @@ function mergeAccounts(accounts) {
   if (list.length === 1) return list[0];
 
   const nav = { cash: 0, stock: 0, options: 0, dividend_accruals: 0, total: 0, twr: 0 };
-  let twrNumerator = 0, twrDenom = 0;
+  let twrN = 0, twrD = 0;
+  // Money multiplier merges cleanly: sum gross_in and net_gain across
+  // accounts, then divide. Annualize with the longest period span so the
+  // rate isn't distorted by a short-lived account.
+  let mmIn = 0, mmGain = 0, mmDays = 0;
   for (const a of list) {
     nav.cash += a.nav.cash || 0;
     nav.stock += a.nav.stock || 0;
     nav.options += a.nav.options || 0;
     nav.dividend_accruals += a.nav.dividend_accruals || 0;
     nav.total += a.nav.total || 0;
-    if (a.nav.twr) { twrNumerator += a.nav.twr * (a.nav.total || 0); twrDenom += a.nav.total || 0; }
+    if (a.nav.twr) { twrN += a.nav.twr * (a.nav.total || 0); twrD += a.nav.total || 0; }
+    const mm = a.nav.money_multiplier;
+    if (mm) {
+      mmIn += mm.gross_in;
+      mmGain += mm.net_gain;
+      mmDays = Math.max(mmDays, mm.days);
+    }
   }
-  nav.twr = twrDenom ? twrNumerator / twrDenom : 0;
+  nav.twr = twrD ? twrN / twrD : 0;
+  nav.money_multiplier = mmIn > 0 ? {
+    gross_in: mmIn,
+    net_gain: mmGain,
+    period_return: mmGain / mmIn,
+    annualized: Math.pow(1 + mmGain / mmIn, 365 / Math.max(mmDays, 1)) - 1,
+    days: mmDays,
+  } : null;
 
   // Merge stocks by symbol (sum qty/cost/value, weighted avg cost_price)
   const stockMap = {};
@@ -159,8 +176,18 @@ function render(data) {
   // KPIs
   $("kpi-nav").textContent = fmtMoney(totalNav);
   const twrEl = $("kpi-twr");
+  // Preference: TWR (official, only present in legacy Activity Statement
+  // uploads) → annualized money multiplier (computed from Flex cash flows).
+  // IRR is kept on the data but not displayed — it overweights early
+  // deposits and tends to print misleadingly high numbers when the account
+  // ramped up mid-period.
+  const mm = nav.money_multiplier;
   if (nav.twr) {
     twrEl.textContent = `时间加权收益率 ${fmtPct(nav.twr, 2)}`;
+    twrEl.hidden = false;
+  } else if (mm && mm.annualized != null) {
+    twrEl.textContent = `年化回报率 ${fmtPct(mm.annualized, 1)}`;
+    twrEl.title = `期间净入金 ${fmtMoney(mm.gross_in)} · 净收益 ${fmtMoney(mm.net_gain)} · ${mm.days} 天`;
     twrEl.hidden = false;
   } else {
     twrEl.hidden = true;

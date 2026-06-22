@@ -13,7 +13,10 @@ import csv
 import io
 import re
 from collections import defaultdict
+from datetime import date
 from typing import Any
+
+from .returns import compute_account_returns
 
 
 def _to_float(v: str) -> float:
@@ -59,6 +62,8 @@ def _classify_section(header: list[str]) -> str:
         return "OpenPositions"
     if {"TradeDate", "TradePrice"} <= cols or "OrigTradePrice" in cols:
         return "Trades"
+    if {"ActivityCode", "Amount", "Balance"} <= cols:
+        return "StatementOfFunds"
     return "Unknown"
 
 
@@ -71,7 +76,20 @@ def _empty_account() -> dict[str, Any]:
         "options": [],
         "options_by_underlying": {},
         "performance": {"realized_total": 0.0, "unrealized_total": 0.0, "by_symbol": {}},
+        "_cash_flows": [],  # raw (date, amount) for IRR; stripped before serialising
+        "_starting_cash": 0.0,
+        "_from_date": "",
+        "_to_date": "",
     }
+
+
+def _parse_date(yyyymmdd: str) -> date | None:
+    if not yyyymmdd or len(yyyymmdd) != 8 or not yyyymmdd.isdigit():
+        return None
+    try:
+        return date(int(yyyymmdd[:4]), int(yyyymmdd[4:6]), int(yyyymmdd[6:]))
+    except ValueError:
+        return None
 
 
 def _section_rows(content: str) -> list[tuple[list[str], list[list[str]]]]:
@@ -192,6 +210,32 @@ def _ingest_change_in_nav(account: dict[str, Any], row: dict[str, str]) -> None:
     from_d, to_d = row.get("FromDate"), row.get("ToDate")
     if from_d and to_d:
         account["statement"]["Period"] = f"{_fmt_iso_date(from_d)} → {_fmt_iso_date(to_d)}"
+        account["_from_date"] = from_d
+        account["_to_date"] = to_d
+    starting_cash = _to_float(row.get("StartingCash"))
+    if starting_cash:
+        account["_starting_cash"] = starting_cash
+
+
+# IBKR Activity codes that represent external investor cash flows.
+# Anything else (BUY/SELL/FOREX/DIV/CINT/FRTAX/...) is internal to the
+# account and must NOT enter the IRR series.
+_EXTERNAL_CF_CODES = {"DEP", "WITH", "BWT", "DPI", "WTI"}
+
+
+def _ingest_statement_of_funds(account: dict[str, Any], row: dict[str, str]) -> None:
+    code = row.get("ActivityCode", "")
+    if code not in _EXTERNAL_CF_CODES:
+        return
+    d = _parse_date(row.get("Date", ""))
+    if d is None:
+        return
+    amount = _to_float(row.get("Amount"))
+    if amount == 0:
+        return
+    # IBKR's sign on Amount: deposit positive, withdrawal negative.
+    # Keep that convention here; compute_account_returns flips for IRR.
+    account["_cash_flows"].append((d, amount))
 
 
 def parse_ibkr_flex_csv(content: str) -> dict[str, Any]:
@@ -216,6 +260,8 @@ def parse_ibkr_flex_csv(content: str) -> dict[str, Any]:
                 _ingest_performance(acct, row)
             elif kind == "ChangeInNAV":
                 _ingest_change_in_nav(acct, row)
+            elif kind == "StatementOfFunds":
+                _ingest_statement_of_funds(acct, row)
 
     # Sort + finalize each account
     for acct in accounts.values():
@@ -241,5 +287,25 @@ def parse_ibkr_flex_csv(content: str) -> dict[str, Any]:
             bucket["net_value"] += opt["value"]
             bucket["unrealized_pl"] += opt["unrealized_pl"]
         acct["options_by_underlying"] = {k: v for k, v in grouped.items()}
+
+        # Money-weighted return — drives the dashboard's annualized-return
+        # subtitle when TWR is absent (which is always, for Flex Web Service).
+        start_d = _parse_date(acct.get("_from_date", ""))
+        end_d = _parse_date(acct.get("_to_date", ""))
+        statement_days = (end_d - start_d).days if (start_d and end_d) else None
+        returns = compute_account_returns(
+            deposits_withdrawals=acct["_cash_flows"],
+            starting_nav=acct.get("_starting_cash", 0.0),
+            starting_date=start_d,
+            ending_nav=acct["nav"].get("total", 0.0),
+            ending_date=end_d,
+            statement_days=statement_days,
+        )
+        acct["nav"]["irr_annualized"] = returns["irr_annualized"]
+        acct["nav"]["money_multiplier"] = returns["money_multiplier"]
+        acct["nav"]["return_method"] = returns["method"]
+        # Strip internal scratch state before serialising.
+        for k in ("_cash_flows", "_starting_cash", "_from_date", "_to_date"):
+            acct.pop(k, None)
 
     return {"accounts": dict(accounts)}
