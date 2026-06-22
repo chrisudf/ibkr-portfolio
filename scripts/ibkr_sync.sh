@@ -59,7 +59,7 @@ sync_one() {
       return 1
     fi
     local delay=${RETRY_DELAYS[$((attempt - 1))]}
-    log "[$tag] retrying in ${delay}s (attempt $((attempt + 1))/$max_attempts)…"
+    log "[$tag] retrying in ${delay}s (attempt $((attempt + 1))/$max_attempts)..."
     sleep "$delay"
   done
 }
@@ -68,7 +68,7 @@ sync_one() {
 try_once() {
   local token="$1" query_id="$2" tag="$3" out="$4"
 
-  log "[$tag] requesting statement (query=$query_id)…"
+  log "[$tag] requesting statement (query=$query_id)..."
   local resp
   resp=$(curl -sS --max-time 30 "$API.SendRequest?t=$token&q=$query_id&v=3") || {
     log "[$tag] network error on send"
@@ -88,14 +88,14 @@ try_once() {
     log "[$tag] transient failure: code=$errcode msg=$errmsg"
     return 1
   fi
-  log "[$tag] ref=$ref, polling…"
+  log "[$tag] ref=$ref, polling..."
 
   local body i
   for i in $(seq 1 30); do
     sleep 5
     body=$(curl -sS --max-time 60 "$API.GetStatement?t=$token&q=$ref&v=3")
     if grep -q "Statement generation in progress" <<<"$body"; then
-      log "[$tag] still generating ($i/30)…"
+      log "[$tag] still generating ($i/30)..."
       continue
     fi
     if grep -q "<ErrorCode>" <<<"$body"; then
@@ -118,7 +118,7 @@ try_once() {
     return 1
   fi
 
-  log "[$tag] uploading to $UPLOAD_URL…"
+  log "[$tag] uploading to $UPLOAD_URL..."
   local http
   http=$(curl -sS -o /tmp/upload_resp.$$ -w "%{http_code}" \
     -u "$BASIC_AUTH" -F "file=@$out" "$UPLOAD_URL")
