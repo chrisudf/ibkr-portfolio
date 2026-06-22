@@ -14,20 +14,129 @@ const fmtNum = (v, digits = 2) => Number(v).toLocaleString("en-US", { maximumFra
 
 const $ = (id) => document.getElementById(id);
 
-const currentDataRef = { data: null };
+const currentDataRef = { data: null, allAccounts: null, selected: null };
+
+function maskAccountId(id) {
+  if (!id || id.length < 6) return id;
+  return id.slice(0, 4) + "*".repeat(Math.max(0, id.length - 6)) + id.slice(-2);
+}
+
+function mergeAccounts(accounts) {
+  const list = Object.values(accounts);
+  if (list.length === 1) return list[0];
+
+  const nav = { cash: 0, stock: 0, options: 0, dividend_accruals: 0, total: 0, twr: 0 };
+  let twrNumerator = 0, twrDenom = 0;
+  for (const a of list) {
+    nav.cash += a.nav.cash || 0;
+    nav.stock += a.nav.stock || 0;
+    nav.options += a.nav.options || 0;
+    nav.dividend_accruals += a.nav.dividend_accruals || 0;
+    nav.total += a.nav.total || 0;
+    if (a.nav.twr) { twrNumerator += a.nav.twr * (a.nav.total || 0); twrDenom += a.nav.total || 0; }
+  }
+  nav.twr = twrDenom ? twrNumerator / twrDenom : 0;
+
+  // Merge stocks by symbol (sum qty/cost/value, weighted avg cost_price)
+  const stockMap = {};
+  for (const a of list) {
+    for (const s of a.stocks) {
+      const k = s.symbol;
+      if (!stockMap[k]) { stockMap[k] = { ...s }; continue; }
+      const m = stockMap[k];
+      m.quantity += s.quantity;
+      m.cost_basis += s.cost_basis;
+      m.value += s.value;
+      m.unrealized_pl += s.unrealized_pl;
+      m.cost_price = m.quantity ? m.cost_basis / m.quantity : 0;
+    }
+  }
+  const stocks = Object.values(stockMap).sort((a, b) => b.value - a.value);
+
+  // Options: concat (each contract is account-specific anyway)
+  const options = list.flatMap(a => a.options || []);
+
+  // Performance by symbol — sum across accounts
+  const bySymbol = {};
+  let realizedTotal = 0, unrealizedTotal = 0;
+  for (const a of list) {
+    realizedTotal += a.performance.realized_total || 0;
+    unrealizedTotal += a.performance.unrealized_total || 0;
+    for (const [k, v] of Object.entries(a.performance.by_symbol || {})) {
+      if (!bySymbol[k]) { bySymbol[k] = { ...v }; continue; }
+      bySymbol[k].realized_total += v.realized_total;
+      bySymbol[k].unrealized_total += v.unrealized_total;
+      bySymbol[k].total = bySymbol[k].realized_total + bySymbol[k].unrealized_total;
+    }
+  }
+
+  // If accounts share the same period (the usual case) collapse to one.
+  const periods = [...new Set(list.map(a => a.statement?.Period).filter(Boolean))];
+  return {
+    account: { Account: "ALL" },
+    statement: { Period: periods.length === 1 ? periods[0] : periods.join(" / ") },
+    nav, stocks, options,
+    performance: {
+      realized_total: realizedTotal,
+      unrealized_total: unrealizedTotal,
+      by_symbol: bySymbol,
+    },
+  };
+}
+
+function renderAccountSwitcher() {
+  const accounts = currentDataRef.allAccounts;
+  const el = $("account-switcher");
+  if (!accounts || Object.keys(accounts).length < 2) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  const ids = Object.keys(accounts).sort();
+  // Individual accounts first; "总账户" merge view as the trailing option.
+  el.innerHTML = `<span class="label">账号</span>`
+    + ids.map(id => `<button data-acct="${id}">${maskAccountId(id)}</button>`).join("")
+    + `<button data-acct="ALL">总账户</button>`;
+  el.querySelectorAll("button").forEach(btn => {
+    if (btn.dataset.acct === currentDataRef.selected) btn.classList.add("active");
+    btn.addEventListener("click", () => {
+      currentDataRef.selected = btn.dataset.acct;
+      el.querySelectorAll("button").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      renderSelected();
+    });
+  });
+}
+
+function renderSelected() {
+  const accounts = currentDataRef.allAccounts;
+  const sel = currentDataRef.selected;
+  const data = sel === "ALL" ? mergeAccounts(accounts) : accounts[sel];
+  currentDataRef.data = data;
+  render(data);
+}
 
 async function loadPortfolio() {
   const res = await fetch("/api/portfolio");
-  const data = await res.json();
-  if (data.empty) {
+  const payload = await res.json();
+  if (payload.empty) {
     $("empty").hidden = false;
     $("dashboard").hidden = true;
     return;
   }
   $("empty").hidden = true;
   $("dashboard").hidden = false;
-  currentDataRef.data = data;
-  render(data);
+  // Accept both new multi-account payload and legacy single-account shape.
+  const accounts = payload.accounts || { "default": payload };
+  currentDataRef.allAccounts = accounts;
+  // Default to the alphabetically-first account (puts U17xxxx ahead of U22xxxx)
+  // rather than the merged view — most viewing happens per-account.
+  if (!currentDataRef.selected || (currentDataRef.selected !== "ALL" && !accounts[currentDataRef.selected])) {
+    const ids = Object.keys(accounts).sort();
+    currentDataRef.selected = ids[0];
+  }
+  renderAccountSwitcher();
+  renderSelected();
 }
 
 function render(data) {
@@ -43,13 +152,19 @@ function render(data) {
 
   // Account line — show masked account + period, hide name
   const acct = account.Account || "";
-  const masked = acct ? acct.slice(0, 4) + "*".repeat(Math.max(0, acct.length - 6)) + acct.slice(-2) : "";
+  const masked = acct === "ALL" ? "总账户" : maskAccountId(acct);
   const period = statement.Period || "";
   $("account-line").textContent = [masked, period].filter(Boolean).join(" · ") || "已导入";
 
   // KPIs
   $("kpi-nav").textContent = fmtMoney(totalNav);
-  $("kpi-twr").textContent = nav.twr ? `时间加权收益率 ${fmtPct(nav.twr, 2)}` : "时间加权收益率 —";
+  const twrEl = $("kpi-twr");
+  if (nav.twr) {
+    twrEl.textContent = `时间加权收益率 ${fmtPct(nav.twr, 2)}`;
+    twrEl.hidden = false;
+  } else {
+    twrEl.hidden = true;
+  }
 
   $("kpi-stock").textContent = fmtMoney(adjStock);
   $("kpi-stock-pct").textContent = `占总净值 ${fmtPct(adjStock / totalNav)}`;

@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 venv/
 .env
+scripts/sync.env
 .DS_Store
 uploads/*.json
 uploads/*.csv

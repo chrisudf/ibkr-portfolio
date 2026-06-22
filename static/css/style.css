@@ -200,6 +200,30 @@ ul.rank li {
 ul.rank li:last-child { border-bottom: none; }
 ul.rank .sym { font-weight: 600; }
 
+.account-switcher {
+  display: flex;
+  gap: 6px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  padding: 6px;
+  border-radius: 12px;
+  margin-bottom: 16px;
+  align-items: center;
+}
+.account-switcher .label { color: var(--text-faint); font-size: 11px; letter-spacing: 0.5px; margin: 0 8px; text-transform: uppercase; }
+.account-switcher button {
+  border: none; background: transparent; color: var(--text-dim);
+  padding: 8px 14px; border-radius: 8px; font-size: 13px; cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  font-family: inherit;
+  font-variant-numeric: tabular-nums;
+}
+.account-switcher button:hover { color: var(--text); background: var(--panel-2); }
+.account-switcher button.active {
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  color: #0a0c12; font-weight: 600;
+}
+
 .seg-toggle { display: inline-flex; gap: 4px; background: var(--panel-2); padding: 4px; border-radius: 10px; }
 .seg-toggle button {
   border: none; background: transparent; color: var(--text-dim);
