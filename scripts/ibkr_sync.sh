@@ -168,16 +168,19 @@ try_once() {
   log "[$tag] ref=$ref, polling..."
 
   # --- Step 2: poll GetStatement until the report is ready ------------------
-  # Up to 30 attempts × 5s = 2.5 minutes. While IBKR is still building, the
-  # body is an XML envelope containing "Statement generation in progress".
-  # When ready, the body IS the raw CSV (no XML wrapper). If it's an error
-  # we get an XML body with <ErrorCode>.
+  # Up to 60 attempts × 5s = 5 minutes. Larger Flex queries (Statement of
+  # Funds + Cash Report + multiple performance summaries) can take 2-4
+  # minutes; the previous 2.5 min budget was tight. While IBKR is still
+  # building, the body is an XML envelope containing "Statement generation
+  # in progress". When ready, the body IS the raw CSV (no XML wrapper).
+  # If it's an error we get an XML body with <ErrorCode>.
   local body i
-  for i in $(seq 1 30); do
+  local max_polls=60
+  for i in $(seq 1 $max_polls); do
     sleep 5
     body=$(curl -sS --max-time 60 "$API.GetStatement?t=$token&q=$ref&v=3")
     if grep -q "Statement generation in progress" <<<"$body"; then
-      log "[$tag] still generating ($i/30)..."
+      log "[$tag] still generating ($i/$max_polls)..."
       continue
     fi
     if grep -q "<ErrorCode>" <<<"$body"; then
@@ -196,9 +199,13 @@ try_once() {
     break
   done
 
-  # 30 polls exhausted without a successful body or error → timeout.
+  # Polls exhausted without a successful body or error → timeout.
+  # Dump the last IBKR response to /tmp for post-mortem so we can see
+  # whether it was still "in progress" or returning something weird.
   if [[ ! -s "$out" ]]; then
-    log "[$tag] timeout waiting for statement"
+    local debug_file="/tmp/ibkr_debug_${tag}_$(date +%s).xml"
+    printf '%s' "$body" > "$debug_file"
+    log "[$tag] timeout waiting for statement; last response saved to $debug_file"
     return 1
   fi
 

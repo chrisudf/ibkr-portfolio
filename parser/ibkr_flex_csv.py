@@ -58,6 +58,10 @@ def _classify_section(header: list[str]) -> str:
         return "MTMPerformance"
     if "StartingCash" in cols and "EndingCash" in cols:
         return "ChangeInNAV"
+    # The "MTM Performance Summary in Base" / "Profit & Loss" section that
+    # ships TWR alongside FromDate/ToDate, StartingValue and EndingValue.
+    if {"TWR", "StartingValue", "EndingValue", "FromDate", "ToDate"} <= cols:
+        return "PnLSummary"
     if {"PositionValue", "MarkPrice", "Quantity", "CostBasisMoney"} <= cols:
         return "OpenPositions"
     if {"TradeDate", "TradePrice"} <= cols or "OrigTradePrice" in cols:
@@ -200,6 +204,26 @@ def _ingest_performance(account: dict[str, Any], row: dict[str, str]) -> None:
     account["performance"]["unrealized_total"] += unrealized
 
 
+def _ingest_pnl_summary(account: dict[str, Any], row: dict[str, str]) -> None:
+    """The PnL summary section is the goldmine: it carries IBKR's official
+    TWR plus the canonical period bookends. Always prefer this over the
+    ChangeInNAV-derived fallback values."""
+    twr = row.get("TWR", "")
+    if twr:
+        try:
+            account["nav"]["twr"] = float(twr) / 100.0
+        except ValueError:
+            pass
+    from_d, to_d = row.get("FromDate"), row.get("ToDate")
+    if from_d and to_d:
+        account["statement"]["Period"] = f"{_fmt_iso_date(from_d)} → {_fmt_iso_date(to_d)}"
+        account["_from_date"] = from_d
+        account["_to_date"] = to_d
+    starting = _to_float(row.get("StartingValue"))
+    if starting:
+        account["_starting_cash"] = starting
+
+
 def _ingest_change_in_nav(account: dict[str, Any], row: dict[str, str]) -> None:
     twr = row.get("TWR") or row.get("TimeWeightedReturn")
     if twr:
@@ -260,6 +284,8 @@ def parse_ibkr_flex_csv(content: str) -> dict[str, Any]:
                 _ingest_performance(acct, row)
             elif kind == "ChangeInNAV":
                 _ingest_change_in_nav(acct, row)
+            elif kind == "PnLSummary":
+                _ingest_pnl_summary(acct, row)
             elif kind == "StatementOfFunds":
                 _ingest_statement_of_funds(acct, row)
 
