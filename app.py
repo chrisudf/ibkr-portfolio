@@ -28,9 +28,10 @@ LEGACY_STATE_FILE = UPLOAD_DIR / "last_portfolio.json"
 app = Flask(__name__, template_folder=str(BASE_DIR / "templates"), static_folder=str(BASE_DIR / "static"))
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB
 
-# Minimum gap between successful /api/refresh calls. Prevents button-spam
-# from chewing through IBKR's per-query throttle quota — they'll lock the
-# query out for ~30 min if hit too often.
+# Minimum gap between /api/refresh attempts (gating is on attempt-start,
+# regardless of success or failure). Prevents button-spam from chewing
+# through IBKR's per-query throttle quota — IBKR locks a query for ~30 min
+# if hit too often, success or not, so we cool down on every attempt.
 REFRESH_MIN_INTERVAL_SEC = 5 * 60
 _refresh_state = {"last_started": 0.0, "in_progress": False}
 _refresh_lock = Lock()
@@ -117,9 +118,10 @@ def refresh():
     if not specs:
         return jsonify({"error": "ACCOUNTS env var malformed"}), 500
 
-    # Throttle: refuse if another refresh is in flight or one finished too
-    # recently. Both cases get a "wait N seconds" hint so the UI can format
-    # a friendly message rather than guessing.
+    # Throttle: refuse if another refresh is in flight or one *started* too
+    # recently (we don't care whether it succeeded — IBKR throttles by
+    # request, not by outcome). Both cases get a "wait N seconds" hint so
+    # the UI can format a friendly message rather than guessing.
     now = time.time()
     with _refresh_lock:
         if _refresh_state["in_progress"]:
@@ -145,7 +147,7 @@ def refresh():
                 for acct_id, data in payload.get("accounts", {}).items():
                     out_path = UPLOAD_DIR / f"{acct_id}.json"
                     with open(out_path, "w", encoding="utf-8") as out:
-                        json.dump(data, out, ensure_ascii=False, indent=2, default=str)
+                        json.dump(data, out, ensure_ascii=False, indent=2)
                     saved.append(acct_id)
                 entry.update({"ok": True, "accounts": saved})
             except FlexFetchError as exc:

@@ -108,9 +108,13 @@ def fetch_one(
         raise FlexFetchError("SendRequest succeeded but no ReferenceCode in response")
 
     # --- Step 2: poll GetStatement until ready --------------------------------
+    # First poll fires immediately — small queries are often ready by the
+    # time SendRequest returns the reference code. Subsequent iterations
+    # sleep between attempts.
     get_url = f"{API_BASE}.GetStatement?{urllib.parse.urlencode({'t': spec.token, 'q': ref, 'v': 3})}"
-    for _ in range(max_polls):
-        time.sleep(poll_interval)
+    for attempt in range(max_polls):
+        if attempt > 0:
+            time.sleep(poll_interval)
         try:
             body = _http_get(get_url, timeout=60)
         except Exception as exc:

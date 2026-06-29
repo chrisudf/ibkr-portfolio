@@ -545,8 +545,19 @@ function renderRankings(bySymbol) {
 function showToast(kind, title, detail = "", durationMs = 4500) {
   const el = $("toast");
   el.className = `toast ${kind}`;
-  el.innerHTML = `<div class="toast-title">${title}</div>` +
-    (detail ? `<div class="toast-detail">${detail}</div>` : "");
+  // textContent (not innerHTML) — title and detail can include server-supplied
+  // strings (IBKR error messages, account ids) that must not be parsed as HTML.
+  el.replaceChildren();
+  const titleEl = document.createElement("div");
+  titleEl.className = "toast-title";
+  titleEl.textContent = title;
+  el.appendChild(titleEl);
+  if (detail) {
+    const detailEl = document.createElement("div");
+    detailEl.className = "toast-detail";
+    detailEl.textContent = detail;
+    el.appendChild(detailEl);
+  }
   el.hidden = false;
   clearTimeout(el._timer);
   el._timer = setTimeout(() => { el.hidden = true; }, durationMs);
