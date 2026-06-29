@@ -26,10 +26,13 @@ function mergeAccounts(accounts) {
   if (list.length === 1) return list[0];
 
   const nav = { cash: 0, stock: 0, options: 0, dividend_accruals: 0, total: 0, twr: 0 };
-  let twrN = 0, twrD = 0;
-  // Money multiplier merges cleanly: sum gross_in and net_gain across
-  // accounts, then divide. Annualize with the longest period span so the
-  // rate isn't distorted by a short-lived account.
+  // For the merged view we deliberately DO NOT use IBKR's per-account TWR —
+  // weighted-averaging TWRs across accounts is mathematically wrong (each
+  // TWR is itself a chain-link of daily returns over a different timeline).
+  // Instead we build a single combined money-multiplier from the summed
+  // gross_in / net_gain across all accounts, which approximates the real
+  // consolidated return that IBKR's PortfolioAnalyst shows (typically within
+  // a few percentage points of their Modified Dietz number).
   let mmIn = 0, mmGain = 0, mmDays = 0;
   for (const a of list) {
     nav.cash += a.nav.cash || 0;
@@ -37,7 +40,6 @@ function mergeAccounts(accounts) {
     nav.options += a.nav.options || 0;
     nav.dividend_accruals += a.nav.dividend_accruals || 0;
     nav.total += a.nav.total || 0;
-    if (a.nav.twr) { twrN += a.nav.twr * (a.nav.total || 0); twrD += a.nav.total || 0; }
     const mm = a.nav.money_multiplier;
     if (mm) {
       mmIn += mm.gross_in;
@@ -45,7 +47,7 @@ function mergeAccounts(accounts) {
       mmDays = Math.max(mmDays, mm.days);
     }
   }
-  nav.twr = twrD ? twrN / twrD : 0;
+  // nav.twr stays 0 → render() falls through to the money-multiplier branch.
   nav.money_multiplier = mmIn > 0 ? {
     gross_in: mmIn,
     net_gain: mmGain,
@@ -540,7 +542,71 @@ function renderRankings(bySymbol) {
   $("losers").innerHTML = render(losers, "down", "");
 }
 
+function showToast(kind, title, detail = "", durationMs = 4500) {
+  const el = $("toast");
+  el.className = `toast ${kind}`;
+  // textContent (not innerHTML) — title and detail can include server-supplied
+  // strings (IBKR error messages, account ids) that must not be parsed as HTML.
+  el.replaceChildren();
+  const titleEl = document.createElement("div");
+  titleEl.className = "toast-title";
+  titleEl.textContent = title;
+  el.appendChild(titleEl);
+  if (detail) {
+    const detailEl = document.createElement("div");
+    detailEl.className = "toast-detail";
+    detailEl.textContent = detail;
+    el.appendChild(detailEl);
+  }
+  el.hidden = false;
+  clearTimeout(el._timer);
+  el._timer = setTimeout(() => { el.hidden = true; }, durationMs);
+}
+
+async function refreshFromIBKR() {
+  const btn = $("refresh-btn");
+  if (btn.disabled) return;
+  btn.disabled = true;
+  btn.classList.add("spinning");
+  const label = btn.querySelector(".refresh-label");
+  const origLabel = label.textContent;
+  label.textContent = "同步中...";
+  try {
+    const res = await fetch("/api/refresh", { method: "POST" });
+    const data = await res.json();
+    if (res.status === 429) {
+      showToast("warn", "请稍后再试", data.error || "刷新过于频繁");
+      return;
+    }
+    if (!res.ok) {
+      showToast("error", "同步失败", data.error || `HTTP ${res.status}`);
+      return;
+    }
+    const ok = (data.results || []).filter(r => r.ok);
+    const failed = (data.results || []).filter(r => !r.ok);
+    const okAccts = ok.flatMap(r => r.accounts || []);
+    if (ok.length && !failed.length) {
+      showToast("success", "已更新", okAccts.join(" + ") || "数据已同步");
+    } else if (ok.length && failed.length) {
+      showToast("warn", "部分成功",
+        `成功: ${okAccts.join(", ")} / 失败: ${failed.map(f => `${f.tag} (${f.error})`).join("; ")}`);
+    } else {
+      const first = failed[0] || {};
+      showToast("error", "同步失败", first.error || "未知错误");
+    }
+    if (ok.length) await loadPortfolio();
+  } catch (exc) {
+    showToast("error", "同步失败", String(exc));
+  } finally {
+    btn.disabled = false;
+    btn.classList.remove("spinning");
+    label.textContent = origLabel;
+  }
+}
+
 document.addEventListener("DOMContentLoaded", () => {
+  $("refresh-btn").addEventListener("click", refreshFromIBKR);
+
   $("file").addEventListener("change", async (e) => {
     const f = e.target.files[0];
     if (!f) return;
