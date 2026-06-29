@@ -177,7 +177,13 @@ baseline 稳了再加 web 通道，否则两条链路同时排查更累。
 
 ---
 
-## [P4] 「按标的合并」全账户 IRR
+## ~~[P4] 「按标的合并」全账户 IRR~~ ✓ 已完成
+
+合并视图原本对各账户 TWR 做 NAV 加权（数学错误，TWR 不能这样合并），
+现在改成：直接把每个账户的 gross_in / net_gain 相加，重算合并版
+money multiplier。结果跟 IBKR PortfolioAnalyst 的 consolidated return
+差几个百分点（25.5% vs 22.55%），剩余 gap 是 Modified Dietz 时间加权
+vs 简单 multiplier 的差异，可接受。
 
 merged view 现在用 NAV 加权平均各账户的 money multiplier，
 近似但不精确。严谨做法是把所有账户的现金流序列合并，重解一次 IRR。
