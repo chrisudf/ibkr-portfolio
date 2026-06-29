@@ -185,6 +185,49 @@ money multiplier。结果跟 IBKR PortfolioAnalyst 的 consolidated return
 差几个百分点（25.5% vs 22.55%），剩余 gap 是 Modified Dietz 时间加权
 vs 简单 multiplier 的差异，可接受。
 
+---
+
+## [P5] 真正的 consolidated Modified Dietz / IRR
+
+当前合并视图用 sum gross_in + sum net_gain 算 money multiplier，
+得到 25.49% — 跟 IBKR PortfolioAnalyst 的 22.55% 差 ~3 个百分点。
+
+差距来源：simple multiplier 不按时间加权现金流，而 IBKR 用 Modified
+Dietz / TWR 给每笔现金流按 `(T-t)/T` 加权。对像 U228 这种半路加入
+（11 月才砸 $109k）的账户，我们会**轻微高估**合并回报率，因为把
+后期资金也摊到全年分母里算。
+
+**对单账户也有影响**：U228 money multiplier 35% < IBKR TWR 42%
+（dashboard 单账户视角现在显示 IBKR TWR，没问题；但合并视角拿不到
+TWR 这种东西）。
+
+### 实现思路
+
+1. `parser/ibkr_flex_csv.py` 别在 finalize 时 strip 掉 `_cash_flows`
+   —— 保留每个账户的现金流序列在 JSON 里（带日期）
+2. `mergeAccounts` 把所有账户的现金流 concat 成单一序列：
+   - 起始：每个账户的 `(start_date, -starting_value)`
+   - 中间：每笔 `(date, signed_amount)`
+   - 终点：每个账户的 `(end_date, +ending_NAV)` 合成
+     `(common_end_date, +total_ending_NAV)`
+3. 调 `parser/returns.py` 已有的 `compute_irr()` 求解器
+4. 失败降级到当前的 simple multiplier（保留作 fallback）
+
+### 工作量
+- parser 改动：不 strip cash_flows（1 行）
+- mergeAccounts：~20 行 JS（cashflow 拼接 + 调 IRR）
+- 但 IRR solver 现在是 Python，得在 JS 端再写一个 Newton's method 实现
+  （或者新增 `POST /api/merged-return` 后端算，UI 异步取）
+
+后端算更稳。30–45 分钟。
+
+### 决策点
+
+- 收益：合并视图数字跟 IBKR PortfolioAnalyst 对齐到小数点
+- 代价：JSON 文件变大（每个账户多存现金流序列，几 KB）
+- 推荐：等其他 P1–P3 做完再做。3 个点的偏差，对我们这种自用面板
+  够用了。
+
 merged view 现在用 NAV 加权平均各账户的 money multiplier，
 近似但不精确。严谨做法是把所有账户的现金流序列合并，重解一次 IRR。
 
