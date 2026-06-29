@@ -18,6 +18,10 @@
       </div>
     </div>
     <div class="actions">
+      <button id="refresh-btn" class="refresh" type="button" title="从 IBKR 自动同步最新数据">
+        <span class="refresh-icon">⟳</span>
+        <span class="refresh-label">刷新 IBKR</span>
+      </button>
       <label class="upload">
         <input id="file" type="file" accept=".csv,.pdf" hidden />
         <span>上传 CSV / PDF</span>
@@ -25,6 +29,8 @@
       <span id="status" class="status"></span>
     </div>
   </header>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 
   <main id="root">
     <section class="empty-state" id="empty">
@@ -34,6 +40,8 @@
     </section>
 
     <section class="dashboard" id="dashboard" hidden>
+      <div class="account-switcher" id="account-switcher" hidden></div>
+
       <!-- KPI Cards -->
       <div class="kpi-grid">
         <div class="kpi" data-tone="primary">

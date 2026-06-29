@@ -2,6 +2,12 @@ services:
   app:
     build: ..
     restart: unless-stopped
+    # Share credentials with scripts/ibkr_sync.sh so the on-demand /api/refresh
+    # button uses the same ACCOUNTS/BASIC_AUTH/UPLOAD_URL config as cron.
+    # sync.env is gitignored; we mount the host file via env_file so secrets
+    # never bake into the image.
+    env_file:
+      - ../scripts/sync.env
     volumes:
       - app_data:/app/uploads
     expose:

@@ -14,20 +14,148 @@ const fmtNum = (v, digits = 2) => Number(v).toLocaleString("en-US", { maximumFra
 
 const $ = (id) => document.getElementById(id);
 
-const currentDataRef = { data: null };
+const currentDataRef = { data: null, allAccounts: null, selected: null };
+
+function maskAccountId(id) {
+  if (!id || id.length < 6) return id;
+  return id.slice(0, 4) + "*".repeat(Math.max(0, id.length - 6)) + id.slice(-2);
+}
+
+function mergeAccounts(accounts) {
+  const list = Object.values(accounts);
+  if (list.length === 1) return list[0];
+
+  const nav = { cash: 0, stock: 0, options: 0, dividend_accruals: 0, total: 0, twr: 0 };
+  // For the merged view we deliberately DO NOT use IBKR's per-account TWR —
+  // weighted-averaging TWRs across accounts is mathematically wrong (each
+  // TWR is itself a chain-link of daily returns over a different timeline).
+  // Instead we build a single combined money-multiplier from the summed
+  // gross_in / net_gain across all accounts, which approximates the real
+  // consolidated return that IBKR's PortfolioAnalyst shows (typically within
+  // a few percentage points of their Modified Dietz number).
+  let mmIn = 0, mmGain = 0, mmDays = 0;
+  for (const a of list) {
+    nav.cash += a.nav.cash || 0;
+    nav.stock += a.nav.stock || 0;
+    nav.options += a.nav.options || 0;
+    nav.dividend_accruals += a.nav.dividend_accruals || 0;
+    nav.total += a.nav.total || 0;
+    const mm = a.nav.money_multiplier;
+    if (mm) {
+      mmIn += mm.gross_in;
+      mmGain += mm.net_gain;
+      mmDays = Math.max(mmDays, mm.days);
+    }
+  }
+  // nav.twr stays 0 → render() falls through to the money-multiplier branch.
+  nav.money_multiplier = mmIn > 0 ? {
+    gross_in: mmIn,
+    net_gain: mmGain,
+    period_return: mmGain / mmIn,
+    annualized: Math.pow(1 + mmGain / mmIn, 365 / Math.max(mmDays, 1)) - 1,
+    days: mmDays,
+  } : null;
+
+  // Merge stocks by symbol (sum qty/cost/value, weighted avg cost_price)
+  const stockMap = {};
+  for (const a of list) {
+    for (const s of a.stocks) {
+      const k = s.symbol;
+      if (!stockMap[k]) { stockMap[k] = { ...s }; continue; }
+      const m = stockMap[k];
+      m.quantity += s.quantity;
+      m.cost_basis += s.cost_basis;
+      m.value += s.value;
+      m.unrealized_pl += s.unrealized_pl;
+      m.cost_price = m.quantity ? m.cost_basis / m.quantity : 0;
+    }
+  }
+  const stocks = Object.values(stockMap).sort((a, b) => b.value - a.value);
+
+  // Options: concat (each contract is account-specific anyway)
+  const options = list.flatMap(a => a.options || []);
+
+  // Performance by symbol — sum across accounts
+  const bySymbol = {};
+  let realizedTotal = 0, unrealizedTotal = 0;
+  for (const a of list) {
+    realizedTotal += a.performance.realized_total || 0;
+    unrealizedTotal += a.performance.unrealized_total || 0;
+    for (const [k, v] of Object.entries(a.performance.by_symbol || {})) {
+      if (!bySymbol[k]) { bySymbol[k] = { ...v }; continue; }
+      bySymbol[k].realized_total += v.realized_total;
+      bySymbol[k].unrealized_total += v.unrealized_total;
+      bySymbol[k].total = bySymbol[k].realized_total + bySymbol[k].unrealized_total;
+    }
+  }
+
+  // If accounts share the same period (the usual case) collapse to one.
+  const periods = [...new Set(list.map(a => a.statement?.Period).filter(Boolean))];
+  return {
+    account: { Account: "ALL" },
+    statement: { Period: periods.length === 1 ? periods[0] : periods.join(" / ") },
+    nav, stocks, options,
+    performance: {
+      realized_total: realizedTotal,
+      unrealized_total: unrealizedTotal,
+      by_symbol: bySymbol,
+    },
+  };
+}
+
+function renderAccountSwitcher() {
+  const accounts = currentDataRef.allAccounts;
+  const el = $("account-switcher");
+  if (!accounts || Object.keys(accounts).length < 2) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  const ids = Object.keys(accounts).sort();
+  // Individual accounts first; "总账户" merge view as the trailing option.
+  el.innerHTML = `<span class="label">账号</span>`
+    + ids.map(id => `<button data-acct="${id}">${maskAccountId(id)}</button>`).join("")
+    + `<button data-acct="ALL">总账户</button>`;
+  el.querySelectorAll("button").forEach(btn => {
+    if (btn.dataset.acct === currentDataRef.selected) btn.classList.add("active");
+    btn.addEventListener("click", () => {
+      currentDataRef.selected = btn.dataset.acct;
+      el.querySelectorAll("button").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      renderSelected();
+    });
+  });
+}
+
+function renderSelected() {
+  const accounts = currentDataRef.allAccounts;
+  const sel = currentDataRef.selected;
+  const data = sel === "ALL" ? mergeAccounts(accounts) : accounts[sel];
+  currentDataRef.data = data;
+  render(data);
+}
 
 async function loadPortfolio() {
   const res = await fetch("/api/portfolio");
-  const data = await res.json();
-  if (data.empty) {
+  const payload = await res.json();
+  if (payload.empty) {
     $("empty").hidden = false;
     $("dashboard").hidden = true;
     return;
   }
   $("empty").hidden = true;
   $("dashboard").hidden = false;
-  currentDataRef.data = data;
-  render(data);
+  // Accept both new multi-account payload and legacy single-account shape.
+  const accounts = payload.accounts || { "default": payload };
+  currentDataRef.allAccounts = accounts;
+  // Default to the alphabetically-first account (puts U17xxxx ahead of U22xxxx)
+  // rather than the merged view — most viewing happens per-account.
+  if (!currentDataRef.selected || (currentDataRef.selected !== "ALL" && !accounts[currentDataRef.selected])) {
+    const ids = Object.keys(accounts).sort();
+    currentDataRef.selected = ids[0];
+  }
+  renderAccountSwitcher();
+  renderSelected();
 }
 
 function render(data) {
@@ -43,13 +171,29 @@ function render(data) {
 
   // Account line — show masked account + period, hide name
   const acct = account.Account || "";
-  const masked = acct ? acct.slice(0, 4) + "*".repeat(Math.max(0, acct.length - 6)) + acct.slice(-2) : "";
+  const masked = acct === "ALL" ? "总账户" : maskAccountId(acct);
   const period = statement.Period || "";
   $("account-line").textContent = [masked, period].filter(Boolean).join(" · ") || "已导入";
 
   // KPIs
   $("kpi-nav").textContent = fmtMoney(totalNav);
-  $("kpi-twr").textContent = nav.twr ? `时间加权收益率 ${fmtPct(nav.twr, 2)}` : "时间加权收益率 —";
+  const twrEl = $("kpi-twr");
+  // Preference: TWR (official, only present in legacy Activity Statement
+  // uploads) → annualized money multiplier (computed from Flex cash flows).
+  // IRR is kept on the data but not displayed — it overweights early
+  // deposits and tends to print misleadingly high numbers when the account
+  // ramped up mid-period.
+  const mm = nav.money_multiplier;
+  if (nav.twr) {
+    twrEl.textContent = `时间加权收益率 ${fmtPct(nav.twr, 2)}`;
+    twrEl.hidden = false;
+  } else if (mm && mm.annualized != null) {
+    twrEl.textContent = `年化回报率 ${fmtPct(mm.annualized, 1)}`;
+    twrEl.title = `期间净入金 ${fmtMoney(mm.gross_in)} · 净收益 ${fmtMoney(mm.net_gain)} · ${mm.days} 天`;
+    twrEl.hidden = false;
+  } else {
+    twrEl.hidden = true;
+  }
 
   $("kpi-stock").textContent = fmtMoney(adjStock);
   $("kpi-stock-pct").textContent = `占总净值 ${fmtPct(adjStock / totalNav)}`;
@@ -398,7 +542,71 @@ function renderRankings(bySymbol) {
   $("losers").innerHTML = render(losers, "down", "");
 }
 
+function showToast(kind, title, detail = "", durationMs = 4500) {
+  const el = $("toast");
+  el.className = `toast ${kind}`;
+  // textContent (not innerHTML) — title and detail can include server-supplied
+  // strings (IBKR error messages, account ids) that must not be parsed as HTML.
+  el.replaceChildren();
+  const titleEl = document.createElement("div");
+  titleEl.className = "toast-title";
+  titleEl.textContent = title;
+  el.appendChild(titleEl);
+  if (detail) {
+    const detailEl = document.createElement("div");
+    detailEl.className = "toast-detail";
+    detailEl.textContent = detail;
+    el.appendChild(detailEl);
+  }
+  el.hidden = false;
+  clearTimeout(el._timer);
+  el._timer = setTimeout(() => { el.hidden = true; }, durationMs);
+}
+
+async function refreshFromIBKR() {
+  const btn = $("refresh-btn");
+  if (btn.disabled) return;
+  btn.disabled = true;
+  btn.classList.add("spinning");
+  const label = btn.querySelector(".refresh-label");
+  const origLabel = label.textContent;
+  label.textContent = "同步中...";
+  try {
+    const res = await fetch("/api/refresh", { method: "POST" });
+    const data = await res.json();
+    if (res.status === 429) {
+      showToast("warn", "请稍后再试", data.error || "刷新过于频繁");
+      return;
+    }
+    if (!res.ok) {
+      showToast("error", "同步失败", data.error || `HTTP ${res.status}`);
+      return;
+    }
+    const ok = (data.results || []).filter(r => r.ok);
+    const failed = (data.results || []).filter(r => !r.ok);
+    const okAccts = ok.flatMap(r => r.accounts || []);
+    if (ok.length && !failed.length) {
+      showToast("success", "已更新", okAccts.join(" + ") || "数据已同步");
+    } else if (ok.length && failed.length) {
+      showToast("warn", "部分成功",
+        `成功: ${okAccts.join(", ")} / 失败: ${failed.map(f => `${f.tag} (${f.error})`).join("; ")}`);
+    } else {
+      const first = failed[0] || {};
+      showToast("error", "同步失败", first.error || "未知错误");
+    }
+    if (ok.length) await loadPortfolio();
+  } catch (exc) {
+    showToast("error", "同步失败", String(exc));
+  } finally {
+    btn.disabled = false;
+    btn.classList.remove("spinning");
+    label.textContent = origLabel;
+  }
+}
+
 document.addEventListener("DOMContentLoaded", () => {
+  $("refresh-btn").addEventListener("click", refreshFromIBKR);
+
   $("file").addEventListener("change", async (e) => {
     const f = e.target.files[0];
     if (!f) return;
