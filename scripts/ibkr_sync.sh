@@ -54,7 +54,7 @@
 # -----------------------------------------------------
 #   ACCOUNTS="TOKEN_A:QUERY_ID_A TOKEN_B:QUERY_ID_B"
 #   BASIC_AUTH="admin:yourpassword"
-#   UPLOAD_URL="https://nomad403.cc/api/upload"
+#   UPLOAD_URL="https://your-domain.example/api/upload"
 # ============================================================================
 
 # `set -e`  → fail fast on any non-zero exit

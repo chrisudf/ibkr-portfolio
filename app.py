@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 from threading import Lock
@@ -33,8 +34,39 @@ app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB
 # through IBKR's per-query throttle quota — IBKR locks a query for ~30 min
 # if hit too often, success or not, so we cool down on every attempt.
 REFRESH_MIN_INTERVAL_SEC = 5 * 60
+# In-process state: only authoritative because the Dockerfile runs a single
+# Gunicorn worker (threads share this dict). Adding workers would need a
+# cross-process lock (file lock / redis) instead.
 _refresh_state = {"last_started": 0.0, "in_progress": False}
 _refresh_lock = Lock()
+
+# Account ids become filenames (uploads/{id}.json) and come from parsed
+# user uploads, so anything outside this alphabet is rejected — blocks
+# path traversal via a crafted ClientAccountID. Real IBKR ids (U1234567,
+# DU1234567) and our "default" fallback all pass.
+_ACCT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+
+
+def _save_accounts(payload: dict) -> tuple[list[str], list[str]]:
+    """Write per-account JSON files; returns (saved, skipped) account ids.
+
+    Writes to a temp file then os.replace so a concurrent reader never
+    sees a half-written JSON.
+    """
+    saved: list[str] = []
+    skipped: list[str] = []
+    for acct_id, data in (payload.get("accounts") or {}).items():
+        if not _ACCT_ID_RE.match(acct_id or ""):
+            app.logger.warning("refusing to save account with unsafe id %r", acct_id)
+            skipped.append(str(acct_id))
+            continue
+        out_path = UPLOAD_DIR / f"{acct_id}.json"
+        tmp_path = out_path.with_name(out_path.name + ".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as out:
+            json.dump(data, out, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, out_path)
+        saved.append(acct_id)
+    return saved, skipped
 
 
 @app.get("/")
@@ -43,9 +75,16 @@ def index():
 
 
 def _load_all_accounts() -> dict:
-    """Read every uploads/U*.json into a single multi-account payload."""
+    """Read every per-account uploads/*.json into a multi-account payload.
+
+    Matches all JSON files (not just U*.json) so accounts saved under the
+    "default" fallback id still show up; only the legacy single-portfolio
+    file is excluded.
+    """
     accounts: dict[str, dict] = {}
-    for path in sorted(UPLOAD_DIR.glob("U*.json")):
+    for path in sorted(UPLOAD_DIR.glob("*.json")):
+        if path.name == LEGACY_STATE_FILE.name or path.name.startswith("."):
+            continue
         try:
             with open(path, "r", encoding="utf-8") as f:
                 accounts[path.stem] = json.load(f)
@@ -91,14 +130,14 @@ def upload():
     except Exception as exc:  # pragma: no cover - surface parsing errors to UI
         return jsonify({"error": f"parse failed: {exc}"}), 400
 
-    saved = []
-    for acct_id, data in payload.get("accounts", {}).items():
-        out_path = UPLOAD_DIR / f"{acct_id}.json"
-        with open(out_path, "w", encoding="utf-8") as out:
-            json.dump(data, out, ensure_ascii=False, indent=2)
-        saved.append(acct_id)
+    saved, skipped = _save_accounts(payload)
+    if skipped and not saved:
+        return jsonify({"error": "statement contains no valid account ids"}), 400
 
-    return jsonify({"ok": True, "accounts": saved})
+    resp = {"ok": True, "accounts": saved}
+    if skipped:
+        resp["skipped"] = skipped
+    return jsonify(resp)
 
 
 @app.post("/api/refresh")
@@ -139,17 +178,19 @@ def refresh():
     results: list[dict] = []
     try:
         for spec in specs:
-            entry = {"query_id": spec.query_id, "tag": spec.tag}
+            # tag only — the UI doesn't need query ids and there's no point
+            # echoing config back out of the API.
+            entry = {"tag": spec.tag}
             try:
                 csv_body = fetch_one(spec)
                 payload = parse_ibkr_auto(csv_body)
-                saved = []
-                for acct_id, data in payload.get("accounts", {}).items():
-                    out_path = UPLOAD_DIR / f"{acct_id}.json"
-                    with open(out_path, "w", encoding="utf-8") as out:
-                        json.dump(data, out, ensure_ascii=False, indent=2)
-                    saved.append(acct_id)
-                entry.update({"ok": True, "accounts": saved})
+                saved, skipped = _save_accounts(payload)
+                if saved:
+                    entry.update({"ok": True, "accounts": saved})
+                    if skipped:
+                        entry["skipped"] = skipped
+                else:
+                    entry.update({"ok": False, "error": "statement contains no valid account ids"})
             except FlexFetchError as exc:
                 entry.update({"ok": False, "error": str(exc), "code": exc.code,
                               "permanent": exc.permanent})

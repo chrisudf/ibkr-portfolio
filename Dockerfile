@@ -14,6 +14,12 @@ COPY . .
 ENV PORT=8000
 EXPOSE 8000
 
-# Timeout has to exceed the worst-case /api/refresh runtime: fetch_one
-# polls up to 60 × 5s = 300s, plus parse + write. 360s gives headroom.
-CMD ["gunicorn", "-w", "2", "-b", "0.0.0.0:8000", "--timeout", "360", "app:app"]
+# Single worker + thread pool, on purpose:
+# - app.py's refresh cooldown/lock is in-process state, so it is only
+#   authoritative with exactly one worker. More workers would let refreshes
+#   run concurrently and bypass the IBKR throttle guard.
+# - gthread heartbeats from its accept loop, not per-request, so a long
+#   /api/refresh (up to ~300s per account, accounts fetched serially) can't
+#   trip the worker timeout the way sync workers would. Timeout is
+#   liveness-only here; other threads keep serving the UI meanwhile.
+CMD ["gunicorn", "-w", "1", "--threads", "8", "-b", "0.0.0.0:8000", "--timeout", "120", "app:app"]

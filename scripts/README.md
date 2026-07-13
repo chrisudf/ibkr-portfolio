@@ -6,7 +6,7 @@
 ## 一次性配置（在 droplet 上）
 
 ```bash
-ssh root@167.71.193.42
+ssh deploy@<your-droplet-ip>   # 用普通用户，别用 root
 cd /opt/ibkr-portfolio/scripts
 cp sync.env.example sync.env
 chmod 600 sync.env
@@ -15,7 +15,7 @@ vim sync.env   # 填入 token、query_id、basic auth、域名
 
 `ACCOUNTS` 支持多账号，用空格分隔，每对 `TOKEN:QUERY_ID`：
 ```
-ACCOUNTS="aaaaTOKEN1:1549141 bbbbTOKEN2:1549142"
+ACCOUNTS="aaaaTOKEN1:1111111 bbbbTOKEN2:2222222"
 ```
 
 ## 手动跑一次确认能跑通
@@ -25,12 +25,12 @@ ACCOUNTS="aaaaTOKEN1:1549141 bbbbTOKEN2:1549142"
 ```
 正常输出大致是：
 ```
-[…] [154914] requesting statement (query=1549141)…
-[…] [154914] ref=1234567890, polling…
-[…] [154914] still generating (1/30)…
-[…] [154914] downloaded 1472 lines
-[…] [154914] uploading to https://nomad403.cc/api/upload…
-[…] [154914] uploaded OK (200)
+[…] [111111] requesting statement (query=1111111)…
+[…] [111111] ref=1234567890, polling…
+[…] [111111] still generating (1/30)…
+[…] [111111] downloaded 1472 lines
+[…] [111111] uploading to https://your-domain.example/api/upload…
+[…] [111111] uploaded OK (200)
 […] all accounts synced
 ```
 

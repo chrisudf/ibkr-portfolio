@@ -146,7 +146,9 @@ async function loadPortfolio() {
   $("empty").hidden = true;
   $("dashboard").hidden = false;
   // Accept both new multi-account payload and legacy single-account shape.
-  const accounts = payload.accounts || { "default": payload };
+  // For legacy, key by the real account id when present so the account
+  // switcher doesn't label it as a masked "default".
+  const accounts = payload.accounts || { [payload.account?.Account || "default"]: payload };
   currentDataRef.allAccounts = accounts;
   // Default to the alphabetically-first account (puts U17xxxx ahead of U22xxxx)
   // rather than the merged view — most viewing happens per-account.
