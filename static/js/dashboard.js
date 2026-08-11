@@ -210,9 +210,12 @@ function render(data) {
   // ramped up mid-period.
   const mm = nav.money_multiplier;
   // Both branches are scoped to the statement period, so both carry the
-  // window in the label. Prefer the statement's own dates; mm.days is the
-  // fallback (and the only source for the merged view, which has no Period).
-  const spanDays = periodDays(period) || (mm && mm.days) || 0;
+  // window in the label. Single accounts read it off statement.Period.
+  // The merged view must NOT: mergeAccounts() joins differing periods into
+  // one string ("A / B") while annualizing over the longest mm.days, so
+  // parsing that string would label the number with the wrong window —
+  // it'd pick up whichever range happens to be listed first.
+  const spanDays = (acct === "ALL" ? 0 : periodDays(period)) || (mm && mm.days) || 0;
   const span = fmtSpan(spanDays);
   const suffix = span ? `（${span}）` : "";
   const scopeHint = `${span ? span + "，" : ""}按报表期间计算，非开户至今`;
