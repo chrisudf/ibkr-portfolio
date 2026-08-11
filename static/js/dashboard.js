@@ -12,6 +12,29 @@ const fmtMoney = (v, digits = 0) => {
 const fmtPct = (v, digits = 1) => (v * 100).toFixed(digits) + "%";
 const fmtNum = (v, digits = 2) => Number(v).toLocaleString("en-US", { maximumFractionDigits: digits, minimumFractionDigits: digits });
 
+// The return KPI is computed over the Flex query's period, NOT since account
+// inception — a "Last 365 Calendar Days" query on an account opened earlier
+// simply can't see the first months. Label the window explicitly so the
+// number isn't mistaken for a lifetime return.
+// "2025-07-10 → 2026-07-09" → 364. Returns 0 for the "截至 YYYY-MM-DD"
+// fallback period and anything else we can't read two dates out of.
+const periodDays = (period) => {
+  const m = (period || "").match(/(\d{4}-\d{2}-\d{2})\D+(\d{4}-\d{2}-\d{2})/);
+  if (!m) return 0;
+  const days = Math.round((Date.parse(m[2]) - Date.parse(m[1])) / 86400000);
+  return days > 0 ? days : 0;
+};
+
+const fmtSpan = (days) => {
+  if (!days || days <= 0) return "";
+  if (days >= 350) {
+    const yrs = days / 365;
+    return yrs >= 1.9 ? `近 ${yrs.toFixed(1)} 年` : "近 12 个月";
+  }
+  const months = Math.round(days / 30.44);
+  return months >= 2 ? `近 ${months} 个月` : `近 ${days} 天`;
+};
+
 const $ = (id) => document.getElementById(id);
 
 const currentDataRef = { data: null, allAccounts: null, selected: null };
@@ -186,12 +209,21 @@ function render(data) {
   // deposits and tends to print misleadingly high numbers when the account
   // ramped up mid-period.
   const mm = nav.money_multiplier;
+  // Both branches are scoped to the statement period, so both carry the
+  // window in the label. Prefer the statement's own dates; mm.days is the
+  // fallback (and the only source for the merged view, which has no Period).
+  const spanDays = periodDays(period) || (mm && mm.days) || 0;
+  const span = fmtSpan(spanDays);
+  const suffix = span ? `（${span}）` : "";
+  const scopeHint = `${span ? span + "，" : ""}按报表期间计算，非开户至今`;
   if (nav.twr) {
-    twrEl.textContent = `时间加权收益率 ${fmtPct(nav.twr, 2)}`;
+    twrEl.textContent = `时间加权收益率 ${fmtPct(nav.twr, 2)}${suffix}`;
+    twrEl.title = `${scopeHint} · 报表期间 ${period || "—"}`;
     twrEl.hidden = false;
   } else if (mm && mm.annualized != null) {
-    twrEl.textContent = `年化回报率 ${fmtPct(mm.annualized, 1)}`;
-    twrEl.title = `期间净入金 ${fmtMoney(mm.gross_in)} · 净收益 ${fmtMoney(mm.net_gain)} · ${mm.days} 天`;
+    twrEl.textContent = `年化回报率 ${fmtPct(mm.annualized, 1)}${suffix}`;
+    twrEl.title = `${scopeHint} · `
+      + `期间净入金 ${fmtMoney(mm.gross_in)} · 净收益 ${fmtMoney(mm.net_gain)} · ${mm.days} 天`;
     twrEl.hidden = false;
   } else {
     twrEl.hidden = true;

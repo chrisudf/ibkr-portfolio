@@ -80,7 +80,10 @@ def _empty_account() -> dict[str, Any]:
         "options": [],
         "options_by_underlying": {},
         "performance": {"realized_total": 0.0, "unrealized_total": 0.0, "by_symbol": {}},
+        "cash_flows": [],   # persisted ledger: one id-keyed entry per external flow
         "_cash_flows": [],  # raw (date, amount) for IRR; stripped before serialising
+        "_cf_ids": set(),   # flow ids already ingested this parse; stripped
+        "_cf_synth_seq": {},  # composite-key occurrence counter; stripped
         "_starting_cash": 0.0,
         "_from_date": "",
         "_to_date": "",
@@ -247,6 +250,39 @@ def _ingest_change_in_nav(account: dict[str, Any], row: dict[str, str]) -> None:
 _EXTERNAL_CF_CODES = {"DEP", "WITH", "BWT", "DPI", "WTI"}
 
 
+# IBKR's own per-row unique key for Statement of Funds. The exact spelling
+# has drifted between Flex versions, so try the known ones in order rather
+# than betting on a single string.
+_TXN_ID_COLUMNS = ("TransactionID", "TransactionId", "TransactionID(Trade)")
+
+
+def _cash_flow_id(account: dict[str, Any], row: dict[str, str], d: date,
+                  code: str, amount: float) -> str:
+    """Stable identity for one cash-flow row, so overlapping statements can
+    be deduped instead of double-counted.
+
+    Prefers IBKR's TransactionID (prefixed `txn:`). If the Flex query wasn't
+    configured to include that column we synthesise a composite key
+    (prefixed `synth:`) from date+code+amount, plus an occurrence ordinal —
+    two identical deposits on the same day are otherwise indistinguishable,
+    and silently collapsing them would understate deposits and overstate IRR.
+
+    The prefix is deliberately visible in the saved JSON: if you ever see
+    `synth:` in uploads/*.json, add "Transaction ID" to the Flex query's
+    Statement of Funds column list and the ids become reliable. The ordinal
+    is only stable when both statements cover that whole day, so a merge
+    across a mid-day boundary can still mis-key `synth:` rows.
+    """
+    for col in _TXN_ID_COLUMNS:
+        txn = (row.get(col) or "").strip()
+        if txn:
+            return f"txn:{txn}"
+    base = f"{d.isoformat()}|{code}|{amount:.2f}"
+    seq = account["_cf_synth_seq"].get(base, 0) + 1
+    account["_cf_synth_seq"][base] = seq
+    return f"synth:{base}|{seq}"
+
+
 def _ingest_statement_of_funds(account: dict[str, Any], row: dict[str, str]) -> None:
     code = row.get("ActivityCode", "")
     if code not in _EXTERNAL_CF_CODES:
@@ -257,6 +293,19 @@ def _ingest_statement_of_funds(account: dict[str, Any], row: dict[str, str]) -> 
     amount = _to_float(row.get("Amount"))
     if amount == 0:
         return
+    flow_id = _cash_flow_id(account, row, d, code, amount)
+    # A repeated id within one statement means IBKR handed us the same row
+    # twice; drop it rather than double-count the deposit.
+    if flow_id in account["_cf_ids"]:
+        return
+    account["_cf_ids"].add(flow_id)
+    account["cash_flows"].append({
+        "id": flow_id,
+        "date": d.isoformat(),
+        "code": code,
+        "amount": amount,
+        "description": (row.get("ActivityDescription") or "").strip(),
+    })
     # IBKR's sign on Amount: deposit positive, withdrawal negative.
     # Keep that convention here; compute_account_returns flips for IRR.
     account["_cash_flows"].append((d, amount))
@@ -330,8 +379,11 @@ def parse_ibkr_flex_csv(content: str) -> dict[str, Any]:
         acct["nav"]["irr_annualized"] = returns["irr_annualized"]
         acct["nav"]["money_multiplier"] = returns["money_multiplier"]
         acct["nav"]["return_method"] = returns["method"]
-        # Strip internal scratch state before serialising.
-        for k in ("_cash_flows", "_starting_cash", "_from_date", "_to_date"):
+        acct["cash_flows"].sort(key=lambda f: (f["date"], f["id"]))
+        # Strip internal scratch state before serialising. _cf_ids is a set
+        # and would blow up json.dump if it ever survived to the writer.
+        for k in ("_cash_flows", "_cf_ids", "_cf_synth_seq",
+                  "_starting_cash", "_from_date", "_to_date"):
             acct.pop(k, None)
 
     return {"accounts": dict(accounts)}
