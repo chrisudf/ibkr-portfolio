@@ -455,6 +455,25 @@ def _ingest_statement_of_funds(account: dict[str, Any], row: dict[str, str]) -> 
     account["_cash_flows"].append((d, amount))
 
 
+def describe_sections(content: str) -> list[str]:
+    """Which sections a Flex CSV actually contains, as classified names.
+
+    Diagnostic only. A refresh that succeeds but shows no dividends is almost
+    always a query-configuration problem rather than a parsing one, and the
+    fastest way to tell them apart is to see whether CashTransactions /
+    StatementOfFunds came back at all. Unknown sections are reported with
+    their first few column names so an unrecognised section is identifiable
+    without re-downloading the statement.
+    """
+    seen: list[str] = []
+    for header, rows in _section_rows(content):
+        kind = _classify_section(header)
+        if kind == "Unknown":
+            kind = "Unknown(" + ",".join(header[1:4]) + ")"
+        seen.append(f"{kind}[{len(rows)}]")
+    return seen
+
+
 def parse_ibkr_flex_csv(content: str) -> dict[str, Any]:
     accounts: dict[str, dict[str, Any]] = defaultdict(_empty_account)
 

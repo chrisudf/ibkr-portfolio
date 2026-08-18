@@ -8,6 +8,7 @@ Then open http://127.0.0.1:5050/
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import time
@@ -18,6 +19,7 @@ from flask import Flask, jsonify, render_template, request
 
 from parser import parse_ibkr_auto, parse_ibkr_pdf
 from parser.flex_fetch import FlexFetchError, fetch_one, parse_accounts_env
+from parser.ibkr_flex_csv import describe_sections
 
 BASE_DIR = Path(__file__).parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -28,6 +30,16 @@ LEGACY_STATE_FILE = UPLOAD_DIR / "last_portfolio.json"
 
 app = Flask(__name__, template_folder=str(BASE_DIR / "templates"), static_folder=str(BASE_DIR / "static"))
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB
+
+# Under gunicorn, Flask's logger sits at NOTSET and inherits the root's
+# WARNING, which would swallow the refresh diagnostics at exactly the moment
+# they matter (a *successful* fetch logs the section list at INFO). Opt in
+# explicitly, and borrow gunicorn's handlers when it is the one serving so the
+# lines land in the same stream as the access log.
+_gunicorn_logger = logging.getLogger("gunicorn.error")
+if _gunicorn_logger.handlers:
+    app.logger.handlers = _gunicorn_logger.handlers
+app.logger.setLevel(logging.INFO)
 
 # Minimum gap between /api/refresh attempts (gating is on attempt-start,
 # regardless of success or failure). Prevents button-spam from chewing
@@ -183,18 +195,33 @@ def refresh():
             entry = {"tag": spec.tag}
             try:
                 csv_body = fetch_one(spec)
+                # A refresh you had to wait out a throttle for is worth one log
+                # line: the section list says whether the *query* carries what
+                # a panel needs (Cash Transactions for dividends, say), which
+                # no amount of re-reading the parser can tell you.
+                sections = describe_sections(csv_body)
+                app.logger.info("[%s] fetched %d bytes, sections: %s",
+                                spec.tag, len(csv_body), ", ".join(sections) or "none")
                 payload = parse_ibkr_auto(csv_body)
                 saved, skipped = _save_accounts(payload)
                 if saved:
-                    entry.update({"ok": True, "accounts": saved})
+                    entry.update({"ok": True, "accounts": saved, "sections": sections})
                     if skipped:
                         entry["skipped"] = skipped
                 else:
-                    entry.update({"ok": False, "error": "statement contains no valid account ids"})
+                    entry.update({"ok": False, "error": "statement contains no valid account ids",
+                                  "sections": sections})
             except FlexFetchError as exc:
+                # exc.raw is IBKR's own envelope, token-redacted — the parsed
+                # code/message drop everything IBKR said around them, and that
+                # remainder is the whole point when the code list comes up short.
+                app.logger.warning("[%s] refresh failed: %s | code=%s permanent=%s | raw: %s",
+                                   spec.tag, exc, exc.code or "-", exc.permanent,
+                                   exc.raw or "<empty>")
                 entry.update({"ok": False, "error": str(exc), "code": exc.code,
-                              "permanent": exc.permanent})
+                              "permanent": exc.permanent, "raw": exc.raw})
             except Exception as exc:  # pragma: no cover - surface parse errors
+                app.logger.exception("[%s] parse failed", spec.tag)
                 entry.update({"ok": False, "error": f"parse failed: {exc}"})
             results.append(entry)
     finally:

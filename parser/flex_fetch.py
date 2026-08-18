@@ -31,12 +31,19 @@ class FlexFetchError(Exception):
     `permanent` distinguishes config errors (bad token, bad query) from
     transient ones (throttled, slow, weekend maintenance) so the UI can
     decide whether retrying makes sense.
+
+    `raw` holds IBKR's own response body (token-redacted, truncated). The
+    parsed code/message throw away everything IBKR said around them, which is
+    exactly what you want to read when a refresh fails for a reason the code
+    list doesn't explain.
     """
 
-    def __init__(self, message: str, *, permanent: bool = False, code: str = ""):
+    def __init__(self, message: str, *, permanent: bool = False, code: str = "",
+                 raw: str = ""):
         super().__init__(message)
         self.permanent = permanent
         self.code = code
+        self.raw = raw
 
 
 @dataclass
@@ -61,6 +68,28 @@ def parse_accounts_env(value: str) -> list[AccountSpec]:
         if token and query:
             specs.append(AccountSpec(token=token, query_id=query))
     return specs
+
+
+# The token is a query parameter on every call, so it can surface in an
+# exception string, a redirect URL echoed back, or an error envelope. Scrub it
+# before anything reaches a log line or an HTTP response.
+_TOKEN_PARAM_RE = re.compile(r"([?&]t=)[^&\s\"'<>]+")
+
+# Enough to hold a whole error envelope without dumping a stray CSV into logs.
+RAW_SNIPPET_LIMIT = 2000
+
+
+def redact(text: str, *secrets: str) -> str:
+    out = text or ""
+    for s in secrets:
+        if s:
+            out = out.replace(s, "<token>")
+    return _TOKEN_PARAM_RE.sub(lambda m: m.group(1) + "<token>", out)
+
+
+def _snippet(text: str, *secrets: str) -> str:
+    out = redact((text or "").strip(), *secrets)
+    return out[:RAW_SNIPPET_LIMIT] + ("…[truncated]" if len(out) > RAW_SNIPPET_LIMIT else "")
 
 
 def _http_get(url: str, timeout: float = 30.0) -> str:
@@ -91,7 +120,8 @@ def fetch_one(
     try:
         send_resp = _http_get(send_url, timeout=30)
     except Exception as exc:  # network blip
-        raise FlexFetchError(f"network error on SendRequest: {exc}") from exc
+        raise FlexFetchError(
+            redact(f"network error on SendRequest: {exc}", spec.token)) from exc
 
     status = _find_tag(send_resp, "Status")
     if status != "Success":
@@ -101,24 +131,28 @@ def fetch_one(
             f"IBKR refused request: code={code} msg={msg}",
             permanent=code in PERMANENT_CODES,
             code=code,
+            raw=_snippet(send_resp, spec.token),
         )
 
     ref = _find_tag(send_resp, "ReferenceCode")
     if not ref:
-        raise FlexFetchError("SendRequest succeeded but no ReferenceCode in response")
+        raise FlexFetchError("SendRequest succeeded but no ReferenceCode in response",
+                             raw=_snippet(send_resp, spec.token))
 
     # --- Step 2: poll GetStatement until ready --------------------------------
     # First poll fires immediately — small queries are often ready by the
     # time SendRequest returns the reference code. Subsequent iterations
     # sleep between attempts.
     get_url = f"{API_BASE}.GetStatement?{urllib.parse.urlencode({'t': spec.token, 'q': ref, 'v': 3})}"
+    body = ""  # so the give-up branch below can report the last thing we saw
     for attempt in range(max_polls):
         if attempt > 0:
             time.sleep(poll_interval)
         try:
             body = _http_get(get_url, timeout=60)
         except Exception as exc:
-            raise FlexFetchError(f"network error on GetStatement: {exc}") from exc
+            raise FlexFetchError(
+                redact(f"network error on GetStatement: {exc}", spec.token)) from exc
         # IBKR's "still generating" status comes back as an XML envelope
         # carrying the literal phrase, sometimes with ErrorCode 1019.
         if "Statement generation in progress" in body:
@@ -131,6 +165,7 @@ def fetch_one(
                 f"IBKR error on download: code={code} msg={msg}",
                 permanent=code in PERMANENT_CODES,
                 code=code,
+                raw=_snippet(body, spec.token),
             )
         # Anything else is the raw CSV body.
         return body
@@ -138,6 +173,7 @@ def fetch_one(
     raise FlexFetchError(
         f"IBKR still generating after {int(max_polls * poll_interval)}s — try again later",
         code="timeout",
+        raw=_snippet(body, spec.token),
     )
 
 
