@@ -68,6 +68,11 @@ def _classify_section(header: list[str]) -> str:
         return "Trades"
     if {"ActivityCode", "Amount", "Balance"} <= cols:
         return "StatementOfFunds"
+    # Cash Transactions carries the same Amount column but no running Balance;
+    # its distinguishing pair is Type ("Dividends", "Withholding Tax", ...)
+    # alongside a settlement date.
+    if {"Type", "Amount", "SettleDate"} <= cols:
+        return "CashTransactions"
     return "Unknown"
 
 
@@ -81,9 +86,15 @@ def _empty_account() -> dict[str, Any]:
         "options_by_underlying": {},
         "performance": {"realized_total": 0.0, "unrealized_total": 0.0, "by_symbol": {}},
         "cash_flows": [],   # persisted ledger: one id-keyed entry per external flow
+        "dividends": {},    # aggregated payout summary, built in finalize
         "_cash_flows": [],  # raw (date, amount) for IRR; stripped before serialising
         "_cf_ids": set(),   # flow ids already ingested this parse; stripped
         "_cf_synth_seq": {},  # composite-key occurrence counter; stripped
+        # Dividend rows land in one bucket per source section; finalize picks a
+        # single winner so a query carrying both doesn't double-count.
+        "_div_cash": [],    # from Cash Transactions
+        "_div_sof": [],     # from Statement of Funds
+        "_div_ids": set(),
         "_starting_cash": 0.0,
         "_from_date": "",
         "_to_date": "",
@@ -283,8 +294,141 @@ def _cash_flow_id(account: dict[str, Any], row: dict[str, str], d: date,
     return f"synth:{base}|{seq}"
 
 
+# --- Dividends -------------------------------------------------------------
+#
+# Two Flex sections can carry payouts and a query may enable either or both:
+#
+#   Cash Transactions  → Type = "Dividends" / "Payment In Lieu Of Dividends"
+#                        / "Withholding Tax"
+#   Statement of Funds → ActivityCode = DIV / PIL / FRTAX
+#
+# They describe the same money, so ingesting both would double every payout.
+# Each source fills its own bucket during the row scan and `_finalize_dividends`
+# picks exactly one. Cash Transactions wins when present: it is the section
+# purpose-built for this and always carries a Symbol, whereas Statement of
+# Funds rows occasionally settle a payout against a blank symbol.
+
+_DIV_GROSS_CODES = {"DIV", "PIL"}
+_DIV_TAX_CODES = {"FRTAX"}
+
+_DIV_CASH_TYPES = {
+    "dividends": "gross",
+    "payment in lieu of dividends": "gross",
+    "withholding tax": "tax",
+}
+
+# "MSFT(US5949181045) Cash Dividend USD 0.83 per Share" → MSFT. Used only when
+# the row itself has no Symbol column filled in.
+_DIV_SYMBOL_RE = re.compile(r"^([A-Z][A-Z0-9\.]{0,9})\s*\(")
+
+
+def _dividend_symbol(row: dict[str, str]) -> str:
+    sym = (row.get("Symbol") or "").strip()
+    if sym:
+        return sym
+    desc = (row.get("Description") or row.get("ActivityDescription") or "").strip()
+    m = _DIV_SYMBOL_RE.match(desc)
+    return m.group(1) if m else "—"
+
+
+def _dividend_id(account: dict[str, Any], prefix: str, d: date, sym: str,
+                 kind: str, amount: float, row: dict[str, str]) -> str | None:
+    """Dedupe key for one payout row; None means "already seen, skip"."""
+    for col in _TXN_ID_COLUMNS:
+        txn = (row.get(col) or "").strip()
+        if txn:
+            key = f"{prefix}:txn:{txn}"
+            break
+    else:
+        key = f"{prefix}:{d.isoformat()}|{sym}|{kind}|{amount:.4f}"
+    if key in account["_div_ids"]:
+        return None
+    account["_div_ids"].add(key)
+    return key
+
+
+def _ingest_dividend_row(account: dict[str, Any], bucket: str, d: date, sym: str,
+                         kind: str, amount: float, row: dict[str, str]) -> None:
+    if _dividend_id(account, bucket, d, sym, kind, amount, row) is None:
+        return
+    account[bucket].append({
+        "date": d.isoformat(),
+        "symbol": sym,
+        "kind": kind,  # "gross" (dividend / payment in lieu) or "tax" (withheld)
+        "amount": amount,
+        "description": (row.get("Description") or row.get("ActivityDescription") or "").strip(),
+    })
+
+
+def _ingest_cash_transaction(account: dict[str, Any], row: dict[str, str]) -> None:
+    kind = _DIV_CASH_TYPES.get((row.get("Type") or "").strip().lower())
+    if kind is None:
+        return
+    # SettleDate is when the cash actually lands; DateTime is the ex/pay stamp
+    # and can carry a time suffix, so prefer SettleDate and fall back.
+    raw = (row.get("SettleDate") or row.get("DateTime") or "")[:8]
+    d = _parse_date(raw)
+    if d is None:
+        return
+    amount = _to_float(row.get("Amount"))
+    if amount == 0:
+        return
+    _ingest_dividend_row(account, "_div_cash", d, _dividend_symbol(row), kind, amount, row)
+
+
+def _finalize_dividends(account: dict[str, Any]) -> None:
+    """Collapse the raw payout rows into the summary the dashboard renders."""
+    rows = account["_div_cash"] or account["_div_sof"]
+    source = "cash_transactions" if account["_div_cash"] else (
+        "statement_of_funds" if account["_div_sof"] else "")
+    if not rows:
+        account["dividends"] = {}
+        return
+
+    by_symbol: dict[str, dict[str, Any]] = {}
+    by_month: dict[str, dict[str, Any]] = {}
+    gross = tax = 0.0
+    for r in rows:
+        # Withholding arrives as a negative amount; keep IBKR's sign so
+        # gross + tax = net falls out without special-casing.
+        if r["kind"] == "gross":
+            gross += r["amount"]
+        else:
+            tax += r["amount"]
+        s = by_symbol.setdefault(r["symbol"], {
+            "symbol": r["symbol"], "gross": 0.0, "tax": 0.0, "net": 0.0,
+            "count": 0, "last_date": "",
+        })
+        s[r["kind"]] += r["amount"]
+        s["net"] = s["gross"] + s["tax"]
+        if r["kind"] == "gross":
+            s["count"] += 1
+        s["last_date"] = max(s["last_date"], r["date"])
+        m = by_month.setdefault(r["date"][:7], {"month": r["date"][:7], "gross": 0.0, "tax": 0.0, "net": 0.0})
+        m[r["kind"]] += r["amount"]
+        m["net"] = m["gross"] + m["tax"]
+
+    account["dividends"] = {
+        "source": source,
+        "gross": gross,
+        "tax": tax,
+        "net": gross + tax,
+        "by_symbol": sorted(by_symbol.values(), key=lambda x: x["net"], reverse=True),
+        "by_month": sorted(by_month.values(), key=lambda x: x["month"]),
+        "events": sorted(rows, key=lambda r: (r["date"], r["symbol"]), reverse=True),
+    }
+
+
 def _ingest_statement_of_funds(account: dict[str, Any], row: dict[str, str]) -> None:
     code = row.get("ActivityCode", "")
+    if code in _DIV_GROSS_CODES or code in _DIV_TAX_CODES:
+        d = _parse_date(row.get("Date", "") or row.get("SettleDate", ""))
+        amount = _to_float(row.get("Amount"))
+        if d is not None and amount != 0:
+            kind = "gross" if code in _DIV_GROSS_CODES else "tax"
+            _ingest_dividend_row(account, "_div_sof", d, _dividend_symbol(row),
+                                 kind, amount, row)
+        return
     if code not in _EXTERNAL_CF_CODES:
         return
     d = _parse_date(row.get("Date", ""))
@@ -337,6 +481,8 @@ def parse_ibkr_flex_csv(content: str) -> dict[str, Any]:
                 _ingest_pnl_summary(acct, row)
             elif kind == "StatementOfFunds":
                 _ingest_statement_of_funds(acct, row)
+            elif kind == "CashTransactions":
+                _ingest_cash_transaction(acct, row)
 
     # Sort + finalize each account
     for acct in accounts.values():
@@ -380,9 +526,11 @@ def parse_ibkr_flex_csv(content: str) -> dict[str, Any]:
         acct["nav"]["money_multiplier"] = returns["money_multiplier"]
         acct["nav"]["return_method"] = returns["method"]
         acct["cash_flows"].sort(key=lambda f: (f["date"], f["id"]))
+        _finalize_dividends(acct)
         # Strip internal scratch state before serialising. _cf_ids is a set
         # and would blow up json.dump if it ever survived to the writer.
         for k in ("_cash_flows", "_cf_ids", "_cf_synth_seq",
+                  "_div_cash", "_div_sof", "_div_ids",
                   "_starting_cash", "_from_date", "_to_date"):
             acct.pop(k, None)
 

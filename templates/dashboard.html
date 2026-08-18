@@ -90,6 +90,40 @@
         <div id="alloc-legend" class="alloc-legend"></div>
       </section>
 
+      <!-- Margin usage -->
+      <section class="panel" id="margin-panel" hidden>
+        <div class="panel-head">
+          <h2>保证金占用</h2>
+          <span class="panel-note" id="margin-note"></span>
+        </div>
+        <div class="margin-hero">
+          <div>
+            <div class="margin-hero-label">Margin 占用</div>
+            <div class="margin-hero-pct"><span id="margin-pct">—</span><small>占整个账户</small></div>
+          </div>
+          <div class="margin-hero-amount" id="margin-amount">$0</div>
+        </div>
+        <div class="margin-gauge" id="margin-gauge"></div>
+        <div class="margin-gauge-note" id="margin-gauge-note"></div>
+        <div class="margin-basis" id="margin-basis"></div>
+        <div class="table-wrap" style="margin-top:16px">
+          <table class="holdings">
+            <thead>
+              <tr>
+                <th>标的</th><th>卖出合约</th>
+                <th class="num">正股价</th>
+                <th class="num">名义抵押</th>
+                <th class="num">权利金负债</th>
+                <th class="num">保证金占用</th>
+                <th class="num">占比</th>
+              </tr>
+            </thead>
+            <tbody id="margin-body"></tbody>
+          </table>
+        </div>
+        <div class="margin-foot" id="margin-foot"></div>
+      </section>
+
       <!-- Holdings table -->
       <section class="panel">
         <div class="panel-head">
@@ -134,6 +168,49 @@
             </thead>
             <tbody id="options-body"></tbody>
           </table>
+        </div>
+      </section>
+
+      <!-- Dividends -->
+      <section class="panel" id="dividends-panel" hidden>
+        <div class="panel-head">
+          <h2>分红收入</h2>
+          <span class="panel-note" id="div-note"></span>
+        </div>
+
+        <div class="div-empty" id="div-empty" hidden>
+          <p>本期报表里没有分红记录。</p>
+          <p class="hint">如果持仓里有派息标的却读不到数据，多半是 Flex Query 没勾选
+            <b>Cash Transactions</b>（建议，含 Dividends / Payment In Lieu / Withholding Tax）
+            或 <b>Statement of Funds</b>。勾上后重新刷新即可。</p>
+        </div>
+
+        <div id="div-content" hidden>
+          <div class="div-hero">
+            <div>
+              <div class="div-hero-label">期间净分红</div>
+              <div class="div-hero-value" id="div-net">$0</div>
+              <div class="div-hero-sub" id="div-gross"></div>
+            </div>
+            <div class="div-hero-yield" id="div-yield"></div>
+          </div>
+
+          <div class="div-chart" id="div-chart"></div>
+          <div class="div-chart-note" id="div-chart-note"></div>
+
+          <div class="table-wrap" style="margin-top:18px">
+            <table class="holdings">
+              <thead>
+                <tr>
+                  <th>标的</th><th class="num">次数</th>
+                  <th class="num">税前</th><th class="num">预扣税</th>
+                  <th class="num">净额</th><th class="num">占比</th>
+                  <th>最近一次</th>
+                </tr>
+              </thead>
+              <tbody id="div-body"></tbody>
+            </table>
+          </div>
         </div>
       </section>
 

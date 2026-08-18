@@ -34,6 +34,75 @@ def _parse_option_symbol(symbol: str) -> dict[str, Any] | None:
     }
 
 
+# "MSFT(US5949181045) Cash Dividend USD 0.83 per Share" → MSFT. The Activity
+# Statement's Dividends / Withholding Tax sections have no Symbol column, so
+# the ticker has to come out of the description.
+_DIV_SYMBOL_RE = re.compile(r"^([A-Z][A-Z0-9\.]{0,9})\s*\(")
+
+
+def _parse_dividends(sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Build the payout summary from the Dividends / Withholding Tax sections.
+
+    Both are plain Currency/Date/Description/Amount tables. Withholding rows
+    are already negative in IBKR's output, so gross + tax = net directly.
+    Only "Data" rows are read — the sections end with a Total row that would
+    otherwise double every figure.
+    """
+    rows: list[dict[str, Any]] = []
+    for section, kind in (("Dividends", "gross"),
+                          ("Payment In Lieu Of Dividends", "gross"),
+                          ("Withholding Tax", "tax")):
+        for r in sections.get(section, {}).get("rows", []):
+            if r.get("_kind") != "Data":
+                continue
+            amount = _to_float(r.get("Amount", "0"))
+            date = (r.get("Date") or "").strip()
+            if amount == 0 or not date:
+                continue
+            desc = (r.get("Description") or "").strip()
+            m = _DIV_SYMBOL_RE.match(desc)
+            rows.append({
+                "date": date,
+                "symbol": m.group(1) if m else "—",
+                "kind": kind,
+                "amount": amount,
+                "description": desc,
+            })
+    if not rows:
+        return {}
+
+    by_symbol: dict[str, dict[str, Any]] = {}
+    by_month: dict[str, dict[str, Any]] = {}
+    gross = tax = 0.0
+    for r in rows:
+        if r["kind"] == "gross":
+            gross += r["amount"]
+        else:
+            tax += r["amount"]
+        s = by_symbol.setdefault(r["symbol"], {
+            "symbol": r["symbol"], "gross": 0.0, "tax": 0.0, "net": 0.0,
+            "count": 0, "last_date": "",
+        })
+        s[r["kind"]] += r["amount"]
+        s["net"] = s["gross"] + s["tax"]
+        if r["kind"] == "gross":
+            s["count"] += 1
+        s["last_date"] = max(s["last_date"], r["date"])
+        m = by_month.setdefault(r["date"][:7], {"month": r["date"][:7], "gross": 0.0, "tax": 0.0, "net": 0.0})
+        m[r["kind"]] += r["amount"]
+        m["net"] = m["gross"] + m["tax"]
+
+    return {
+        "source": "activity_statement",
+        "gross": gross,
+        "tax": tax,
+        "net": gross + tax,
+        "by_symbol": sorted(by_symbol.values(), key=lambda x: x["net"], reverse=True),
+        "by_month": sorted(by_month.values(), key=lambda x: x["month"]),
+        "events": sorted(rows, key=lambda r: (r["date"], r["symbol"]), reverse=True),
+    }
+
+
 def parse_ibkr_csv(content: str) -> dict[str, Any]:
     """Parse IBKR CSV content.
 
@@ -187,6 +256,7 @@ def parse_ibkr_csv(content: str) -> dict[str, Any]:
         "stocks": stocks,
         "options": options,
         "options_by_underlying": {k: v for k, v in options_by_underlying.items()},
+        "dividends": _parse_dividends(sections),
         "performance": {
             "realized_total": realized_total,
             "unrealized_total": unrealized_total,
