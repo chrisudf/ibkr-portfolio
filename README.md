@@ -37,6 +37,20 @@ DIV / PIL / FRTAX）。两个都勾也不会重复计算 —— 解析器只认�
 如果一个都没勾，面板会显示提示而不是空白。统计窗口 = Flex Query 的报表期间
 （比如 "Last 365 Calendar Days"），不是开户至今。
 
+Cash Transactions 至少要选到这几列，否则 section 认不出来或者标的会并成「—」：
+
+| 列 | 作用 |
+|---|---|
+| `ClientAccountID` | 分段 + 归账号，必需 |
+| `Type` + `Amount` | 识别 section 用，必需 |
+| `SettleDate` 或 `DateTime` | 任选其一即可 |
+| `Symbol` 或 `Description` | 没有的话所有分红并到「—」 |
+| `TransactionID` | 去重用，强烈建议 |
+
+⚠️ 别开这两个开关，会直接把解析器打挂：**Include section code and line
+descriptor**（第一列会变成 section code，解析器靠字面量 `ClientAccountID`
+分段）和 **Display single column header row**（多 section 会塌成一个表头）。
+
 ## 首次安装
 ```bash
 cd ~/Desktop/ibkr-portfolio

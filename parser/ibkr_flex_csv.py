@@ -69,9 +69,11 @@ def _classify_section(header: list[str]) -> str:
     if {"ActivityCode", "Amount", "Balance"} <= cols:
         return "StatementOfFunds"
     # Cash Transactions carries the same Amount column but no running Balance;
-    # its distinguishing pair is Type ("Dividends", "Withholding Tax", ...)
-    # alongside a settlement date.
-    if {"Type", "Amount", "SettleDate"} <= cols:
+    # what identifies it is Type ("Dividends", "Withholding Tax", ...) next to
+    # a date. Either date column will do — the section is configurable and a
+    # query that ships DateTime but not SettleDate is still perfectly usable,
+    # so don't make one optional column decide whether we recognise it at all.
+    if {"Type", "Amount"} <= cols and ({"SettleDate"} <= cols or {"DateTime"} <= cols):
         return "CashTransactions"
     return "Unknown"
 
