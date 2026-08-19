@@ -502,8 +502,12 @@ def _ingest_trade_cost(account: dict[str, Any], row: dict[str, str]) -> None:
     if not sym:
         return
     hist = account["cost_history"].setdefault(sym, {
-        "bought_qty": 0.0, "bought_cost": 0.0, "sold_qty": 0.0,
+        "bought_qty": 0.0, "bought_cost": 0.0, "sold_qty": 0.0, "moves": [],
     })
+    d = _parse_date(row.get("Date", ""))
+    if d is not None:
+        # Dated deltas, so finalize can integrate the position over time.
+        hist["moves"].append((d, qty))
     if qty > 0:
         hist["bought_qty"] += qty
         hist["bought_cost"] += qty * _to_float(row.get("TradePrice"))
@@ -514,7 +518,22 @@ def _ingest_trade_cost(account: dict[str, Any], row: dict[str, str]) -> None:
 
 
 def _finalize_cost_history(account: dict[str, Any]) -> None:
-    """Reduce the tallies to an average cost, dropping the unusable ones."""
+    """Reduce the tallies to an average cost, a deployed window and an
+    average position size.
+
+    `days` is how long capital was actually in the name *within this
+    statement*, which is what an annualized yield has to divide by — a
+    position held four months can't have its four-month payouts compared
+    against a full-year quote without saying so.
+
+    `avg_shares` integrates the position over that window. It's what makes a
+    "did I actually own this on the ex-dates" check possible: multiply it by
+    the summed per-share rates and you get what a steady holder of the same
+    average size would have collected.
+    """
+    from_d = _parse_date(account.get("_from_date", ""))
+    to_d = _parse_date(account.get("_to_date", ""))
+    open_qty = {s["symbol"]: s["quantity"] for s in account["stocks"]}
     out: dict[str, Any] = {}
     for sym, h in account["cost_history"].items():
         bq = h["bought_qty"]
@@ -523,12 +542,41 @@ def _finalize_cost_history(account: dict[str, Any]) -> None:
         # Buys must cover the sells, otherwise the position was opened before
         # this statement began and the average would be built from a fragment.
         covered = bq >= h["sold_qty"] - 1e-6
-        out[sym] = {
+        held_now = open_qty.get(sym, 0.0)
+        # Shares we end up holding that we never saw bought must predate the
+        # statement, so the deployed window starts at the statement instead.
+        pre_existing = bq < h["sold_qty"] + held_now - 1e-6
+        moves = sorted(h["moves"])
+        start = from_d if (pre_existing or not moves) else moves[0][0]
+        if held_now > 1e-9 or not moves:
+            end = to_d
+        else:
+            end = moves[-1][0]  # fully closed: capital came out on the last sell
+        entry = {
             "avg_price": h["bought_cost"] / bq,
             "bought_qty": bq,
             "sold_qty": h["sold_qty"],
             "covered": covered,
+            "pre_existing": pre_existing,
+            "start": start.isoformat() if start else "",
+            "end": end.isoformat() if end else "",
+            "days": (end - start).days if (start and end and end > start) else 0,
+            "avg_shares": 0.0,
         }
+        if start and end and end > start:
+            # Position at the window's start = everything bought before it.
+            pos = sum(q for d, q in moves if d <= start)
+            area = 0.0
+            prev = start
+            for d, q in moves:
+                if d <= start or d > end:
+                    continue
+                area += pos * (d - prev).days
+                prev = d
+                pos += q
+            area += pos * (end - prev).days
+            entry["avg_shares"] = area / entry["days"]
+        out[sym] = entry
     account["cost_history"] = out
 
 

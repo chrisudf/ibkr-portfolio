@@ -156,11 +156,17 @@ function mergeAccounts(accounts) {
   const histAcc = {};
   for (const a of list) {
     for (const [sym, h] of Object.entries(a.cost_history || {})) {
-      const t = histAcc[sym] || (histAcc[sym] = { qty: 0, cost: 0, sold: 0, covered: true });
+      const t = histAcc[sym] || (histAcc[sym] = {
+        qty: 0, cost: 0, sold: 0, covered: true, days: 0, shares: 0, pre: false,
+      });
       t.qty += h.bought_qty;
       t.cost += h.avg_price * h.bought_qty;
       t.sold += h.sold_qty;
       t.covered = t.covered && h.covered;
+      // Widest deployed window across the accounts, and the positions add up.
+      t.days = Math.max(t.days, h.days || 0);
+      t.shares += h.avg_shares || 0;
+      t.pre = t.pre || !!h.pre_existing;
     }
   }
   const cost_history = {};
@@ -168,6 +174,7 @@ function mergeAccounts(accounts) {
     if (t.qty > 0) {
       cost_history[sym] = {
         avg_price: t.cost / t.qty, bought_qty: t.qty, sold_qty: t.sold, covered: t.covered,
+        days: t.days, avg_shares: t.shares, pre_existing: t.pre,
       };
     }
   }
@@ -829,8 +836,17 @@ function renderDividends(data) {
       ? `${fmtPct(dps / cp, 2)}${rebuilt ? '<span class="muted">†</span>' : ""}`
         + `${s.rate_missing ? '<span class="muted">*</span>' : ""}`
       : `<span class="muted">—</span>`;
+    // The headline stays un-annualized: it's what was actually collected.
+    // But a 4-month holding printing 1.9% next to a fund quoted at 4.2% reads
+    // as an error rather than as a shorter window, so the tooltip does the
+    // division. Below a month the extrapolation is noise, so it's withheld.
+    const days = h && h.days ? h.days : 0;
+    const annual = (cp && dps && days >= 30) ? (dps / cp) * 365 / days : 0;
     const yieldTitle = (cp && dps)
       ? `每股股息 ${fmtMoney(dps, 4)} ÷ ${rebuilt ? "重建" : "平均"}成本 ${fmtMoney(cp, 2)}`
+        + (days ? ` · 本期投入 ${days} 天` : "")
+        + (annual ? ` · 年化约 ${fmtPct(annual, 2)}` : days ? " · 不足 30 天，年化无意义" : "")
+        + (h && h.pre_existing ? "（建仓早于报表期间，只算期内）" : "")
         + (rebuilt ? ` · 已清仓，成本由本期 ${fmtNum(h.bought_qty, 2)} 股买入记录重建` : "")
         + (s.rate_missing ? ` · ${s.rate_missing} 笔代付股息(PIL)不含每股报价，实际略高于此` : "")
       : "建仓在报表期间之前，本期数据里没有买入记录，无法重建成本";
