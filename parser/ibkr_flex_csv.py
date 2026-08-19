@@ -73,7 +73,7 @@ def _classify_section(header: list[str]) -> str:
     # a date. Either date column will do — the section is configurable and a
     # query that ships DateTime but not SettleDate is still perfectly usable,
     # so don't make one optional column decide whether we recognise it at all.
-    if {"Type", "Amount"} <= cols and ({"SettleDate"} <= cols or {"DateTime"} <= cols):
+    if {"Type", "Amount"} <= cols and cols & {"SettleDate", "Date/Time", "DateTime"}:
         return "CashTransactions"
     return "Unknown"
 
@@ -97,6 +97,7 @@ def _empty_account() -> dict[str, Any]:
         "_div_cash": [],    # from Cash Transactions
         "_div_sof": [],     # from Statement of Funds
         "_div_ids": set(),
+        "_nav_date": "",   # latest ReportDate seen in the NAV series; stripped
         "_starting_cash": 0.0,
         "_from_date": "",
         "_to_date": "",
@@ -141,15 +142,27 @@ def _section_rows(content: str) -> list[tuple[list[str], list[list[str]]]]:
 
 
 def _ingest_nav(account: dict[str, Any], row: dict[str, str]) -> None:
+    """Take the NAV snapshot for the latest ReportDate we've seen.
+
+    This section is a *daily series* — a 365-day query ships ~262 rows per
+    account, one per trading day. Last-row-wins would work only while IBKR
+    keeps emitting them in ascending date order; if that ever flipped, the
+    dashboard would quietly render a year-old NAV and every percentage on the
+    page would be wrong with nothing to show for it. Compare dates instead.
+    """
     nav = account["nav"]
+    rd = row.get("ReportDate", "")
+    seen = account.get("_nav_date", "")
+    if rd and seen and rd < seen:
+        return
     nav["cash"] = _to_float(row.get("Cash"))
     nav["stock"] = _to_float(row.get("Stock"))
     nav["options"] = _to_float(row.get("Options"))
     nav["dividend_accruals"] = _to_float(row.get("DividendAccruals"))
     nav["total"] = _to_float(row.get("Total"))
-    # Keep the most recent report date around as a fallback period.
-    rd = row.get("ReportDate", "")
     if rd:
+        account["_nav_date"] = rd
+        # Keep the most recent report date around as a fallback period.
         account["statement"]["_report_date"] = _fmt_iso_date(rd)
 
 
@@ -325,12 +338,26 @@ _DIV_SYMBOL_RE = re.compile(r"^([A-Z][A-Z0-9\.]{0,9})\s*\(")
 
 
 def _dividend_symbol(row: dict[str, str]) -> str:
+    """Ticker for a payout row, or "" when the row names no security at all."""
     sym = (row.get("Symbol") or "").strip()
     if sym:
         return sym
     desc = (row.get("Description") or row.get("ActivityDescription") or "").strip()
     m = _DIV_SYMBOL_RE.match(desc)
-    return m.group(1) if m else "—"
+    return m.group(1) if m else ""
+
+
+def _skip_unattributed_tax(kind: str, sym: str) -> bool:
+    """Withholding that names no security is not dividend withholding.
+
+    IBKR files tax on credit interest under the same "Withholding Tax" type
+    (and the same FRTAX activity code) as tax on dividends — e.g. a row reading
+    "WITHHOLDING @ 10% ON CREDIT INT FOR NOV-2025" with a blank Symbol. Real
+    dividend withholding is always attached to the security that paid it, so a
+    tax row with no identifiable ticker belongs to something else and would
+    otherwise overstate the dividend tax drag.
+    """
+    return kind == "tax" and not sym
 
 
 def _dividend_id(account: dict[str, Any], prefix: str, d: date, sym: str,
@@ -366,16 +393,20 @@ def _ingest_cash_transaction(account: dict[str, Any], row: dict[str, str]) -> No
     kind = _DIV_CASH_TYPES.get((row.get("Type") or "").strip().lower())
     if kind is None:
         return
-    # SettleDate is when the cash actually lands; DateTime is the ex/pay stamp
-    # and can carry a time suffix, so prefer SettleDate and fall back.
-    raw = (row.get("SettleDate") or row.get("DateTime") or "")[:8]
+    # SettleDate is when the cash actually lands; the ex/pay stamp is the
+    # date-time column, which real Flex output spells "Date/Time" and carries a
+    # ";HHmmss" suffix. Prefer SettleDate, fall back through both spellings.
+    raw = (row.get("SettleDate") or row.get("Date/Time") or row.get("DateTime") or "")[:8]
     d = _parse_date(raw)
     if d is None:
         return
     amount = _to_float(row.get("Amount"))
     if amount == 0:
         return
-    _ingest_dividend_row(account, "_div_cash", d, _dividend_symbol(row), kind, amount, row)
+    sym = _dividend_symbol(row)
+    if _skip_unattributed_tax(kind, sym):
+        return
+    _ingest_dividend_row(account, "_div_cash", d, sym or "—", kind, amount, row)
 
 
 def _finalize_dividends(account: dict[str, Any]) -> None:
@@ -428,8 +459,10 @@ def _ingest_statement_of_funds(account: dict[str, Any], row: dict[str, str]) -> 
         amount = _to_float(row.get("Amount"))
         if d is not None and amount != 0:
             kind = "gross" if code in _DIV_GROSS_CODES else "tax"
-            _ingest_dividend_row(account, "_div_sof", d, _dividend_symbol(row),
-                                 kind, amount, row)
+            sym = _dividend_symbol(row)
+            if not _skip_unattributed_tax(kind, sym):
+                _ingest_dividend_row(account, "_div_sof", d, sym or "—",
+                                     kind, amount, row)
         return
     if code not in _EXTERNAL_CF_CODES:
         return
@@ -551,7 +584,7 @@ def parse_ibkr_flex_csv(content: str) -> dict[str, Any]:
         # Strip internal scratch state before serialising. _cf_ids is a set
         # and would blow up json.dump if it ever survived to the writer.
         for k in ("_cash_flows", "_cf_ids", "_cf_synth_seq",
-                  "_div_cash", "_div_sof", "_div_ids",
+                  "_div_cash", "_div_sof", "_div_ids", "_nav_date",
                   "_starting_cash", "_from_date", "_to_date"):
             acct.pop(k, None)
 

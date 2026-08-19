@@ -47,6 +47,11 @@ Cash Transactions 至少要选到这几列，否则 section 认不出来或者�
 | `Symbol` 或 `Description` | 没有的话所有分红并到「—」 |
 | `TransactionID` | 去重用，强烈建议 |
 
+预扣税只认**能归到某个标的**的那些。IBKR 把「信用利息的预扣税」也归在
+`Withholding Tax` 类型下（描述形如 `WITHHOLDING @ 10% ON CREDIT INT FOR
+NOV-2025`，Symbol 为空），那不是分红税；算进来会虚增税负、压低净分红。所以
+没有标的的预扣税行会被跳过 —— 跟 IBKR 报表对账时数字对不上，多半是这个差异。
+
 ⚠️ 别开这两个开关，会直接把解析器打挂：**Include section code and line
 descriptor**（第一列会变成 section code，解析器靠字面量 `ClientAccountID`
 分段）和 **Display single column header row**（多 section 会塌成一个表头）。
