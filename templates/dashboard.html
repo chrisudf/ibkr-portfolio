@@ -137,6 +137,98 @@
         </div>
       </section>
 
+      <!-- Margin usage -->
+      <section class="panel" id="margin-panel" hidden>
+        <div class="panel-head">
+          <h2>保证金占用</h2>
+          <span class="panel-note" id="margin-note"></span>
+        </div>
+        <div class="margin-hero">
+          <div>
+            <div class="margin-hero-label">Margin 占用</div>
+            <div class="margin-hero-pct"><span id="margin-pct">—</span><small>占整个账户</small></div>
+          </div>
+          <div class="margin-hero-amount" id="margin-amount">$0</div>
+        </div>
+        <div class="margin-gauge" id="margin-gauge"></div>
+        <div class="margin-gauge-note" id="margin-gauge-note"></div>
+        <div class="margin-basis" id="margin-basis"></div>
+        <div class="table-wrap" style="margin-top:16px">
+          <table class="holdings">
+            <thead>
+              <tr>
+                <th>标的</th><th>卖出合约</th>
+                <th class="num">正股价</th>
+                <th class="num">名义抵押</th>
+                <th class="num">权利金负债</th>
+                <th class="num">保证金占用</th>
+                <th class="num">占比</th>
+              </tr>
+            </thead>
+            <tbody id="margin-body"></tbody>
+          </table>
+        </div>
+        <div class="margin-foot" id="margin-foot"></div>
+        <div class="margin-foot">垂直价差按裸卖估算（Reg-T 下价差风险以最大价差损失封顶），
+          当前持仓无价差组合；跨账户不共享抵押品，合并视图为各账户分别计算后相加。</div>
+      </section>
+
+      <!-- Dividends -->
+      <section class="panel" id="dividends-panel" hidden>
+        <div class="panel-head">
+          <h2>分红收入</h2>
+          <span class="panel-note" id="div-note"></span>
+        </div>
+
+        <div class="div-empty" id="div-empty" hidden>
+          <p>本期报表里没有分红记录。</p>
+          <p class="hint">如果持仓里有派息标的却读不到数据，多半是 Flex Query 没勾选
+            <b>Cash Transactions</b>（建议，含 Dividends / Payment In Lieu / Withholding Tax）
+            或 <b>Statement of Funds</b>。勾上后重新刷新即可。</p>
+        </div>
+
+        <div id="div-content" hidden>
+          <div class="div-hero">
+            <div>
+              <div class="div-hero-label">期间净分红</div>
+              <div class="div-hero-value" id="div-net">$0</div>
+              <div class="div-hero-sub" id="div-gross"></div>
+            </div>
+            <div class="div-hero-yield" id="div-yield"></div>
+          </div>
+
+          <div class="div-chart" id="div-chart"></div>
+          <div class="div-chart-note" id="div-chart-note"></div>
+          <div class="div-legend">
+            成本股息率 = 本期实收<b>每股</b>股息 ÷ <b>每股</b>平均成本，再按持有天数<b>年化</b>
+            —— 分子分母都是每股，期间加减仓不影响；年化后不同持有期的标的才能横向比。
+            数字下方是资金实际投入的天数，天数越少外推越虚，不足 30 天不给年化。
+            hover 可看未年化的实收值。<b>只算股息收入</b> —— 基金分出来的资本利得/资本返还
+            走的是同一条现金通道但不是收益率（杠杆 ETF 尤其明显），会计入税前与净额、
+            但不计入这一列，标的旁打「含资本利得」提示。
+            <span class="muted">†</span> 已清仓，成本由本期买入记录重建；
+            <span class="muted">*</span> 含代付股息(PIL)，IBKR 不报每股费率，实际略高于显示值。
+            注意分母是<b>你的成本价</b>不是现价，跟 screener 上的市场股息率不是一回事。
+          </div>
+
+          <div class="table-wrap" style="margin-top:18px">
+            <table class="holdings">
+              <thead>
+                <tr>
+                  <th>标的</th><th class="num">次数</th>
+                  <th class="num">税前</th><th class="num">预扣税</th>
+                  <th class="num">净额</th><th class="num">占比</th>
+                  <th class="num">每股股息</th>
+                  <th class="num">成本股息率<br><small>年化</small></th>
+                  <th>最近一次</th>
+                </tr>
+              </thead>
+              <tbody id="div-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
       <!-- Realized perf -->
       <section class="panel">
         <div class="panel-head">

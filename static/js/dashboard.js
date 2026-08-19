@@ -112,12 +112,107 @@ function mergeAccounts(accounts) {
     }
   }
 
+  // Dividends — sum across accounts, keyed by symbol and by month.
+  const divSym = {}, divMonth = {};
+  let divGross = 0, divTax = 0, divNonDiv = 0, divSource = "";
+  for (const a of list) {
+    const d = a.dividends;
+    if (!d || !d.by_symbol) continue;
+    divSource = divSource || d.source;
+    divGross += d.gross || 0;
+    divTax += d.tax || 0;
+    divNonDiv += d.non_dividend || 0;
+    for (const s of d.by_symbol) {
+      const t = divSym[s.symbol] || (divSym[s.symbol] = {
+        symbol: s.symbol, gross: 0, tax: 0, net: 0, count: 0,
+        per_share: 0, per_share_ordinary: 0, non_dividend: 0,
+        rate_missing: 0, last_date: "",
+      });
+      t.gross += s.gross; t.tax += s.tax; t.net += s.net; t.count += s.count;
+      // per_share is a property of the security, not of the account — both
+      // accounts holding MSFT booked the same $1.82/share. Summing would
+      // double it. Take the widest coverage instead: the account that held
+      // through the most ex-dates saw the most of the year's rate.
+      t.non_dividend += s.non_dividend || 0;   // cash, so this one does add
+      t.rate_missing = Math.max(t.rate_missing, s.rate_missing || 0);
+      t.last_date = t.last_date > s.last_date ? t.last_date : s.last_date;
+    }
+    for (const m of d.by_month || []) {
+      const t = divMonth[m.month] || (divMonth[m.month] = { month: m.month, gross: 0, tax: 0, net: 0 });
+      t.gross += m.gross; t.tax += m.tax; t.net += m.net;
+    }
+  }
+  // Per-share rates can't be summed across accounts (both holders of MSFT
+  // booked the same $1.82) but taking the max is wrong too: when the accounts
+  // held the name over different stretches, each one saw payments the other
+  // missed. Union the distinct payments instead — same identity the dedupe
+  // uses — so a household that held SGOV Sep-Mar in one account and Dec-Jun in
+  // the other gets credit for every ex-date either of them was present for.
+  const seenPay = {};
+  for (const a of list) {
+    for (const e of a.dividends?.events || []) {
+      if (e.kind !== "gross" || !e.per_share) continue;
+      const t = divSym[e.symbol];
+      if (!t) continue;
+      const key = `${e.symbol}|${e.date}|${e.per_share}`;
+      if (seenPay[key]) continue;
+      seenPay[key] = true;
+      t.per_share += e.per_share;
+      if ((e.income_class || "ordinary") === "ordinary") t.per_share_ordinary += e.per_share;
+    }
+  }
+
+  const dividends = Object.keys(divSym).length ? {
+    source: divSource,
+    gross: divGross,
+    tax: divTax,
+    net: divGross + divTax,
+    non_dividend: divNonDiv,
+    by_symbol: Object.values(divSym).sort((a, b) => b.net - a.net),
+    by_month: Object.values(divMonth).sort((a, b) => a.month.localeCompare(b.month)),
+    events: list.flatMap(a => a.dividends?.events || [])
+      .sort((a, b) => (a.date < b.date ? 1 : -1)),
+  } : {};
+
+  // Cost history: re-derive the average from summed tallies rather than
+  // averaging averages, which would ignore how many shares each account held.
+  const histAcc = {};
+  for (const a of list) {
+    for (const [sym, h] of Object.entries(a.cost_history || {})) {
+      const t = histAcc[sym] || (histAcc[sym] = {
+        qty: 0, cost: 0, sold: 0, covered: true, start: "", end: "", shares: 0, pre: false,
+      });
+      t.qty += h.bought_qty;
+      t.cost += h.avg_price * h.bought_qty;
+      t.sold += h.sold_qty;
+      t.covered = t.covered && h.covered;
+      // Union of the deployed windows, to match the unioned payments above:
+      // earliest start to latest end across the accounts.
+      if (h.start && (!t.start || h.start < t.start)) t.start = h.start;
+      if (h.end && (!t.end || h.end > t.end)) t.end = h.end;
+      t.shares += h.avg_shares || 0;
+      t.pre = t.pre || !!h.pre_existing;
+    }
+  }
+  const cost_history = {};
+  for (const [sym, t] of Object.entries(histAcc)) {
+    if (t.qty > 0) {
+      cost_history[sym] = {
+        avg_price: t.cost / t.qty, bought_qty: t.qty, sold_qty: t.sold, covered: t.covered,
+        days: (t.start && t.end)
+          ? Math.max(0, Math.round((Date.parse(t.end) - Date.parse(t.start)) / 86400000))
+          : 0,
+        avg_shares: t.shares, pre_existing: t.pre,
+      };
+    }
+  }
+
   // If accounts share the same period (the usual case) collapse to one.
   const periods = [...new Set(list.map(a => a.statement?.Period).filter(Boolean))];
   return {
     account: { Account: "ALL" },
     statement: { Period: periods.length === 1 ? periods[0] : periods.join(" / ") },
-    nav, stocks, options,
+    nav, stocks, options, dividends, cost_history,
     performance: {
       realized_total: realizedTotal,
       unrealized_total: unrealizedTotal,
@@ -263,14 +358,249 @@ function render(data) {
   const shortOptMV = options.filter(o => o.value < 0).reduce((s, o) => s + Math.abs(o.value), 0);
   renderAllocation({ cash: adjCash, stock: adjStock, longOptions: longOptMV, shortOptionsNote: shortOptMV }, totalNav);
 
+  // Margin — prices are pooled across every loaded account, so pass the whole
+  // set rather than just the account being viewed.
+  renderMargin(data, currentDataRef.allAccounts);
+
   // Holdings — show all positions including cash equivalents (tagged)
   renderHoldings(data.stocks);
 
   // Options
   renderOptions(options);
 
+  // Dividends
+  renderDividends(data);
+
   // Realized rankings
   renderRankings(performance.by_symbol);
+}
+
+/* ---------------------------------------------------------------------------
+ * Margin — estimated, not reported.
+ *
+ * IBKR's Flex Web Service does not export margin requirements in any section
+ * (they only exist in TWS and the rendered Activity Statement), so we
+ * reconstruct the standard Reg-T initial requirement from the positions we do
+ * have. Per share, for an uncovered short option:
+ *
+ *   put  → max(0.20 × underlying − OTM amount, 0.10 × strike,     $2.50)
+ *   call → max(0.20 × underlying − OTM amount, 0.10 × underlying, $2.50)
+ *
+ * plus the contract's current market value (the premium you'd pay to close).
+ * Short calls backed by stock in the same account are covered — the shares are
+ * the collateral, so they consume no margin.
+ *
+ * Long options need no margin (the premium is already paid), and stock bought
+ * with cash needs none either — this account only borrows to back short puts,
+ * which is exactly what the panel reports.
+ * ------------------------------------------------------------------------- */
+
+// Ex-date capture: what a payout stream collected, against what a steady
+// holder of the same average size would have collected over the same window.
+//
+// Under 100% doesn't automatically mean money was lost — a position built up
+// during the period naturally misses the earlier ex-dates, and one trimmed
+// early naturally over-collects (these run past 180% in real data). So the
+// ratio alone is a position-timing statistic, not a mistake detector. The
+// dollar floor is what makes it worth showing: it only surfaces cases where
+// the gap is large enough to be real money rather than rounding on a stub.
+const CAPTURE_FLAG_RATIO = 0.8;
+const CAPTURE_FLAG_DOLLARS = 10;
+
+// Reg-T floor for an uncovered contract: $250, i.e. $2.50/share.
+const MARGIN_FLOOR_PER_SHARE = 2.5;
+const CONTRACT_MULTIPLIER = 100;
+
+// Underlying mark prices, pooled across every loaded account — a price is a
+// market fact, not account data, so a stock held only in U22 still prices a
+// U17 short put. Populated from stock positions; underlyings we hold no
+// shares of simply aren't in here.
+function buildPriceBook(accounts) {
+  const px = {};
+  for (const a of Object.values(accounts || {})) {
+    for (const s of a.stocks || []) {
+      if (s.close_price > 0 && !(s.symbol in px)) px[s.symbol] = s.close_price;
+    }
+  }
+  return px;
+}
+
+// Reg-T requirement for one short contract, per share of underlying.
+function regTPerShare(right, strike, underlying) {
+  const otm = right === "P"
+    ? Math.max(0, underlying - strike)   // put is OTM when spot is above strike
+    : Math.max(0, strike - underlying);  // call is OTM when spot is below strike
+  const floorPct = right === "P" ? 0.10 * strike : 0.10 * underlying;
+  return Math.max(0.20 * underlying - otm, floorPct, MARGIN_FLOOR_PER_SHARE);
+}
+
+function computeMargin(data, priceBook) {
+  const stocks = data.stocks || [];
+  const options = data.options || [];
+  const nav = data.nav || {};
+  const totalNav = nav.total || (nav.cash + nav.stock + nav.options);
+
+  // Shares available to cover short calls, spent longest-dated first.
+  const sharesLeft = {};
+  for (const s of stocks) sharesLeft[s.symbol] = (sharesLeft[s.symbol] || 0) + s.quantity;
+
+  const byUnderlying = {};
+  let requirement = 0, notional = 0, premium = 0, assumedContracts = 0;
+  // How much of the total leans on an assumed spot. Counting contracts
+  // understates it — the assumed ones are often the biggest requirements,
+  // because assuming at-the-money is the most expensive guess you can make.
+  let assumedRequirement = 0;
+
+  // Short calls before puts so covering shares go to the calls that need them.
+  const shorts = options.filter(o => o.quantity < 0)
+    .sort((a, b) => (a.right === "C" ? 0 : 1) - (b.right === "C" ? 0 : 1));
+
+  for (const o of shorts) {
+    const qty = Math.abs(o.quantity);
+    const shares = qty * CONTRACT_MULTIPLIER;
+    const mv = Math.abs(o.value);
+    const known = priceBook[o.underlying];
+    // No price anywhere in the portfolio → assume the contract sits at the
+    // money. That lands the estimate on 20% of strike, the middle of the
+    // Reg-T range, and every such contract is counted so the UI can say so.
+    const spot = known || o.strike;
+    if (!known) assumedContracts += qty;
+
+    let covered = 0;
+    if (o.right === "C") {
+      covered = Math.min(shares, Math.max(sharesLeft[o.underlying] || 0, 0));
+      sharesLeft[o.underlying] = (sharesLeft[o.underlying] || 0) - covered;
+    }
+    const nakedShares = shares - covered;
+    // mv is the whole position's market value, so only the naked slice of the
+    // premium belongs in the requirement — a call half covered by stock would
+    // otherwise carry the covered half's premium too.
+    const req = nakedShares > 0
+      ? regTPerShare(o.right, o.strike, spot) * nakedShares + mv * (nakedShares / shares)
+      : 0;
+    const notionalHere = o.right === "P" ? o.strike * shares : 0;
+
+    requirement += req;
+    if (!known) assumedRequirement += req;
+    premium += mv;
+    notional += notionalHere;
+
+    const b = byUnderlying[o.underlying] || (byUnderlying[o.underlying] = {
+      underlying: o.underlying, contracts: 0, puts: 0, calls: 0, covered: 0,
+      requirement: 0, notional: 0, premium: 0, spot, priceKnown: !!known,
+    });
+    b.contracts += qty;
+    b[o.right === "P" ? "puts" : "calls"] += qty;
+    b.covered += covered / CONTRACT_MULTIPLIER;
+    b.requirement += req;
+    b.notional += notionalHere;
+    b.premium += mv;
+  }
+
+  return {
+    requirement,
+    notional,
+    premium,
+    totalNav,
+    pctOfNav: totalNav > 0 ? requirement / totalNav : 0,
+    excess: totalNav - requirement,
+    // Negative cash is a real margin loan — that part accrues interest, unlike
+    // collateral tied up behind short options.
+    borrowed: Math.max(0, -(nav.cash || 0)),
+    assumedContracts,
+    assumedRequirement,
+    assumedShare: requirement > 0 ? assumedRequirement / requirement : 0,
+    rows: Object.values(byUnderlying).sort((a, b) => b.requirement - a.requirement),
+  };
+}
+
+// Margin is per account: IBKR does not let one account's shares cover another
+// account's short call, nor its credit balance offset another's debit. So the
+// merged view sums separately-computed requirements rather than computing one
+// requirement over pooled positions.
+function mergeMargin(parts) {
+  const out = {
+    requirement: 0, notional: 0, premium: 0, totalNav: 0, excess: 0, borrowed: 0,
+    assumedContracts: 0, assumedRequirement: 0, rows: [],
+  };
+  const byU = {};
+  for (const m of parts) {
+    for (const k of ["requirement", "notional", "premium", "totalNav", "excess",
+                     "borrowed", "assumedContracts", "assumedRequirement"]) {
+      out[k] += m[k];
+    }
+    for (const r of m.rows) {
+      const b = byU[r.underlying] || (byU[r.underlying] = { ...r });
+      if (b !== r) {
+        for (const k of ["contracts", "puts", "calls", "covered", "requirement",
+                         "notional", "premium"]) b[k] += r[k];
+        b.priceKnown = b.priceKnown && r.priceKnown;
+      }
+    }
+  }
+  out.pctOfNav = out.totalNav > 0 ? out.requirement / out.totalNav : 0;
+  out.assumedShare = out.requirement > 0 ? out.assumedRequirement / out.requirement : 0;
+  out.rows = Object.values(byU).sort((a, b) => b.requirement - a.requirement);
+  return out;
+}
+
+function renderMargin(data, accounts) {
+  const panel = $("margin-panel");
+  const book = buildPriceBook(accounts);
+  const merged = (data.account || {}).Account === "ALL";
+  const m = merged
+    ? mergeMargin(Object.values(accounts || {}).map(a => computeMargin(a, book)))
+    : computeMargin(data, book);
+  if (!m.rows.length) { panel.hidden = true; return; }
+  panel.hidden = false;
+
+  $("margin-amount").textContent = fmtMoney(m.requirement);
+  $("margin-pct").textContent = fmtPct(m.pctOfNav, 1);
+  $("margin-basis").textContent = m.borrowed > 0
+    ? `其中融资借款 ${fmtMoney(m.borrowed)}（这部分计息）`
+    : "仅为卖出期权抵押，不付利息（现金为正，无融资借款）";
+
+  // Gauge: requirement against net liquidation value.
+  const gauge = $("margin-gauge");
+  const pct = Math.min(100, Math.max(0, m.pctOfNav * 100));
+  // Bands mirror how the cushion actually behaves: under 30% there's plenty of
+  // room, past 60% a gap-down starts eating into excess liquidity fast.
+  const tone = pct >= 60 ? "var(--red)" : pct >= 30 ? "var(--amber)" : "var(--green)";
+  gauge.innerHTML = `<div class="margin-gauge-fill" style="width:${pct}%;background:${tone}"></div>`;
+  $("margin-gauge-note").textContent =
+    `账户总值 ${fmtMoney(m.totalNav)} · 估算剩余可用 ${fmtMoney(m.excess)}`;
+
+  const note = $("margin-note");
+  note.textContent = m.assumedContracts > 0
+    ? `Reg-T 估算 · ${m.assumedContracts} 张合约无正股报价，按平值估算`
+      + `（占估算额 ${fmtPct(m.assumedShare, 0)}）`
+    : "Reg-T 估算 · 正股价格取自当前持仓";
+  note.title = m.assumedContracts > 0
+    ? "平值假设对价外的卖put偏保守 —— 实际保证金通常低于此。"
+      + "买入这些标的的正股后，价格会自动接入，数字随之收紧。"
+    : "";
+
+  const tbody = $("margin-body");
+  tbody.innerHTML = "";
+  for (const r of m.rows) {
+    const kinds = [r.puts ? `${r.puts} PUT` : "", r.calls ? `${r.calls} CALL` : ""].filter(Boolean).join(" · ");
+    const priceTag = r.priceKnown ? "" : ` <span class="tag tag-short">估算价</span>`;
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td><b>${r.underlying}</b>${priceTag}</td>
+      <td>${kinds}${r.covered ? ` <span class="tag tag-flow-in">${r.covered} 张有正股覆盖</span>` : ""}</td>
+      <td class="num">${fmtMoney(r.spot, 2)}</td>
+      <td class="num muted">${r.notional ? fmtMoney(r.notional, 0) : "—"}</td>
+      <td class="num">${fmtMoney(r.premium, 0)}</td>
+      <td class="num"><b>${fmtMoney(r.requirement, 0)}</b></td>
+      <td class="num">${fmtPct(m.requirement ? r.requirement / m.requirement : 0, 1)}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+
+  $("margin-foot").textContent =
+    `卖出看跌名义抵押合计 ${fmtMoney(m.notional)}（若全部现金担保需要的资金）· `
+    + `当前卖方权利金负债 ${fmtMoney(m.premium)}`;
 }
 
 function renderTreemap(stocks) {
@@ -469,6 +799,192 @@ function renderOptions(options) {
     tbody.appendChild(tr);
   }
   updateSortIndicators("options-body", optionsSort);
+}
+
+/* ---------------------------------------------------------------------------
+ * Dividends — payouts over the statement period.
+ *
+ * The parser hands us gross (dividends + payment-in-lieu) and tax (withholding,
+ * already negative) so net is just their sum. The window is whatever the Flex
+ * query covers — a "Last 365 Calendar Days" query can't see further back than
+ * that, so the panel labels the period rather than implying since-inception.
+ * ------------------------------------------------------------------------- */
+
+// Fill the gaps so a month with no payout still gets a (zero-height) bar —
+// otherwise quarterly payers render as an evenly-spaced row that hides the
+// actual cadence.
+function monthRange(months, period) {
+  if (!months.length) return [];
+  const step = (ym, delta) => {
+    const [y, m] = ym.split("-").map(Number);
+    const d = new Date(Date.UTC(y, m - 1 + delta, 1));
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+  };
+  const byMonth = Object.fromEntries(months.map(m => [m.month, m]));
+  // Span the whole reporting window, not just first payout to last. A
+  // quarterly payer inside a 12-month window otherwise renders ~10 bars and
+  // the monthly average divides by the wrong number of months — and the empty
+  // months at the edges are exactly where a missed ex-date would show.
+  const bounds = (period || "").match(/(\d{4}-\d{2})-\d{2}\D+(\d{4}-\d{2})-\d{2}/);
+  let cur = months[0].month;
+  let last = months[months.length - 1].month;
+  if (bounds) {
+    if (bounds[1] < cur) cur = bounds[1];
+    if (bounds[2] > last) last = bounds[2];
+  }
+  const out = [];
+  for (let i = 0; i < 240 && cur <= last; i++) {
+    out.push(byMonth[cur] || { month: cur, gross: 0, tax: 0, net: 0 });
+    cur = step(cur, 1);
+  }
+  return out;
+}
+
+function renderDividends(data) {
+  const panel = $("dividends-panel");
+  const div = data.dividends;
+  const empty = $("div-empty");
+  const body = $("div-content");
+  panel.hidden = false;
+
+  if (!div || !div.by_symbol || !div.by_symbol.length) {
+    // Distinguish "no payouts" from "the query never asked for them" — the
+    // fix for the second one is a checkbox in the Flex query, not the code.
+    empty.hidden = false;
+    body.hidden = true;
+    $("div-note").textContent = "";
+    return;
+  }
+  empty.hidden = true;
+  body.hidden = false;
+
+  $("div-net").textContent = fmtMoney(div.net, 2);
+  $("div-gross").textContent = `税前 ${fmtMoney(div.gross, 2)} · 预扣税 ${fmtMoney(div.tax, 2)}`;
+
+  // Yield is against the stock sleeve, not total NAV: cash and short options
+  // pay no dividends, so dividing by NAV would understate what the equity
+  // actually returns.
+  const stockValue = (data.stocks || []).reduce((s, x) => s + x.value, 0);
+  const yieldPct = stockValue > 0 ? div.net / stockValue : 0;
+  $("div-yield").textContent = stockValue > 0
+    ? `${fmtPct(yieldPct, 2)} 分红收益率（净额 ÷ 当前股票市值 ${fmtMoney(stockValue)}）`
+    : "";
+
+  const accrued = data.nav?.dividend_accruals || 0;
+  const sourceLabel = {
+    cash_transactions: "Cash Transactions",
+    statement_of_funds: "Statement of Funds",
+    activity_statement: "Activity Statement",
+  }[div.source] || "报表";
+  $("div-note").textContent = `${data.statement?.Period || ""} · 数据来自 ${sourceLabel}`
+    + (accrued ? ` · 另有应计未付 ${fmtMoney(accrued, 2)}` : "");
+
+  // Monthly bars
+  const months = monthRange(div.by_month || [], data.statement?.Period);
+  const maxNet = Math.max(...months.map(m => Math.abs(m.net)), 1);
+  const chart = $("div-chart");
+  chart.innerHTML = months.map(m => {
+    const h = Math.max(2, Math.abs(m.net) / maxNet * 100);
+    const label = m.month.slice(2).replace("-", "/");
+    return `<div class="div-bar" title="${m.month} 净分红 ${fmtMoney(m.net, 2)}">
+        <div class="div-bar-fill" style="height:${h}%"></div>
+        <div class="div-bar-label">${label}</div>
+      </div>`;
+  }).join("");
+  const best = months.reduce((a, b) => (b.net > (a?.net ?? -Infinity) ? b : a), null);
+  $("div-chart-note").textContent = months.length
+    ? `${months.length} 个月 · 月均 ${fmtMoney(div.net / months.length, 2)}`
+      + (best && best.net > 0 ? ` · 最高 ${best.month} ${fmtMoney(best.net, 2)}` : "")
+    : "";
+
+  const tbody = $("div-body");
+  tbody.innerHTML = "";
+  // Yield is per-share on both sides: the payments you actually collected per
+  // share, over what you paid per share. Dividing total dividends by the
+  // current cost basis instead would compare a full year of payouts against
+  // whatever position survived to today — on a position trimmed 90% through
+  // the year that reads as a 36% yield. Per-share cancels the size change out.
+  const costPrice = {};
+  for (const s of data.stocks || []) if (s.cost_price > 0) costPrice[s.symbol] = s.cost_price;
+  // Closed positions fall back to a cost rebuilt from the period's trades.
+  // IBKR's own CostBasisPrice wins whenever the position still exists — the
+  // rebuilt average only describes a position that ended flat.
+  const hist = data.cost_history || {};
+  for (const s of div.by_symbol) {
+    const tr = document.createElement("tr");
+    const open = s.symbol in costPrice;
+    const h = hist[s.symbol];
+    const rebuilt = !open && h && h.covered && h.avg_price > 0 ? h.avg_price : 0;
+    const soldTag = open ? "" : ` <span class="tag tag-flow-out">已清仓</span>`;
+    const cp = open ? costPrice[s.symbol] : rebuilt;
+    const dps = s.per_share || 0;
+    // Still no cost means the position was opened before this statement's
+    // window, so its buys simply aren't in the data to average.
+    // Annualized, because that is what a dividend yield means everywhere —
+    // TTM, forward, SEC 30-day, yield-on-cost are all annual rates. It is also
+    // the only form that lets the column be sorted: a 5.05% collected over 312
+    // days and a 1.90% over 182 days aren't measuring the same thing until
+    // both are put on a yearly footing. The raw collected figure stays in the
+    // tooltip, and the window is printed under the number so a rate
+    // extrapolated from a few weeks can't pass for a settled one. Below a
+    // month the extrapolation is noise, so it is withheld entirely.
+    const days = h && h.days ? h.days : 0;
+    // Yield counts dividend income only. A fund's capital-gain distribution
+    // arrives as cash through the same channel but isn't yield — it's realized
+    // trading profit handed back, and on a leveraged ETF it can be most of the
+    // payout. It stays in 税前/净额 (the cash was real) and out of this rate.
+    const dpsIncome = s.per_share_ordinary != null ? s.per_share_ordinary : dps;
+    const realized = (cp && dpsIncome) ? dpsIncome / cp : 0;
+    const annual = (realized && days >= 30) ? realized * 365 / days : 0;
+    const nonDiv = s.non_dividend || 0;
+    // Worth flagging only when it moves the number, not on a rounding tail.
+    const nonDivShare = s.gross > 0 ? nonDiv / s.gross : 0;
+    // Did the shares actually exist on the ex-dates?
+    const avgShares = h && h.avg_shares ? h.avg_shares : 0;
+    const should = avgShares * dps;
+    const shortfall = should - s.gross;
+    const missed = should > 0 && s.gross / should < CAPTURE_FLAG_RATIO
+      && shortfall >= CAPTURE_FLAG_DOLLARS;
+
+    const marks = `${rebuilt ? '<span class="muted">†</span>' : ""}`
+      + `${s.rate_missing ? '<span class="muted">*</span>' : ""}`;
+    const yieldCell = annual
+      ? `${fmtPct(annual, 2)}${marks}<div class="yield-days">${days} 天</div>`
+      : realized
+        ? `<span class="muted">—</span>${marks}`
+          + `<div class="yield-days">${days ? days + " 天，太短" : ""}</div>`
+        : `<span class="muted">—</span>`;
+    const yieldTitle = (cp && dps)
+      ? `每股股息 ${fmtMoney(dpsIncome, 4)}`
+        + (nonDiv ? `（已扣除每股 ${fmtMoney(dps - dpsIncome, 4)} 的资本利得分配）` : "")
+        + ` ÷ ${rebuilt ? "重建" : "平均"}成本 ${fmtMoney(cp, 2)}`
+        + ` = 实收 ${fmtPct(realized, 2)}`
+        + (days ? `（${days} 天）` : "")
+        + (annual ? ` · 年化 ${fmtPct(annual, 2)}` : days ? " · 不足 30 天，不做年化" : "")
+        + (h && h.pre_existing ? "（建仓早于报表期间，只算期内）" : "")
+        + (rebuilt ? ` · 已清仓，成本由本期 ${fmtNum(h.bought_qty, 2)} 股买入记录重建` : "")
+        + (s.rate_missing ? ` · ${s.rate_missing} 笔代付股息(PIL)不含每股报价，实际略高于此` : "")
+      : "建仓在报表期间之前，本期数据里没有买入记录，无法重建成本";
+    tr.innerHTML = `
+      <td><b>${s.symbol}</b>${soldTag}${nonDivShare >= 0.05 ? ` <span class="tag tag-capgain" title="${
+        `其中 ${fmtMoney(nonDiv, 2)}（占税前 ${fmtPct(nonDivShare, 0)}）是资本利得/资本返还分配，`
+        + `不是股息收入。已计入税前与净额，但不计入成本股息率。`
+      }">含资本利得</span>` : ""}${missed ? ` <span class="tag tag-miss" title="${
+        `期间平均持仓 ${fmtNum(avgShares, 2)} 股，若整段持有本可收 ${fmtMoney(should, 2)}，`
+        + `实收 ${fmtMoney(s.gross, 2)}，差 ${fmtMoney(shortfall, 2)}。`
+        + `常见原因：除息日前清仓（当期分红作废），或期间才建仓（错过前几次）。`
+      }">除息日缺口 ${fmtMoney(shortfall, 0)}</span>` : ""}</td>
+      <td class="num">${s.count}</td>
+      <td class="num muted">${fmtMoney(s.gross, 2)}</td>
+      <td class="num ${s.tax < 0 ? "down" : "muted"}">${s.tax ? fmtMoney(s.tax, 2) : "—"}</td>
+      <td class="num"><b>${fmtMoney(s.net, 2)}</b></td>
+      <td class="num">${fmtPct(div.net ? s.net / div.net : 0, 1)}</td>
+      <td class="num muted">${dps ? fmtMoney(dps, 4) : "—"}</td>
+      <td class="num" title="${yieldTitle}">${yieldCell}</td>
+      <td class="muted">${s.last_date || "—"}</td>
+    `;
+    tbody.appendChild(tr);
+  }
 }
 
 function updateSortIndicators(tbodyId, state) {

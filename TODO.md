@@ -95,7 +95,11 @@ KPI 总净值卡的副标题：
 
 ---
 
-## [P3] 「刷新 IBKR」网页按钮
+## ~~[P3] 「刷新 IBKR」网页按钮~~ ✓ 已完成
+
+已按下面的方案 B 落地：`parser/flex_fetch.py` + `POST /api/refresh` + 顶栏按钮
++ 5 分钟节流。后来又补了失败时记录 IBKR 原始响应、成功时记录报表 section
+列表（见 `scripts/README.md` 的「刷新按钮失败时去哪看细节」）。以下为原始方案，留档。
 
 **背景**：cron 每周六 16:00 自动同步，但有时想立刻拿最新数据
 （市场剧烈波动、周末已过想看周一开盘后情况、调仓后想立刻核对）。
@@ -187,7 +191,43 @@ vs 简单 multiplier 的差异，可接受。
 
 ---
 
-## [P5] 真正的 consolidated Modified Dietz / IRR
+## [P5] 分红 / 现金流跨报表累积 —— upload 改成按 id 合并
+
+**问题**：分红面板只能显示 Flex Query 期间内的数据（现在是 Last 365
+Calendar Days），再往前就没了。而且这**不是改 query 期间就能解决的** ——
+`/api/upload` 是整份覆盖（`app.py` `_save_accounts` → `os.replace`），
+手动拉一份更早年份的报表传上去，结果是把当前这份顶掉，而不是拼成两年。
+
+跟 1.2「旧快照覆盖新快照检测」是同一个病根：写盘逻辑里没有「合并」这个概念。
+
+**地基已经有了** —— 去重键是 IBKR 的 TransactionID：
+- 现金流：`cash_flows[].id` 存成 `txn:<TransactionID>`（缺列时降级 `synth:`）
+- 分红：`_dividend_id()` 用同一套键，重叠期间不会双算
+
+**缺的两块**：
+1. 分红 event 现在**没把 id 存进 JSON**（只有 date/symbol/kind/amount/
+   per_share/description），现金流那边有。先补上，否则合并时无键可依
+2. upload / refresh 写盘前先读旧 JSON，按 id 取并集，再从全集重算
+   `by_symbol` / `by_month` / `cost_history` / IRR
+
+**顺带收益**：`cost_history` 的 `covered` 判定会跟着变好 —— 窗口越长，
+建仓记录落在窗口内的清仓标的越多，能重建成本的也就越多。
+
+**注意，不是所有字段都能合并**：
+- NAV / OpenPositions / 期间 TWR 是**快照**，永远取最新那份，不能相加
+- 只有事件流（cash_flows、dividends.events）能取并集
+- 合并后 `statement.Period` 要改成实际覆盖的最早 → 最晚，不能照抄其中一份
+
+### 文件改动清单
+- `parser/ibkr_flex_csv.py` — `_ingest_dividend_row` 把 id 存进 event
+- `app.py` — `_save_accounts` 改成 merge-then-write
+- 新建 `parser/merge.py` — 快照取新 / 事件取并集
+
+预计 1–2 小时。
+
+---
+
+## [P6] 真正的 consolidated Modified Dietz / IRR
 
 当前合并视图用 sum gross_in + sum net_gain 算 money multiplier，
 得到 25.49% — 跟 IBKR PortfolioAnalyst 的 22.55% 差 ~3 个百分点。

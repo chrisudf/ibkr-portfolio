@@ -75,3 +75,22 @@ IBKR 周末有计划维护窗口（一般 2–4 小时），脚本内置 2 次�
 - **Token 过期（每年一次）**: IBKR 邮件提醒续期，去 Account Management 重新
   生成 token，更新 `sync.env`。
 - **403 from upload**: basic auth 写错了，或者哈希在 Caddyfile 里被改了。
+
+## 刷新按钮失败时去哪看细节
+
+`/api/refresh` 会把 IBKR 的**原始响应**记到日志（token 已打码），错误码列表
+解释不了的情况就靠它。三个地方都能读到同一份信息：
+
+- 本地：`run-local.ps1` 的终端输出
+- droplet：`docker compose logs -f app`
+- 浏览器：DevTools → Network → `/api/refresh` 响应里的 `raw` 字段
+
+**成功**的那次也会记一行，列出这份报表实际包含哪些 section，例如：
+
+```
+[154914] fetched 182304 bytes, sections: NAV[2], OpenPositions[91], CashTransactions[47], StatementOfFunds[210]
+```
+
+面板缺数据时先看这行 —— 比如分红是空的，但 section 列表里没有
+`CashTransactions` 也没有 `StatementOfFunds`，那就是 Flex Query 没勾，
+不是解析器的问题。
