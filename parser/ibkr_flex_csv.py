@@ -571,10 +571,14 @@ def _finalize_cost_history(account: dict[str, Any]) -> None:
             for d, q in moves:
                 if d <= start or d > end:
                     continue
-                area += pos * (d - prev).days
+                # Only long exposure earns dividends. A name that went short
+                # mid-period (sell 10, buy back months later) otherwise drags
+                # the average negative, and a negative "average shares" is a
+                # nonsense basis for "what should I have collected".
+                area += max(pos, 0.0) * (d - prev).days
                 prev = d
                 pos += q
-            area += pos * (end - prev).days
+            area += max(pos, 0.0) * (end - prev).days
             entry["avg_shares"] = area / entry["days"]
         out[sym] = entry
     account["cost_history"] = out
