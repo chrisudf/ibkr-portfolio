@@ -39,6 +39,32 @@ def _parse_option_symbol(symbol: str) -> dict[str, Any] | None:
 # the ticker has to come out of the description.
 _DIV_SYMBOL_RE = re.compile(r"^([A-Z][A-Z0-9\.]{0,9})\s*\(")
 
+# The Activity Statement carries the rate and the income class in the same
+# description string the Flex export splits into columns:
+#   "MSFT(US5949181045) Cash Dividend USD 0.83 per Share (Ordinary Dividend)"
+_DIV_RATE_RE = re.compile(r"[A-Z]{3}\s+([\d.]+)\s+PER\s+SHARE", re.I)
+
+
+def _dividend_rate(desc: str) -> float:
+    m = _DIV_RATE_RE.search(desc or "")
+    if not m:
+        return 0.0
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return 0.0
+
+
+def _income_class_from_desc(desc: str) -> str:
+    """Capital gains / return of capital arrive through the dividend sections
+    but are not dividend income — see `_income_class` in ibkr_flex_csv.py."""
+    t = (desc or "").lower()
+    if "capital gain" in t:
+        return "capital_gain"
+    if "return of capital" in t:
+        return "return_of_capital"
+    return "ordinary"
+
 
 def _parse_dividends(sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """Build the payout summary from the Dividends / Withholding Tax sections.
@@ -61,11 +87,22 @@ def _parse_dividends(sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
                 continue
             desc = (r.get("Description") or "").strip()
             m = _DIV_SYMBOL_RE.match(desc)
+            sym = m.group(1) if m else ""
+            # Same rule as the Flex path: withholding that names no security
+            # is tax on interest, not on a dividend, and folding it in would
+            # overstate the tax drag. See parser/ibkr_flex_csv.py.
+            if kind == "tax" and not sym:
+                continue
             rows.append({
                 "date": date,
-                "symbol": m.group(1) if m else "—",
+                "symbol": sym or "—",
                 "kind": kind,
                 "amount": amount,
+                # This statement has no DividendType column, but the same
+                # facts are in the description tail: the per-share rate and a
+                # "(Ordinary Dividend)" / "(Short Term Capital Gain)" suffix.
+                "per_share": _dividend_rate(desc) if kind == "gross" else 0.0,
+                "income_class": _income_class_from_desc(desc) if kind == "gross" else "",
                 "description": desc,
             })
     if not rows:
@@ -73,7 +110,7 @@ def _parse_dividends(sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
 
     by_symbol: dict[str, dict[str, Any]] = {}
     by_month: dict[str, dict[str, Any]] = {}
-    gross = tax = 0.0
+    gross = tax = non_dividend_total = 0.0
     for r in rows:
         if r["kind"] == "gross":
             gross += r["amount"]
@@ -81,12 +118,21 @@ def _parse_dividends(sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
             tax += r["amount"]
         s = by_symbol.setdefault(r["symbol"], {
             "symbol": r["symbol"], "gross": 0.0, "tax": 0.0, "net": 0.0,
-            "count": 0, "last_date": "",
+            "count": 0, "per_share": 0.0, "per_share_ordinary": 0.0,
+            "non_dividend": 0.0, "rate_missing": 0, "last_date": "",
         })
         s[r["kind"]] += r["amount"]
         s["net"] = s["gross"] + s["tax"]
         if r["kind"] == "gross":
             s["count"] += 1
+            s["per_share"] += r["per_share"]
+            if r["income_class"] == "ordinary":
+                s["per_share_ordinary"] += r["per_share"]
+            else:
+                s["non_dividend"] += r["amount"]
+                non_dividend_total += r["amount"]
+            if not r["per_share"]:
+                s["rate_missing"] += 1
         s["last_date"] = max(s["last_date"], r["date"])
         m = by_month.setdefault(r["date"][:7], {"month": r["date"][:7], "gross": 0.0, "tax": 0.0, "net": 0.0})
         m[r["kind"]] += r["amount"]
@@ -97,6 +143,7 @@ def _parse_dividends(sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
         "gross": gross,
         "tax": tax,
         "net": gross + tax,
+        "non_dividend": non_dividend_total,
         "by_symbol": sorted(by_symbol.values(), key=lambda x: x["net"], reverse=True),
         "by_month": sorted(by_month.values(), key=lambda x: x["month"]),
         "events": sorted(rows, key=lambda r: (r["date"], r["symbol"]), reverse=True),

@@ -597,8 +597,12 @@ def _finalize_cost_history(account: dict[str, Any]) -> None:
             "avg_shares": 0.0,
         }
         if start and end and end > start:
-            # Position at the window's start = everything bought before it.
-            pos = sum(q for d, q in moves if d <= start)
+            # Shares already held when the statement opens never appear as a
+            # trade, so the integration has to be seeded with them or it starts
+            # from zero on a position that was there all along. Back it out of
+            # the ending position: opening = final - (everything traded since).
+            opening = held_now - (bq - h["sold_qty"])
+            pos = opening + sum(q for d, q in moves if d <= start)
             area = 0.0
             prev = start
             for d, q in moves:

@@ -133,9 +133,6 @@ function mergeAccounts(accounts) {
       // accounts holding MSFT booked the same $1.82/share. Summing would
       // double it. Take the widest coverage instead: the account that held
       // through the most ex-dates saw the most of the year's rate.
-      t.per_share = Math.max(t.per_share, s.per_share || 0);
-      // Same reasoning as per_share: a rate is per security, not per account.
-      t.per_share_ordinary = Math.max(t.per_share_ordinary, s.per_share_ordinary || 0);
       t.non_dividend += s.non_dividend || 0;   // cash, so this one does add
       t.rate_missing = Math.max(t.rate_missing, s.rate_missing || 0);
       t.last_date = t.last_date > s.last_date ? t.last_date : s.last_date;
@@ -145,6 +142,26 @@ function mergeAccounts(accounts) {
       t.gross += m.gross; t.tax += m.tax; t.net += m.net;
     }
   }
+  // Per-share rates can't be summed across accounts (both holders of MSFT
+  // booked the same $1.82) but taking the max is wrong too: when the accounts
+  // held the name over different stretches, each one saw payments the other
+  // missed. Union the distinct payments instead — same identity the dedupe
+  // uses — so a household that held SGOV Sep-Mar in one account and Dec-Jun in
+  // the other gets credit for every ex-date either of them was present for.
+  const seenPay = {};
+  for (const a of list) {
+    for (const e of a.dividends?.events || []) {
+      if (e.kind !== "gross" || !e.per_share) continue;
+      const t = divSym[e.symbol];
+      if (!t) continue;
+      const key = `${e.symbol}|${e.date}|${e.per_share}`;
+      if (seenPay[key]) continue;
+      seenPay[key] = true;
+      t.per_share += e.per_share;
+      if ((e.income_class || "ordinary") === "ordinary") t.per_share_ordinary += e.per_share;
+    }
+  }
+
   const dividends = Object.keys(divSym).length ? {
     source: divSource,
     gross: divGross,
@@ -163,14 +180,16 @@ function mergeAccounts(accounts) {
   for (const a of list) {
     for (const [sym, h] of Object.entries(a.cost_history || {})) {
       const t = histAcc[sym] || (histAcc[sym] = {
-        qty: 0, cost: 0, sold: 0, covered: true, days: 0, shares: 0, pre: false,
+        qty: 0, cost: 0, sold: 0, covered: true, start: "", end: "", shares: 0, pre: false,
       });
       t.qty += h.bought_qty;
       t.cost += h.avg_price * h.bought_qty;
       t.sold += h.sold_qty;
       t.covered = t.covered && h.covered;
-      // Widest deployed window across the accounts, and the positions add up.
-      t.days = Math.max(t.days, h.days || 0);
+      // Union of the deployed windows, to match the unioned payments above:
+      // earliest start to latest end across the accounts.
+      if (h.start && (!t.start || h.start < t.start)) t.start = h.start;
+      if (h.end && (!t.end || h.end > t.end)) t.end = h.end;
       t.shares += h.avg_shares || 0;
       t.pre = t.pre || !!h.pre_existing;
     }
@@ -180,7 +199,10 @@ function mergeAccounts(accounts) {
     if (t.qty > 0) {
       cost_history[sym] = {
         avg_price: t.cost / t.qty, bought_qty: t.qty, sold_qty: t.sold, covered: t.covered,
-        days: t.days, avg_shares: t.shares, pre_existing: t.pre,
+        days: (t.start && t.end)
+          ? Math.max(0, Math.round((Date.parse(t.end) - Date.parse(t.start)) / 86400000))
+          : 0,
+        avg_shares: t.shares, pre_existing: t.pre,
       };
     }
   }
@@ -450,7 +472,12 @@ function computeMargin(data, priceBook) {
       sharesLeft[o.underlying] = (sharesLeft[o.underlying] || 0) - covered;
     }
     const nakedShares = shares - covered;
-    const req = nakedShares > 0 ? regTPerShare(o.right, o.strike, spot) * nakedShares + mv : 0;
+    // mv is the whole position's market value, so only the naked slice of the
+    // premium belongs in the requirement — a call half covered by stock would
+    // otherwise carry the covered half's premium too.
+    const req = nakedShares > 0
+      ? regTPerShare(o.right, o.strike, spot) * nakedShares + mv * (nakedShares / shares)
+      : 0;
     const notionalHere = o.right === "P" ? o.strike * shares : 0;
 
     requirement += req;
@@ -487,9 +514,43 @@ function computeMargin(data, priceBook) {
   };
 }
 
+// Margin is per account: IBKR does not let one account's shares cover another
+// account's short call, nor its credit balance offset another's debit. So the
+// merged view sums separately-computed requirements rather than computing one
+// requirement over pooled positions.
+function mergeMargin(parts) {
+  const out = {
+    requirement: 0, notional: 0, premium: 0, totalNav: 0, excess: 0, borrowed: 0,
+    assumedContracts: 0, assumedRequirement: 0, rows: [],
+  };
+  const byU = {};
+  for (const m of parts) {
+    for (const k of ["requirement", "notional", "premium", "totalNav", "excess",
+                     "borrowed", "assumedContracts", "assumedRequirement"]) {
+      out[k] += m[k];
+    }
+    for (const r of m.rows) {
+      const b = byU[r.underlying] || (byU[r.underlying] = { ...r });
+      if (b !== r) {
+        for (const k of ["contracts", "puts", "calls", "covered", "requirement",
+                         "notional", "premium"]) b[k] += r[k];
+        b.priceKnown = b.priceKnown && r.priceKnown;
+      }
+    }
+  }
+  out.pctOfNav = out.totalNav > 0 ? out.requirement / out.totalNav : 0;
+  out.assumedShare = out.requirement > 0 ? out.assumedRequirement / out.requirement : 0;
+  out.rows = Object.values(byU).sort((a, b) => b.requirement - a.requirement);
+  return out;
+}
+
 function renderMargin(data, accounts) {
   const panel = $("margin-panel");
-  const m = computeMargin(data, buildPriceBook(accounts));
+  const book = buildPriceBook(accounts);
+  const merged = (data.account || {}).Account === "ALL";
+  const m = merged
+    ? mergeMargin(Object.values(accounts || {}).map(a => computeMargin(a, book)))
+    : computeMargin(data, book);
   if (!m.rows.length) { panel.hidden = true; return; }
   panel.hidden = false;
 
@@ -752,7 +813,7 @@ function renderOptions(options) {
 // Fill the gaps so a month with no payout still gets a (zero-height) bar —
 // otherwise quarterly payers render as an evenly-spaced row that hides the
 // actual cadence.
-function monthRange(months) {
+function monthRange(months, period) {
   if (!months.length) return [];
   const step = (ym, delta) => {
     const [y, m] = ym.split("-").map(Number);
@@ -760,9 +821,18 @@ function monthRange(months) {
     return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
   };
   const byMonth = Object.fromEntries(months.map(m => [m.month, m]));
-  const out = [];
+  // Span the whole reporting window, not just first payout to last. A
+  // quarterly payer inside a 12-month window otherwise renders ~10 bars and
+  // the monthly average divides by the wrong number of months — and the empty
+  // months at the edges are exactly where a missed ex-date would show.
+  const bounds = (period || "").match(/(\d{4}-\d{2})-\d{2}\D+(\d{4}-\d{2})-\d{2}/);
   let cur = months[0].month;
-  const last = months[months.length - 1].month;
+  let last = months[months.length - 1].month;
+  if (bounds) {
+    if (bounds[1] < cur) cur = bounds[1];
+    if (bounds[2] > last) last = bounds[2];
+  }
+  const out = [];
   for (let i = 0; i < 240 && cur <= last; i++) {
     out.push(byMonth[cur] || { month: cur, gross: 0, tax: 0, net: 0 });
     cur = step(cur, 1);
@@ -810,7 +880,7 @@ function renderDividends(data) {
     + (accrued ? ` · 另有应计未付 ${fmtMoney(accrued, 2)}` : "");
 
   // Monthly bars
-  const months = monthRange(div.by_month || []);
+  const months = monthRange(div.by_month || [], data.statement?.Period);
   const maxNet = Math.max(...months.map(m => Math.abs(m.net)), 1);
   const chart = $("div-chart");
   chart.innerHTML = months.map(m => {
