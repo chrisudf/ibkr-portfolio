@@ -123,9 +123,16 @@ function mergeAccounts(accounts) {
     divTax += d.tax || 0;
     for (const s of d.by_symbol) {
       const t = divSym[s.symbol] || (divSym[s.symbol] = {
-        symbol: s.symbol, gross: 0, tax: 0, net: 0, count: 0, last_date: "",
+        symbol: s.symbol, gross: 0, tax: 0, net: 0, count: 0,
+        per_share: 0, rate_missing: 0, last_date: "",
       });
       t.gross += s.gross; t.tax += s.tax; t.net += s.net; t.count += s.count;
+      // per_share is a property of the security, not of the account — both
+      // accounts holding MSFT booked the same $1.82/share. Summing would
+      // double it. Take the widest coverage instead: the account that held
+      // through the most ex-dates saw the most of the year's rate.
+      t.per_share = Math.max(t.per_share, s.per_share || 0);
+      t.rate_missing = Math.max(t.rate_missing, s.rate_missing || 0);
       t.last_date = t.last_date > s.last_date ? t.last_date : s.last_date;
     }
     for (const m of d.by_month || []) {
@@ -371,6 +378,10 @@ function computeMargin(data, priceBook) {
 
   const byUnderlying = {};
   let requirement = 0, notional = 0, premium = 0, assumedContracts = 0;
+  // How much of the total leans on an assumed spot. Counting contracts
+  // understates it — the assumed ones are often the biggest requirements,
+  // because assuming at-the-money is the most expensive guess you can make.
+  let assumedRequirement = 0;
 
   // Short calls before puts so covering shares go to the calls that need them.
   const shorts = options.filter(o => o.quantity < 0)
@@ -397,6 +408,7 @@ function computeMargin(data, priceBook) {
     const notionalHere = o.right === "P" ? o.strike * shares : 0;
 
     requirement += req;
+    if (!known) assumedRequirement += req;
     premium += mv;
     notional += notionalHere;
 
@@ -423,6 +435,8 @@ function computeMargin(data, priceBook) {
     // collateral tied up behind short options.
     borrowed: Math.max(0, -(nav.cash || 0)),
     assumedContracts,
+    assumedRequirement,
+    assumedShare: requirement > 0 ? assumedRequirement / requirement : 0,
     rows: Object.values(byUnderlying).sort((a, b) => b.requirement - a.requirement),
   };
 }
@@ -451,8 +465,13 @@ function renderMargin(data, accounts) {
 
   const note = $("margin-note");
   note.textContent = m.assumedContracts > 0
-    ? `Reg-T 估算 · ${m.assumedContracts} 张合约的正股不在持仓中，按平值估算`
+    ? `Reg-T 估算 · ${m.assumedContracts} 张合约无正股报价，按平值估算`
+      + `（占估算额 ${fmtPct(m.assumedShare, 0)}）`
     : "Reg-T 估算 · 正股价格取自当前持仓";
+  note.title = m.assumedContracts > 0
+    ? "平值假设对价外的卖put偏保守 —— 实际保证金通常低于此。"
+      + "买入这些标的的正股后，价格会自动接入，数字随之收紧。"
+    : "";
 
   const tbody = $("margin-body");
   tbody.innerHTML = "";
@@ -764,10 +783,27 @@ function renderDividends(data) {
 
   const tbody = $("div-body");
   tbody.innerHTML = "";
-  const held = new Set((data.stocks || []).map(s => s.symbol));
+  // Yield is per-share on both sides: the payments you actually collected per
+  // share, over what you paid per share. Dividing total dividends by the
+  // current cost basis instead would compare a full year of payouts against
+  // whatever position survived to today — on a position trimmed 90% through
+  // the year that reads as a 36% yield. Per-share cancels the size change out.
+  const costPrice = {};
+  for (const s of data.stocks || []) if (s.cost_price > 0) costPrice[s.symbol] = s.cost_price;
   for (const s of div.by_symbol) {
     const tr = document.createElement("tr");
-    const soldTag = held.has(s.symbol) ? "" : ` <span class="tag tag-flow-out">已清仓</span>`;
+    const soldTag = s.symbol in costPrice ? "" : ` <span class="tag tag-flow-out">已清仓</span>`;
+    const cp = costPrice[s.symbol];
+    const dps = s.per_share || 0;
+    // No current position means no cost per share to divide by — the statement
+    // never carries the cost of something you already closed out.
+    const yieldCell = (cp && dps)
+      ? `${fmtPct(dps / cp, 2)}${s.rate_missing ? ' <span class="muted">*</span>' : ""}`
+      : `<span class="muted">—</span>`;
+    const yieldTitle = (cp && dps)
+      ? `每股股息 ${fmtMoney(dps, 4)} ÷ 平均成本 ${fmtMoney(cp, 2)}`
+        + (s.rate_missing ? ` · ${s.rate_missing} 笔代付股息(PIL)不含每股报价，实际略高于此` : "")
+      : "已清仓或无成本价，无法计算";
     tr.innerHTML = `
       <td><b>${s.symbol}</b>${soldTag}</td>
       <td class="num">${s.count}</td>
@@ -775,6 +811,8 @@ function renderDividends(data) {
       <td class="num ${s.tax < 0 ? "down" : "muted"}">${s.tax ? fmtMoney(s.tax, 2) : "—"}</td>
       <td class="num"><b>${fmtMoney(s.net, 2)}</b></td>
       <td class="num">${fmtPct(div.net ? s.net / div.net : 0, 1)}</td>
+      <td class="num muted">${dps ? fmtMoney(dps, 4) : "—"}</td>
+      <td class="num" title="${yieldTitle}">${yieldCell}</td>
       <td class="muted">${s.last_date || "—"}</td>
     `;
     tbody.appendChild(tr);

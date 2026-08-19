@@ -336,6 +336,23 @@ _DIV_CASH_TYPES = {
 # the row itself has no Symbol column filled in.
 _DIV_SYMBOL_RE = re.compile(r"^([A-Z][A-Z0-9\.]{0,9})\s*\(")
 
+# ...and the rate out of the same string: "USD 0.346643 PER SHARE" → 0.346643.
+# Case-insensitive because live Flex output shouts it while the docs don't.
+# This is what makes a yield-on-cost possible at all: the payment amount alone
+# can't be divided by anything meaningful once the position size has changed.
+_DIV_RATE_RE = re.compile(r"[A-Z]{3}\s+([\d.]+)\s+PER\s+SHARE", re.I)
+
+
+def _dividend_rate(row: dict[str, str]) -> float:
+    desc = (row.get("Description") or row.get("ActivityDescription") or "")
+    m = _DIV_RATE_RE.search(desc)
+    if not m:
+        return 0.0
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return 0.0
+
 
 def _dividend_symbol(row: dict[str, str]) -> str:
     """Ticker for a payout row, or "" when the row names no security at all."""
@@ -385,6 +402,7 @@ def _ingest_dividend_row(account: dict[str, Any], bucket: str, d: date, sym: str
         "symbol": sym,
         "kind": kind,  # "gross" (dividend / payment in lieu) or "tax" (withheld)
         "amount": amount,
+        "per_share": _dividend_rate(row) if kind == "gross" else 0.0,
         "description": (row.get("Description") or row.get("ActivityDescription") or "").strip(),
     })
 
@@ -430,12 +448,17 @@ def _finalize_dividends(account: dict[str, Any]) -> None:
             tax += r["amount"]
         s = by_symbol.setdefault(r["symbol"], {
             "symbol": r["symbol"], "gross": 0.0, "tax": 0.0, "net": 0.0,
-            "count": 0, "last_date": "",
+            "count": 0, "per_share": 0.0, "rate_missing": 0, "last_date": "",
         })
         s[r["kind"]] += r["amount"]
         s["net"] = s["gross"] + s["tax"]
         if r["kind"] == "gross":
             s["count"] += 1
+            # Per-share rates add up across payments regardless of how the
+            # position was sized between them — that's the whole point.
+            s["per_share"] += r["per_share"]
+            if not r["per_share"]:
+                s["rate_missing"] += 1
         s["last_date"] = max(s["last_date"], r["date"])
         m = by_month.setdefault(r["date"][:7], {"month": r["date"][:7], "gross": 0.0, "tax": 0.0, "net": 0.0})
         m[r["kind"]] += r["amount"]

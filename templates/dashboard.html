@@ -90,40 +90,6 @@
         <div id="alloc-legend" class="alloc-legend"></div>
       </section>
 
-      <!-- Margin usage -->
-      <section class="panel" id="margin-panel" hidden>
-        <div class="panel-head">
-          <h2>保证金占用</h2>
-          <span class="panel-note" id="margin-note"></span>
-        </div>
-        <div class="margin-hero">
-          <div>
-            <div class="margin-hero-label">Margin 占用</div>
-            <div class="margin-hero-pct"><span id="margin-pct">—</span><small>占整个账户</small></div>
-          </div>
-          <div class="margin-hero-amount" id="margin-amount">$0</div>
-        </div>
-        <div class="margin-gauge" id="margin-gauge"></div>
-        <div class="margin-gauge-note" id="margin-gauge-note"></div>
-        <div class="margin-basis" id="margin-basis"></div>
-        <div class="table-wrap" style="margin-top:16px">
-          <table class="holdings">
-            <thead>
-              <tr>
-                <th>标的</th><th>卖出合约</th>
-                <th class="num">正股价</th>
-                <th class="num">名义抵押</th>
-                <th class="num">权利金负债</th>
-                <th class="num">保证金占用</th>
-                <th class="num">占比</th>
-              </tr>
-            </thead>
-            <tbody id="margin-body"></tbody>
-          </table>
-        </div>
-        <div class="margin-foot" id="margin-foot"></div>
-      </section>
-
       <!-- Holdings table -->
       <section class="panel">
         <div class="panel-head">
@@ -171,6 +137,40 @@
         </div>
       </section>
 
+      <!-- Margin usage -->
+      <section class="panel" id="margin-panel" hidden>
+        <div class="panel-head">
+          <h2>保证金占用</h2>
+          <span class="panel-note" id="margin-note"></span>
+        </div>
+        <div class="margin-hero">
+          <div>
+            <div class="margin-hero-label">Margin 占用</div>
+            <div class="margin-hero-pct"><span id="margin-pct">—</span><small>占整个账户</small></div>
+          </div>
+          <div class="margin-hero-amount" id="margin-amount">$0</div>
+        </div>
+        <div class="margin-gauge" id="margin-gauge"></div>
+        <div class="margin-gauge-note" id="margin-gauge-note"></div>
+        <div class="margin-basis" id="margin-basis"></div>
+        <div class="table-wrap" style="margin-top:16px">
+          <table class="holdings">
+            <thead>
+              <tr>
+                <th>标的</th><th>卖出合约</th>
+                <th class="num">正股价</th>
+                <th class="num">名义抵押</th>
+                <th class="num">权利金负债</th>
+                <th class="num">保证金占用</th>
+                <th class="num">占比</th>
+              </tr>
+            </thead>
+            <tbody id="margin-body"></tbody>
+          </table>
+        </div>
+        <div class="margin-foot" id="margin-foot"></div>
+      </section>
+
       <!-- Dividends -->
       <section class="panel" id="dividends-panel" hidden>
         <div class="panel-head">
@@ -205,6 +205,8 @@
                   <th>标的</th><th class="num">次数</th>
                   <th class="num">税前</th><th class="num">预扣税</th>
                   <th class="num">净额</th><th class="num">占比</th>
+                  <th class="num">每股股息</th>
+                  <th class="num">成本股息率</th>
                   <th>最近一次</th>
                 </tr>
               </thead>
