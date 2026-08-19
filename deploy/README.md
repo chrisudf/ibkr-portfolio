@@ -62,10 +62,37 @@ docker compose up -d --build
 
 ## 备份持仓数据
 
-数据放在 `app_data` volume 里：
+数据放在 `app_data` volume 里。**注意实际的 volume 名带 compose 项目名前缀** ——
+compose 是在 `deploy/` 目录里跑的，所以项目名是 `deploy`，volume 叫
+`deploy_app_data`，不是 `ibkr-portfolio_app_data`。
+
+先确认名字：
 ```bash
-docker run --rm -v ibkr-portfolio_app_data:/data -v $PWD:/backup alpine \
+docker volume ls | grep app_data
+# 或者直接问容器挂的是哪个：
+docker inspect deploy-app-1 --format '{{range .Mounts}}{{.Name}} -> {{.Destination}}{{println}}{{end}}'
+```
+
+备份：
+```bash
+docker run --rm -v deploy_app_data:/data -v $PWD:/backup alpine \
   tar czf /backup/portfolio-$(date +%F).tar.gz -C /data .
+```
+
+**跑完一定要看一眼大小。** volume 名写错时 docker 不会报错，而是**新建一个空
+volume**、把空目录打包好 —— 得到一个 87 字节、语法完全正确的 tar.gz。正常备份
+是几十 KB：
+```bash
+ls -lh portfolio-*.tar.gz
+```
+写错还会留下一个空 volume，顺手删掉：`docker volume rm ibkr-portfolio_app_data`
+
+恢复到某个备份：
+```bash
+cd /opt/ibkr-portfolio/deploy && docker compose stop app
+docker run --rm -v deploy_app_data:/data -v $PWD:/backup alpine \
+  sh -c 'rm -rf /data/* && tar xzf /backup/portfolio-YYYY-MM-DD.tar.gz -C /data'
+docker compose start app
 ```
 
 ## 不想用域名（只用 IP + 自签证书）
