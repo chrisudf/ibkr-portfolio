@@ -89,6 +89,11 @@ def _empty_account() -> dict[str, Any]:
         "performance": {"realized_total": 0.0, "unrealized_total": 0.0, "by_symbol": {}},
         "cash_flows": [],   # persisted ledger: one id-keyed entry per external flow
         "dividends": {},    # aggregated payout summary, built in finalize
+        # Per-symbol buy/sell tallies rebuilt from Statement of Funds trade
+        # rows, so a position closed during the period still has a cost to
+        # divide a dividend by. Open Positions only describes what you still
+        # hold; this covers what you held and sold.
+        "cost_history": {},
         "_cash_flows": [],  # raw (date, amount) for IRR; stripped before serialising
         "_cf_ids": set(),   # flow ids already ingested this parse; stripped
         "_cf_synth_seq": {},  # composite-key occurrence counter; stripped
@@ -475,7 +480,60 @@ def _finalize_dividends(account: dict[str, Any]) -> None:
     }
 
 
+def _ingest_trade_cost(account: dict[str, Any], row: dict[str, str]) -> None:
+    """Tally stock buys and sells so closed positions keep a cost per share.
+
+    Only meaningful for a position that ended flat: every share bought was
+    also sold, so the average of the buys is the average cost of everything
+    that ever passed through. For a position still open this average is wrong
+    — round trips leave shares in the tally that are no longer held, which is
+    why the dashboard prefers IBKR's own CostBasisPrice whenever it exists and
+    falls back here only once the position is gone.
+
+    Verified against IBKR's realized P&L on 14 fully-closed positions: buy
+    cost + commissions reproduces `proceeds - TotalRealizedPnl` exactly.
+    """
+    if row.get("AssetClass") != "STK":
+        return
+    qty = _to_float(row.get("TradeQuantity"))
+    if qty == 0:
+        return
+    sym = (row.get("Symbol") or "").strip()
+    if not sym:
+        return
+    hist = account["cost_history"].setdefault(sym, {
+        "bought_qty": 0.0, "bought_cost": 0.0, "sold_qty": 0.0,
+    })
+    if qty > 0:
+        hist["bought_qty"] += qty
+        hist["bought_cost"] += qty * _to_float(row.get("TradePrice"))
+        # Commission belongs in the cost of the shares it bought.
+        hist["bought_cost"] += abs(_to_float(row.get("TradeCommission")))
+    else:
+        hist["sold_qty"] += -qty
+
+
+def _finalize_cost_history(account: dict[str, Any]) -> None:
+    """Reduce the tallies to an average cost, dropping the unusable ones."""
+    out: dict[str, Any] = {}
+    for sym, h in account["cost_history"].items():
+        bq = h["bought_qty"]
+        if bq <= 0:
+            continue
+        # Buys must cover the sells, otherwise the position was opened before
+        # this statement began and the average would be built from a fragment.
+        covered = bq >= h["sold_qty"] - 1e-6
+        out[sym] = {
+            "avg_price": h["bought_cost"] / bq,
+            "bought_qty": bq,
+            "sold_qty": h["sold_qty"],
+            "covered": covered,
+        }
+    account["cost_history"] = out
+
+
 def _ingest_statement_of_funds(account: dict[str, Any], row: dict[str, str]) -> None:
+    _ingest_trade_cost(account, row)
     code = row.get("ActivityCode", "")
     if code in _DIV_GROSS_CODES or code in _DIV_TAX_CODES:
         d = _parse_date(row.get("Date", "") or row.get("SettleDate", ""))
@@ -604,6 +662,7 @@ def parse_ibkr_flex_csv(content: str) -> dict[str, Any]:
         acct["nav"]["return_method"] = returns["method"]
         acct["cash_flows"].sort(key=lambda f: (f["date"], f["id"]))
         _finalize_dividends(acct)
+        _finalize_cost_history(acct)
         # Strip internal scratch state before serialising. _cf_ids is a set
         # and would blow up json.dump if it ever survived to the writer.
         for k in ("_cash_flows", "_cf_ids", "_cf_synth_seq",

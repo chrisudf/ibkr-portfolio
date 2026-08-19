@@ -151,12 +151,33 @@ function mergeAccounts(accounts) {
       .sort((a, b) => (a.date < b.date ? 1 : -1)),
   } : {};
 
+  // Cost history: re-derive the average from summed tallies rather than
+  // averaging averages, which would ignore how many shares each account held.
+  const histAcc = {};
+  for (const a of list) {
+    for (const [sym, h] of Object.entries(a.cost_history || {})) {
+      const t = histAcc[sym] || (histAcc[sym] = { qty: 0, cost: 0, sold: 0, covered: true });
+      t.qty += h.bought_qty;
+      t.cost += h.avg_price * h.bought_qty;
+      t.sold += h.sold_qty;
+      t.covered = t.covered && h.covered;
+    }
+  }
+  const cost_history = {};
+  for (const [sym, t] of Object.entries(histAcc)) {
+    if (t.qty > 0) {
+      cost_history[sym] = {
+        avg_price: t.cost / t.qty, bought_qty: t.qty, sold_qty: t.sold, covered: t.covered,
+      };
+    }
+  }
+
   // If accounts share the same period (the usual case) collapse to one.
   const periods = [...new Set(list.map(a => a.statement?.Period).filter(Boolean))];
   return {
     account: { Account: "ALL" },
     statement: { Period: periods.length === 1 ? periods[0] : periods.join(" / ") },
-    nav, stocks, options, dividends,
+    nav, stocks, options, dividends, cost_history,
     performance: {
       realized_total: realizedTotal,
       unrealized_total: unrealizedTotal,
@@ -790,20 +811,29 @@ function renderDividends(data) {
   // the year that reads as a 36% yield. Per-share cancels the size change out.
   const costPrice = {};
   for (const s of data.stocks || []) if (s.cost_price > 0) costPrice[s.symbol] = s.cost_price;
+  // Closed positions fall back to a cost rebuilt from the period's trades.
+  // IBKR's own CostBasisPrice wins whenever the position still exists — the
+  // rebuilt average only describes a position that ended flat.
+  const hist = data.cost_history || {};
   for (const s of div.by_symbol) {
     const tr = document.createElement("tr");
-    const soldTag = s.symbol in costPrice ? "" : ` <span class="tag tag-flow-out">已清仓</span>`;
-    const cp = costPrice[s.symbol];
+    const open = s.symbol in costPrice;
+    const h = hist[s.symbol];
+    const rebuilt = !open && h && h.covered && h.avg_price > 0 ? h.avg_price : 0;
+    const soldTag = open ? "" : ` <span class="tag tag-flow-out">已清仓</span>`;
+    const cp = open ? costPrice[s.symbol] : rebuilt;
     const dps = s.per_share || 0;
-    // No current position means no cost per share to divide by — the statement
-    // never carries the cost of something you already closed out.
+    // Still no cost means the position was opened before this statement's
+    // window, so its buys simply aren't in the data to average.
     const yieldCell = (cp && dps)
-      ? `${fmtPct(dps / cp, 2)}${s.rate_missing ? ' <span class="muted">*</span>' : ""}`
+      ? `${fmtPct(dps / cp, 2)}${rebuilt ? '<span class="muted">†</span>' : ""}`
+        + `${s.rate_missing ? '<span class="muted">*</span>' : ""}`
       : `<span class="muted">—</span>`;
     const yieldTitle = (cp && dps)
-      ? `每股股息 ${fmtMoney(dps, 4)} ÷ 平均成本 ${fmtMoney(cp, 2)}`
+      ? `每股股息 ${fmtMoney(dps, 4)} ÷ ${rebuilt ? "重建" : "平均"}成本 ${fmtMoney(cp, 2)}`
+        + (rebuilt ? ` · 已清仓，成本由本期 ${fmtNum(h.bought_qty, 2)} 股买入记录重建` : "")
         + (s.rate_missing ? ` · ${s.rate_missing} 笔代付股息(PIL)不含每股报价，实际略高于此` : "")
-      : "已清仓或无成本价，无法计算";
+      : "建仓在报表期间之前，本期数据里没有买入记录，无法重建成本";
     tr.innerHTML = `
       <td><b>${s.symbol}</b>${soldTag}</td>
       <td class="num">${s.count}</td>

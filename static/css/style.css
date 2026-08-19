@@ -330,3 +330,6 @@ ul.rank .sym { font-weight: 600; }
   .div-hero-yield { text-align: left; }
   .div-bar-label { display: none; }
 }
+.div-legend {
+  margin-top: 14px; font-size: 11px; color: var(--text-faint); line-height: 1.7;
+}
