@@ -359,6 +359,28 @@ def _dividend_rate(row: dict[str, str]) -> float:
         return 0.0
 
 
+def _income_class(div_type: str) -> str:
+    """Sort a payout into income vs. something that only looks like income.
+
+    IBKR tags every distribution with a DividendType. Funds routinely pay out
+    realized capital gains and return-of-capital through the same cash channel
+    as dividends, and a leveraged ETF does it at a scale that swamps the real
+    dividend — but neither is yield. Capital gains are the fund handing back
+    trading profits; return of capital is your own money coming back, which
+    reduces cost basis rather than adding income.
+
+    Unknown or blank types fall through to "ordinary": ordinary dividends are
+    the overwhelming majority, and mislabelling a rare exotic as income is a
+    smaller error than dropping a real dividend on a spelling we didn't expect.
+    """
+    t = (div_type or "").lower()
+    if "capital gain" in t:
+        return "capital_gain"
+    if "return of capital" in t:
+        return "return_of_capital"
+    return "ordinary"
+
+
 def _dividend_symbol(row: dict[str, str]) -> str:
     """Ticker for a payout row, or "" when the row names no security at all."""
     sym = (row.get("Symbol") or "").strip()
@@ -408,6 +430,7 @@ def _ingest_dividend_row(account: dict[str, Any], bucket: str, d: date, sym: str
         "kind": kind,  # "gross" (dividend / payment in lieu) or "tax" (withheld)
         "amount": amount,
         "per_share": _dividend_rate(row) if kind == "gross" else 0.0,
+        "income_class": _income_class(row.get("DividendType", "")) if kind == "gross" else "",
         "description": (row.get("Description") or row.get("ActivityDescription") or "").strip(),
     })
 
@@ -443,7 +466,7 @@ def _finalize_dividends(account: dict[str, Any]) -> None:
 
     by_symbol: dict[str, dict[str, Any]] = {}
     by_month: dict[str, dict[str, Any]] = {}
-    gross = tax = 0.0
+    gross = tax = non_dividend_total = 0.0
     for r in rows:
         # Withholding arrives as a negative amount; keep IBKR's sign so
         # gross + tax = net falls out without special-casing.
@@ -453,7 +476,8 @@ def _finalize_dividends(account: dict[str, Any]) -> None:
             tax += r["amount"]
         s = by_symbol.setdefault(r["symbol"], {
             "symbol": r["symbol"], "gross": 0.0, "tax": 0.0, "net": 0.0,
-            "count": 0, "per_share": 0.0, "rate_missing": 0, "last_date": "",
+            "count": 0, "per_share": 0.0, "per_share_ordinary": 0.0,
+            "non_dividend": 0.0, "rate_missing": 0, "last_date": "",
         })
         s[r["kind"]] += r["amount"]
         s["net"] = s["gross"] + s["tax"]
@@ -462,6 +486,12 @@ def _finalize_dividends(account: dict[str, Any]) -> None:
             # Per-share rates add up across payments regardless of how the
             # position was sized between them — that's the whole point.
             s["per_share"] += r["per_share"]
+            if r.get("income_class", "ordinary") == "ordinary":
+                s["per_share_ordinary"] += r["per_share"]
+            else:
+                # Kept in gross (the cash did arrive) but excluded from yield.
+                s["non_dividend"] += r["amount"]
+                non_dividend_total += r["amount"]
             if not r["per_share"]:
                 s["rate_missing"] += 1
         s["last_date"] = max(s["last_date"], r["date"])
@@ -474,6 +504,9 @@ def _finalize_dividends(account: dict[str, Any]) -> None:
         "gross": gross,
         "tax": tax,
         "net": gross + tax,
+        # Portion of gross that is a capital-gain / return-of-capital payout
+        # rather than dividend income.
+        "non_dividend": non_dividend_total,
         "by_symbol": sorted(by_symbol.values(), key=lambda x: x["net"], reverse=True),
         "by_month": sorted(by_month.values(), key=lambda x: x["month"]),
         "events": sorted(rows, key=lambda r: (r["date"], r["symbol"]), reverse=True),

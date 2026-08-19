@@ -335,3 +335,4 @@ ul.rank .sym { font-weight: 600; }
 }
 .tag-miss { background: rgba(236, 72, 153, 0.15); color: var(--pink); }
 .yield-days { font-size: 10px; color: var(--text-faint); font-weight: 400; margin-top: 2px; }
+.tag-capgain { background: rgba(251, 191, 36, 0.15); color: var(--amber); }

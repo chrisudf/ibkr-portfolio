@@ -114,17 +114,19 @@ function mergeAccounts(accounts) {
 
   // Dividends — sum across accounts, keyed by symbol and by month.
   const divSym = {}, divMonth = {};
-  let divGross = 0, divTax = 0, divSource = "";
+  let divGross = 0, divTax = 0, divNonDiv = 0, divSource = "";
   for (const a of list) {
     const d = a.dividends;
     if (!d || !d.by_symbol) continue;
     divSource = divSource || d.source;
     divGross += d.gross || 0;
     divTax += d.tax || 0;
+    divNonDiv += d.non_dividend || 0;
     for (const s of d.by_symbol) {
       const t = divSym[s.symbol] || (divSym[s.symbol] = {
         symbol: s.symbol, gross: 0, tax: 0, net: 0, count: 0,
-        per_share: 0, rate_missing: 0, last_date: "",
+        per_share: 0, per_share_ordinary: 0, non_dividend: 0,
+        rate_missing: 0, last_date: "",
       });
       t.gross += s.gross; t.tax += s.tax; t.net += s.net; t.count += s.count;
       // per_share is a property of the security, not of the account — both
@@ -132,6 +134,9 @@ function mergeAccounts(accounts) {
       // double it. Take the widest coverage instead: the account that held
       // through the most ex-dates saw the most of the year's rate.
       t.per_share = Math.max(t.per_share, s.per_share || 0);
+      // Same reasoning as per_share: a rate is per security, not per account.
+      t.per_share_ordinary = Math.max(t.per_share_ordinary, s.per_share_ordinary || 0);
+      t.non_dividend += s.non_dividend || 0;   // cash, so this one does add
       t.rate_missing = Math.max(t.rate_missing, s.rate_missing || 0);
       t.last_date = t.last_date > s.last_date ? t.last_date : s.last_date;
     }
@@ -145,6 +150,7 @@ function mergeAccounts(accounts) {
     gross: divGross,
     tax: divTax,
     net: divGross + divTax,
+    non_dividend: divNonDiv,
     by_symbol: Object.values(divSym).sort((a, b) => b.net - a.net),
     by_month: Object.values(divMonth).sort((a, b) => a.month.localeCompare(b.month)),
     events: list.flatMap(a => a.dividends?.events || [])
@@ -853,8 +859,16 @@ function renderDividends(data) {
     // extrapolated from a few weeks can't pass for a settled one. Below a
     // month the extrapolation is noise, so it is withheld entirely.
     const days = h && h.days ? h.days : 0;
-    const realized = (cp && dps) ? dps / cp : 0;
+    // Yield counts dividend income only. A fund's capital-gain distribution
+    // arrives as cash through the same channel but isn't yield — it's realized
+    // trading profit handed back, and on a leveraged ETF it can be most of the
+    // payout. It stays in 税前/净额 (the cash was real) and out of this rate.
+    const dpsIncome = s.per_share_ordinary != null ? s.per_share_ordinary : dps;
+    const realized = (cp && dpsIncome) ? dpsIncome / cp : 0;
     const annual = (realized && days >= 30) ? realized * 365 / days : 0;
+    const nonDiv = s.non_dividend || 0;
+    // Worth flagging only when it moves the number, not on a rounding tail.
+    const nonDivShare = s.gross > 0 ? nonDiv / s.gross : 0;
     // Did the shares actually exist on the ex-dates?
     const avgShares = h && h.avg_shares ? h.avg_shares : 0;
     const should = avgShares * dps;
@@ -871,7 +885,9 @@ function renderDividends(data) {
           + `<div class="yield-days">${days ? days + " 天，太短" : ""}</div>`
         : `<span class="muted">—</span>`;
     const yieldTitle = (cp && dps)
-      ? `每股股息 ${fmtMoney(dps, 4)} ÷ ${rebuilt ? "重建" : "平均"}成本 ${fmtMoney(cp, 2)}`
+      ? `每股股息 ${fmtMoney(dpsIncome, 4)}`
+        + (nonDiv ? `（已扣除每股 ${fmtMoney(dps - dpsIncome, 4)} 的资本利得分配）` : "")
+        + ` ÷ ${rebuilt ? "重建" : "平均"}成本 ${fmtMoney(cp, 2)}`
         + ` = 实收 ${fmtPct(realized, 2)}`
         + (days ? `（${days} 天）` : "")
         + (annual ? ` · 年化 ${fmtPct(annual, 2)}` : days ? " · 不足 30 天，不做年化" : "")
@@ -880,7 +896,10 @@ function renderDividends(data) {
         + (s.rate_missing ? ` · ${s.rate_missing} 笔代付股息(PIL)不含每股报价，实际略高于此` : "")
       : "建仓在报表期间之前，本期数据里没有买入记录，无法重建成本";
     tr.innerHTML = `
-      <td><b>${s.symbol}</b>${soldTag}${missed ? ` <span class="tag tag-miss" title="${
+      <td><b>${s.symbol}</b>${soldTag}${nonDivShare >= 0.05 ? ` <span class="tag tag-capgain" title="${
+        `其中 ${fmtMoney(nonDiv, 2)}（占税前 ${fmtPct(nonDivShare, 0)}）是资本利得/资本返还分配，`
+        + `不是股息收入。已计入税前与净额，但不计入成本股息率。`
+      }">含资本利得</span>` : ""}${missed ? ` <span class="tag tag-miss" title="${
         `期间平均持仓 ${fmtNum(avgShares, 2)} 股，若整段持有本可收 ${fmtMoney(should, 2)}，`
         + `实收 ${fmtMoney(s.gross, 2)}，差 ${fmtMoney(shortfall, 2)}。`
         + `常见原因：除息日前清仓（当期分红作废），或期间才建仓（错过前几次）。`
