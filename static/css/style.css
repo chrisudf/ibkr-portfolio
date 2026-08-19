@@ -333,3 +333,4 @@ ul.rank .sym { font-weight: 600; }
 .div-legend {
   margin-top: 14px; font-size: 11px; color: var(--text-faint); line-height: 1.7;
 }
+.tag-miss { background: rgba(236, 72, 153, 0.15); color: var(--pink); }

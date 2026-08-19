@@ -367,6 +367,18 @@ function render(data) {
  * which is exactly what the panel reports.
  * ------------------------------------------------------------------------- */
 
+// Ex-date capture: what a payout stream collected, against what a steady
+// holder of the same average size would have collected over the same window.
+//
+// Under 100% doesn't automatically mean money was lost — a position built up
+// during the period naturally misses the earlier ex-dates, and one trimmed
+// early naturally over-collects (these run past 180% in real data). So the
+// ratio alone is a position-timing statistic, not a mistake detector. The
+// dollar floor is what makes it worth showing: it only surfaces cases where
+// the gap is large enough to be real money rather than rounding on a stub.
+const CAPTURE_FLAG_RATIO = 0.8;
+const CAPTURE_FLAG_DOLLARS = 10;
+
 // Reg-T floor for an uncovered contract: $250, i.e. $2.50/share.
 const MARGIN_FLOOR_PER_SHARE = 2.5;
 const CONTRACT_MULTIPLIER = 100;
@@ -832,6 +844,13 @@ function renderDividends(data) {
     const dps = s.per_share || 0;
     // Still no cost means the position was opened before this statement's
     // window, so its buys simply aren't in the data to average.
+    // Did the shares actually exist on the ex-dates?
+    const avgShares = h && h.avg_shares ? h.avg_shares : 0;
+    const should = avgShares * dps;
+    const shortfall = should - s.gross;
+    const missed = should > 0 && s.gross / should < CAPTURE_FLAG_RATIO
+      && shortfall >= CAPTURE_FLAG_DOLLARS;
+
     const yieldCell = (cp && dps)
       ? `${fmtPct(dps / cp, 2)}${rebuilt ? '<span class="muted">†</span>' : ""}`
         + `${s.rate_missing ? '<span class="muted">*</span>' : ""}`
@@ -851,7 +870,11 @@ function renderDividends(data) {
         + (s.rate_missing ? ` · ${s.rate_missing} 笔代付股息(PIL)不含每股报价，实际略高于此` : "")
       : "建仓在报表期间之前，本期数据里没有买入记录，无法重建成本";
     tr.innerHTML = `
-      <td><b>${s.symbol}</b>${soldTag}</td>
+      <td><b>${s.symbol}</b>${soldTag}${missed ? ` <span class="tag tag-miss" title="${
+        `期间平均持仓 ${fmtNum(avgShares, 2)} 股，若整段持有本可收 ${fmtMoney(should, 2)}，`
+        + `实收 ${fmtMoney(s.gross, 2)}，差 ${fmtMoney(shortfall, 2)}。`
+        + `常见原因：除息日前清仓（当期分红作废），或期间才建仓（错过前几次）。`
+      }">除息日缺口 ${fmtMoney(shortfall, 0)}</span>` : ""}</td>
       <td class="num">${s.count}</td>
       <td class="num muted">${fmtMoney(s.gross, 2)}</td>
       <td class="num ${s.tax < 0 ? "down" : "muted"}">${s.tax ? fmtMoney(s.tax, 2) : "—"}</td>
