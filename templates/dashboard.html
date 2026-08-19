@@ -198,10 +198,12 @@
           <div class="div-chart" id="div-chart"></div>
           <div class="div-chart-note" id="div-chart-note"></div>
           <div class="div-legend">
-            成本股息率 = 本期实收<b>每股</b>股息 ÷ <b>每股</b>平均成本 —— 两边都是每股，
-            期间加减仓不影响。<span class="muted">†</span> 已清仓，成本由本期买入记录重建；
+            成本股息率 = 本期实收<b>每股</b>股息 ÷ <b>每股</b>平均成本，再按持有天数<b>年化</b>
+            —— 分子分母都是每股，期间加减仓不影响；年化后不同持有期的标的才能横向比。
+            数字下方是资金实际投入的天数，天数越少外推越虚，不足 30 天不给年化。
+            hover 可看未年化的实收值。<span class="muted">†</span> 已清仓，成本由本期买入记录重建；
             <span class="muted">*</span> 含代付股息(PIL)，IBKR 不报每股费率，实际略高于显示值。
-            持有不足整期的标的天然偏低（只收到了部分派息）。
+            注意分母是<b>你的成本价</b>不是现价，跟 screener 上的市场股息率不是一回事。
           </div>
 
           <div class="table-wrap" style="margin-top:18px">
@@ -212,7 +214,7 @@
                   <th class="num">税前</th><th class="num">预扣税</th>
                   <th class="num">净额</th><th class="num">占比</th>
                   <th class="num">每股股息</th>
-                  <th class="num">成本股息率</th>
+                  <th class="num">成本股息率<br><small>年化</small></th>
                   <th>最近一次</th>
                 </tr>
               </thead>

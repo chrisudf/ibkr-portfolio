@@ -334,3 +334,4 @@ ul.rank .sym { font-weight: 600; }
   margin-top: 14px; font-size: 11px; color: var(--text-faint); line-height: 1.7;
 }
 .tag-miss { background: rgba(236, 72, 153, 0.15); color: var(--pink); }
+.yield-days { font-size: 10px; color: var(--text-faint); font-weight: 400; margin-top: 2px; }

@@ -844,6 +844,17 @@ function renderDividends(data) {
     const dps = s.per_share || 0;
     // Still no cost means the position was opened before this statement's
     // window, so its buys simply aren't in the data to average.
+    // Annualized, because that is what a dividend yield means everywhere —
+    // TTM, forward, SEC 30-day, yield-on-cost are all annual rates. It is also
+    // the only form that lets the column be sorted: a 5.05% collected over 312
+    // days and a 1.90% over 182 days aren't measuring the same thing until
+    // both are put on a yearly footing. The raw collected figure stays in the
+    // tooltip, and the window is printed under the number so a rate
+    // extrapolated from a few weeks can't pass for a settled one. Below a
+    // month the extrapolation is noise, so it is withheld entirely.
+    const days = h && h.days ? h.days : 0;
+    const realized = (cp && dps) ? dps / cp : 0;
+    const annual = (realized && days >= 30) ? realized * 365 / days : 0;
     // Did the shares actually exist on the ex-dates?
     const avgShares = h && h.avg_shares ? h.avg_shares : 0;
     const should = avgShares * dps;
@@ -851,20 +862,19 @@ function renderDividends(data) {
     const missed = should > 0 && s.gross / should < CAPTURE_FLAG_RATIO
       && shortfall >= CAPTURE_FLAG_DOLLARS;
 
-    const yieldCell = (cp && dps)
-      ? `${fmtPct(dps / cp, 2)}${rebuilt ? '<span class="muted">†</span>' : ""}`
-        + `${s.rate_missing ? '<span class="muted">*</span>' : ""}`
-      : `<span class="muted">—</span>`;
-    // The headline stays un-annualized: it's what was actually collected.
-    // But a 4-month holding printing 1.9% next to a fund quoted at 4.2% reads
-    // as an error rather than as a shorter window, so the tooltip does the
-    // division. Below a month the extrapolation is noise, so it's withheld.
-    const days = h && h.days ? h.days : 0;
-    const annual = (cp && dps && days >= 30) ? (dps / cp) * 365 / days : 0;
+    const marks = `${rebuilt ? '<span class="muted">†</span>' : ""}`
+      + `${s.rate_missing ? '<span class="muted">*</span>' : ""}`;
+    const yieldCell = annual
+      ? `${fmtPct(annual, 2)}${marks}<div class="yield-days">${days} 天</div>`
+      : realized
+        ? `<span class="muted">—</span>${marks}`
+          + `<div class="yield-days">${days ? days + " 天，太短" : ""}</div>`
+        : `<span class="muted">—</span>`;
     const yieldTitle = (cp && dps)
       ? `每股股息 ${fmtMoney(dps, 4)} ÷ ${rebuilt ? "重建" : "平均"}成本 ${fmtMoney(cp, 2)}`
-        + (days ? ` · 本期投入 ${days} 天` : "")
-        + (annual ? ` · 年化约 ${fmtPct(annual, 2)}` : days ? " · 不足 30 天，年化无意义" : "")
+        + ` = 实收 ${fmtPct(realized, 2)}`
+        + (days ? `（${days} 天）` : "")
+        + (annual ? ` · 年化 ${fmtPct(annual, 2)}` : days ? " · 不足 30 天，不做年化" : "")
         + (h && h.pre_existing ? "（建仓早于报表期间，只算期内）" : "")
         + (rebuilt ? ` · 已清仓，成本由本期 ${fmtNum(h.bought_qty, 2)} 股买入记录重建` : "")
         + (s.rate_missing ? ` · ${s.rate_missing} 笔代付股息(PIL)不含每股报价，实际略高于此` : "")
