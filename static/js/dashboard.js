@@ -504,13 +504,21 @@ function computeMargin(data, priceBook) {
     b.premium += mv;
   }
 
+  // Excess liquidity the way IBKR actually computes it under Reg-T, not
+  // NAV − requirement. Two things NAV counts are not collateral: long US
+  // equity options have no loan value (a LEAP book cannot back new short
+  // puts), and long stock carries ~25% maintenance. NAV − requirement would
+  // overstate "can I sell another put" headroom by the whole LEAP sleeve
+  // plus a quarter of the stock — the dangerous direction for this panel.
+  //   excess ≈ (cash + stock) − (25% × stock + short-option requirement)
+  const stockValue = nav.stock || 0;
   return {
     requirement,
     notional,
     premium,
     totalNav,
     pctOfNav: totalNav > 0 ? requirement / totalNav : 0,
-    excess: totalNav - requirement,
+    excess: (nav.cash || 0) + stockValue * 0.75 - requirement,
     // Negative cash is a real margin loan — that part accrues interest, unlike
     // collateral tied up behind short options.
     borrowed: Math.max(0, -(nav.cash || 0)),
@@ -580,8 +588,13 @@ function renderMargin(data, accounts) {
   // room, past 60% a gap-down starts eating into excess liquidity fast.
   const tone = pct >= 60 ? "var(--red)" : pct >= 30 ? "var(--amber)" : "var(--green)";
   gauge.innerHTML = `<div class="margin-gauge-fill" style="width:${pct}%;background:${tone}"></div>`;
-  $("margin-gauge-note").textContent =
-    `账户总值 ${fmtMoney(m.totalNav)} · 估算剩余可用 ${fmtMoney(m.excess)}`;
+  const gaugeNote = $("margin-gauge-note");
+  gaugeNote.textContent =
+    `账户总值 ${fmtMoney(m.totalNav)} · 估算剩余流动性 ${fmtMoney(m.excess)}`
+    + `（现金 + 75% 正股 − 占用）`;
+  gaugeNote.title =
+    "近似 IBKR 的 Excess Liquidity：Reg-T 下长期权（含 LEAP）没有抵押价值、"
+    + "正股按 25% 维持保证金扣减，所以不是「净值 − 占用」。";
 
   const note = $("margin-note");
   note.textContent = m.assumedContracts > 0
