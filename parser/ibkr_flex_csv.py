@@ -102,6 +102,7 @@ def _empty_account() -> dict[str, Any]:
         "_div_cash": [],    # from Cash Transactions
         "_div_sof": [],     # from Statement of Funds
         "_div_ids": set(),
+        "_div_synth_seq": {},  # synth-key occurrence counter, like _cf_synth_seq
         "_nav_date": "",   # latest ReportDate seen in the NAV series; stripped
         "_starting_cash": 0.0,
         "_from_date": "",
@@ -410,14 +411,26 @@ def _skip_unattributed_tax(kind: str, sym: str) -> bool:
 
 def _dividend_id(account: dict[str, Any], prefix: str, d: date, sym: str,
                  kind: str, amount: float, row: dict[str, str]) -> str | None:
-    """Dedupe key for one payout row; None means "already seen, skip"."""
+    """Dedupe key for one payout row; None means "already seen, skip".
+
+    The synthetic fallback mirrors _cash_flow_id: the raw Type/ActivityCode
+    goes into the composite so a Dividend and a Payment-In-Lieu of the same
+    amount on the same day never collide, and an occurrence ordinal keeps two
+    genuinely identical rows apart — without it, a cancel + re-book at the
+    identical amount silently drops the re-booked payout and the symbol nets
+    to zero for the month.
+    """
     for col in _TXN_ID_COLUMNS:
         txn = (row.get(col) or "").strip()
         if txn:
             key = f"{prefix}:txn:{txn}"
             break
     else:
-        key = f"{prefix}:{d.isoformat()}|{sym}|{kind}|{amount:.4f}"
+        src = (row.get("Type") or row.get("ActivityCode") or "").strip().lower()
+        base = f"{prefix}:{d.isoformat()}|{sym}|{kind}|{src}|{amount:.4f}"
+        seq = account["_div_synth_seq"].get(base, 0) + 1
+        account["_div_synth_seq"][base] = seq
+        key = f"{base}|{seq}"
     if key in account["_div_ids"]:
         return None
     account["_div_ids"].add(key)
@@ -769,8 +782,8 @@ def parse_ibkr_flex_csv(content: str) -> dict[str, Any]:
         # Strip internal scratch state before serialising. _cf_ids is a set
         # and would blow up json.dump if it ever survived to the writer.
         for k in ("_cash_flows", "_cf_ids", "_cf_synth_seq",
-                  "_div_cash", "_div_sof", "_div_ids", "_nav_date",
-                  "_starting_cash", "_from_date", "_to_date"):
+                  "_div_cash", "_div_sof", "_div_ids", "_div_synth_seq",
+                  "_nav_date", "_starting_cash", "_from_date", "_to_date"):
             acct.pop(k, None)
 
     return {"accounts": dict(accounts)}
