@@ -113,15 +113,22 @@ function mergeAccounts(accounts) {
   }
 
   // Dividends — sum across accounts, keyed by symbol and by month.
-  const divSym = {}, divMonth = {};
-  let divGross = 0, divTax = 0, divNonDiv = 0, divSource = "";
+  const divSym = {}, divMonth = {}, divForeign = {};
+  let divGross = 0, divTax = 0, divNonDiv = 0, divSource = "", divBase = "";
   for (const a of list) {
     const d = a.dividends;
     if (!d || !d.by_symbol) continue;
     divSource = divSource || d.source;
+    divBase = divBase || d.base_currency || "";
     divGross += d.gross || 0;
     divTax += d.tax || 0;
     divNonDiv += d.non_dividend || 0;
+    // Foreign-currency payouts are excluded from every total, so summing the
+    // per-currency buckets across accounts is safe — they're plain cash.
+    for (const [c, f] of Object.entries(d.foreign || {})) {
+      const t = divForeign[c] || (divForeign[c] = { gross: 0, tax: 0, net: 0, count: 0 });
+      t.gross += f.gross; t.tax += f.tax; t.net += f.net; t.count += f.count || 0;
+    }
     for (const s of d.by_symbol) {
       const t = divSym[s.symbol] || (divSym[s.symbol] = {
         symbol: s.symbol, gross: 0, tax: 0, net: 0, count: 0,
@@ -152,6 +159,11 @@ function mergeAccounts(accounts) {
   for (const a of list) {
     for (const e of a.dividends?.events || []) {
       if (e.kind !== "gross" || !e.per_share) continue;
+      // Foreign-currency rates never joined the account's own by_symbol
+      // sums, so they must not join the union either — an AUD rate divided
+      // by a USD cost is not a yield.
+      const base = a.dividends.base_currency || "";
+      if (e.currency && base && e.currency !== base) continue;
       const t = divSym[e.symbol];
       if (!t) continue;
       const key = `${e.symbol}|${e.date}|${e.per_share}`;
@@ -168,6 +180,8 @@ function mergeAccounts(accounts) {
     tax: divTax,
     net: divGross + divTax,
     non_dividend: divNonDiv,
+    base_currency: divBase,
+    foreign: divForeign,
     by_symbol: Object.values(divSym).sort((a, b) => b.net - a.net),
     by_month: Object.values(divMonth).sort((a, b) => a.month.localeCompare(b.month)),
     events: list.flatMap(a => a.dividends?.events || [])
@@ -909,7 +923,12 @@ function renderDividends(data) {
   body.hidden = false;
 
   $("div-net").textContent = fmtMoney(div.net, 2);
-  $("div-gross").textContent = `税前 ${fmtMoney(div.gross, 2)} · 预扣税 ${fmtMoney(div.tax, 2)}`;
+  const foreignCcys = Object.keys(div.foreign || {});
+  $("div-gross").textContent = `税前 ${fmtMoney(div.gross, 2)} · 预扣税 ${fmtMoney(div.tax, 2)}`
+    + (foreignCcys.length
+      ? ` · 另有 ${foreignCcys.map(c => `${c} ${fmtNum(div.foreign[c].net, 2)}`).join(" / ")}`
+        + ` 未计入（多币种不换汇）`
+      : "");
 
   // Yield is against the stock sleeve, not total NAV: cash and short options
   // pay no dividends, so dividing by NAV would understate what the equity

@@ -111,15 +111,36 @@ def _parse_dividends(sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
                 # "(Ordinary Dividend)" / "(Short Term Capital Gain)" suffix.
                 "per_share": rate if amount >= 0 else -rate,
                 "income_class": _income_class_from_desc(desc) if kind == "gross" else "",
+                "currency": (r.get("Currency") or "").strip().upper(),
                 "description": desc,
             })
     if not rows:
         return {}
 
+    # Same no-FX segregation as the Flex path: rows outside the dominant
+    # currency are reported separately, never summed at 1:1 into the totals.
+    ccy_weight: dict[str, float] = {}
+    for r in rows:
+        if r["kind"] == "gross" and r.get("currency"):
+            ccy_weight[r["currency"]] = ccy_weight.get(r["currency"], 0.0) + abs(r["amount"])
+    base_ccy = max(ccy_weight, key=ccy_weight.get) if ccy_weight else ""
+    foreign: dict[str, dict[str, float]] = {}
+    main_rows: list[dict[str, Any]] = []
+    for r in rows:
+        c = r.get("currency", "")
+        if c and base_ccy and c != base_ccy:
+            f = foreign.setdefault(c, {"gross": 0.0, "tax": 0.0, "net": 0.0, "count": 0})
+            f[r["kind"]] += r["amount"]
+            f["net"] = f["gross"] + f["tax"]
+            if r["kind"] == "gross" and r["amount"] > 0:
+                f["count"] += 1
+        else:
+            main_rows.append(r)
+
     by_symbol: dict[str, dict[str, Any]] = {}
     by_month: dict[str, dict[str, Any]] = {}
     gross = tax = non_dividend_total = 0.0
-    for r in rows:
+    for r in main_rows:
         if r["kind"] == "gross":
             gross += r["amount"]
         else:
@@ -154,6 +175,8 @@ def _parse_dividends(sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
         "tax": tax,
         "net": gross + tax,
         "non_dividend": non_dividend_total,
+        "base_currency": base_ccy,
+        "foreign": foreign,
         "by_symbol": sorted(by_symbol.values(), key=lambda x: x["net"], reverse=True),
         "by_month": sorted(by_month.values(), key=lambda x: x["month"]),
         "events": sorted(rows, key=lambda r: (r["date"], r["symbol"]), reverse=True),

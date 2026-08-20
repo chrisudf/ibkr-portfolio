@@ -463,6 +463,7 @@ def _ingest_dividend_row(account: dict[str, Any], bucket: str, d: date, sym: str
         "amount": amount,
         "per_share": rate if amount >= 0 else -rate,
         "income_class": _income_class(row.get("DividendType") or desc) if kind == "gross" else "",
+        "currency": (row.get("CurrencyPrimary") or row.get("Currency") or "").strip().upper(),
         "description": desc,
     })
 
@@ -496,10 +497,33 @@ def _finalize_dividends(account: dict[str, Any]) -> None:
         account["dividends"] = {}
         return
 
+    # Payouts arrive in the payment currency and nothing here converts FX —
+    # a HKD 780 row summed into USD totals at 1:1 would inflate everything
+    # ~8x. Rows outside the dominant currency are reported separately rather
+    # than silently added; empty currency (query without the column) is
+    # treated as base so old exports keep behaving exactly as before.
+    ccy_weight: dict[str, float] = {}
+    for r in rows:
+        if r["kind"] == "gross" and r.get("currency"):
+            ccy_weight[r["currency"]] = ccy_weight.get(r["currency"], 0.0) + abs(r["amount"])
+    base_ccy = max(ccy_weight, key=ccy_weight.get) if ccy_weight else ""
+    foreign: dict[str, dict[str, float]] = {}
+    main_rows: list[dict[str, Any]] = []
+    for r in rows:
+        c = r.get("currency", "")
+        if c and base_ccy and c != base_ccy:
+            f = foreign.setdefault(c, {"gross": 0.0, "tax": 0.0, "net": 0.0, "count": 0})
+            f[r["kind"]] += r["amount"]
+            f["net"] = f["gross"] + f["tax"]
+            if r["kind"] == "gross" and r["amount"] > 0:
+                f["count"] += 1
+        else:
+            main_rows.append(r)
+
     by_symbol: dict[str, dict[str, Any]] = {}
     by_month: dict[str, dict[str, Any]] = {}
     gross = tax = non_dividend_total = 0.0
-    for r in rows:
+    for r in main_rows:
         # Withholding arrives as a negative amount; keep IBKR's sign so
         # gross + tax = net falls out without special-casing.
         if r["kind"] == "gross":
@@ -544,8 +568,12 @@ def _finalize_dividends(account: dict[str, Any]) -> None:
         # Portion of gross that is a capital-gain / return-of-capital payout
         # rather than dividend income.
         "non_dividend": non_dividend_total,
+        # Which currency the totals are in, and what was left out of them.
+        "base_currency": base_ccy,
+        "foreign": foreign,
         "by_symbol": sorted(by_symbol.values(), key=lambda x: x["net"], reverse=True),
         "by_month": sorted(by_month.values(), key=lambda x: x["month"]),
+        # All rows, foreign included — each carries its currency.
         "events": sorted(rows, key=lambda r: (r["date"], r["symbol"]), reverse=True),
     }
 
