@@ -142,22 +142,54 @@ function mergeAccounts(accounts) {
   }
 
   // Dividends — sum across accounts, keyed by symbol and by month.
+  //
+  // Accounts can disagree on base currency (each parser run elects its own
+  // dominant one). Adding a HKD-based account's totals into a USD-based
+  // account's at 1:1 would be the exact mixing the per-account segregation
+  // exists to prevent — so first elect a merged base (net payment count,
+  // gross breaks ties), then treat every other-base account the way one
+  // account treats its own foreign rows: totals into the foreign buckets,
+  // nothing into by_symbol / by_month / the per-share union.
+  const ccyVotes = {};
+  for (const a of list) {
+    const d = a.dividends;
+    if (!d || !d.by_symbol || !d.base_currency) continue;
+    const v = ccyVotes[d.base_currency] || (ccyVotes[d.base_currency] = [0, 0]);
+    for (const s of d.by_symbol) v[0] += s.count || 0;
+    v[1] += Math.abs(d.gross || 0);
+  }
+  const divBase = Object.keys(ccyVotes).reduce((best, c) => {
+    if (!best) return c;
+    const [a, b] = [ccyVotes[best], ccyVotes[c]];
+    return (b[0] > a[0] || (b[0] === a[0] && b[1] > a[1])) ? c : best;
+  }, "");
+  const otherBase = (d) =>
+    !!(d.base_currency && divBase && d.base_currency !== divBase);
+
   const divSym = {}, divMonth = {}, divForeign = {};
-  let divGross = 0, divTax = 0, divNonDiv = 0, divSource = "", divBase = "";
+  let divGross = 0, divTax = 0, divNonDiv = 0, divSource = "";
   for (const a of list) {
     const d = a.dividends;
     if (!d || !d.by_symbol) continue;
-    divSource = divSource || d.source;
-    divBase = divBase || d.base_currency || "";
-    divGross += d.gross || 0;
-    divTax += d.tax || 0;
-    divNonDiv += d.non_dividend || 0;
+    divSource = !divSource ? d.source
+      : (d.source && d.source !== divSource ? "mixed" : divSource);
     // Foreign-currency payouts are excluded from every total, so summing the
     // per-currency buckets across accounts is safe — they're plain cash.
     for (const [c, f] of Object.entries(d.foreign || {})) {
       const t = divForeign[c] || (divForeign[c] = { gross: 0, tax: 0, net: 0, count: 0 });
       t.gross += f.gross; t.tax += f.tax; t.net += f.net; t.count += f.count || 0;
     }
+    if (otherBase(d)) {
+      // Whole account denominated in another currency: report, don't add.
+      const t = divForeign[d.base_currency]
+        || (divForeign[d.base_currency] = { gross: 0, tax: 0, net: 0, count: 0 });
+      t.gross += d.gross || 0; t.tax += d.tax || 0; t.net += d.net || 0;
+      for (const s of d.by_symbol) t.count += s.count || 0;
+      continue;
+    }
+    divGross += d.gross || 0;
+    divTax += d.tax || 0;
+    divNonDiv += d.non_dividend || 0;
     for (const s of d.by_symbol) {
       const t = divSym[s.symbol] || (divSym[s.symbol] = {
         symbol: s.symbol, gross: 0, tax: 0, net: 0, count: 0,
@@ -189,16 +221,27 @@ function mergeAccounts(accounts) {
   // the other gets credit for every ex-date either of them was present for.
   const seenPay = {};
   for (const a of list) {
-    for (const e of a.dividends?.events || []) {
+    const d = a.dividends || {};
+    if (otherBase(d)) continue;  // whole account reported under foreign
+    // Occurrence ordinal per account: a cancel + re-book at the same
+    // date/rate is (+r, -r, +r) — without the ordinal the re-book collides
+    // with the original's key and the union nets to zero, re-dropping in
+    // the merged view the exact payout the parser's own seq keeps. Counting
+    // per account, then unioning on (payment, n), still collapses the same
+    // payment seen from two accounts while keeping within-account repeats.
+    const occ = {};
+    for (const e of d.events || []) {
       if (e.kind !== "gross" || !e.per_share) continue;
       // Foreign-currency rates never joined the account's own by_symbol
       // sums, so they must not join the union either — an AUD rate divided
       // by a USD cost is not a yield.
-      const base = a.dividends.base_currency || "";
+      const base = d.base_currency || "";
       if (e.currency && base && e.currency !== base) continue;
       const t = divSym[e.symbol];
       if (!t) continue;
-      const key = `${e.symbol}|${e.date}|${e.per_share}`;
+      const pay = `${e.symbol}|${e.date}|${e.per_share}`;
+      const n = (occ[pay] = (occ[pay] || 0) + 1);
+      const key = `${pay}|${n}`;
       if (seenPay[key]) continue;
       seenPay[key] = true;
       t.per_share += e.per_share;
@@ -225,8 +268,12 @@ function mergeAccounts(accounts) {
   const histAcc = {};
   for (const a of list) {
     // Each account's own per-share rates, for the ex-date benchmark below.
+    // Other-base accounts contribute nothing: their rates are denominated in
+    // a currency whose cash never enters the merged gross either.
     const rateBySym = {};
-    for (const s of a.dividends?.by_symbol || []) rateBySym[s.symbol] = s.per_share || 0;
+    if (!otherBase(a.dividends || {})) {
+      for (const s of a.dividends?.by_symbol || []) rateBySym[s.symbol] = s.per_share || 0;
+    }
     for (const [sym, h] of Object.entries(a.cost_history || {})) {
       const t = histAcc[sym] || (histAcc[sym] = {
         qty: 0, cost: 0, sold: 0, covered: true, start: "", end: "", shares: 0, pre: false,
