@@ -123,10 +123,14 @@ def _parse_dividends(sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
     # aren't comparable across currencies.
     ccy_weight: dict[str, list[float]] = {}
     for r in rows:
+        # NET payment count (reversal votes -1) — correction churn on one
+        # foreign payout must not out-vote the real base currency. Amount is
+        # a deterministic tie-break only.
         if r["kind"] == "gross" and r.get("currency"):
             w = ccy_weight.setdefault(r["currency"], [0.0, 0.0])
-            w[0] += 1
-            w[1] += abs(r["amount"])
+            w[0] += 1 if r["amount"] > 0 else -1
+            if r["amount"] > 0:
+                w[1] += r["amount"]
     base_ccy = max(ccy_weight, key=lambda c: tuple(ccy_weight[c])) if ccy_weight else ""
     foreign: dict[str, dict[str, float]] = {}
     main_rows: list[dict[str, Any]] = []

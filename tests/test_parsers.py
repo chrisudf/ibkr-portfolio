@@ -296,6 +296,28 @@ def test_foreign_currency_segregated():
     assert all(s["symbol"] != "0005" for s in d["by_symbol"])
 
 
+def test_reversal_churn_does_not_flip_base_currency():
+    hk = "0005(HK0005000000) Cash Dividend HKD 2.00 per Share (Ordinary Dividend)"
+    acct = parse([
+        _pnl(), _nav(),
+        (CASH_HDR, [
+            _cash_div(100.00, "MSFT(US5949181045) Cash Dividend USD 1.00 per"
+                      " Share (Ordinary Dividend)", sym="MSFT"),
+            _cash_div(50.00, "SGOV(US46436E7186) Cash Dividend USD 0.25 per"
+                      " Share (Ordinary Dividend)", sym="SGOV", date="20260501"),
+            # One HKD payout corrected in-period = 3 rows, but only 2 are
+            # payments — must not out-vote the 2 clean USD payments.
+            _cash_div(780.00, hk, sym="0005", ccy="HKD", date="20260401"),
+            _cash_div(-780.00, hk, sym="0005", ccy="HKD", date="20260402"),
+            _cash_div(780.00, hk, sym="0005", ccy="HKD", date="20260402"),
+        ]),
+    ])
+    d = acct["dividends"]
+    assert d["base_currency"] == "USD"
+    assert abs(d["gross"] - 150.00) < 1e-9
+    assert abs(d["foreign"]["HKD"]["gross"] - 780.00) < 1e-9
+
+
 # ---------------------------------------------------------------------------
 # Option positions carry their own multiplier.
 # ---------------------------------------------------------------------------
