@@ -157,12 +157,28 @@ def test_untraded_open_position_gets_seeded():
         (POS_HDR, [_stock_pos("MSFT", 100, 30000)]),
         (CASH_HDR, [_cash_div(83.00, "MSFT(US5949181045) Cash Dividend USD 0.83"
                               " per Share (Ordinary Dividend)", sym="MSFT")]),
+        # SoF present (an unrelated trade) — "MSFT has no trade rows" is only
+        # meaningful evidence of buy-and-hold when trade rows were collected.
+        (SOF_HDR, [_sof_trade("NVDA", 1, 100.0, -1.0, "20260301")]),
     ])
     h = acct["cost_history"]["MSFT"]
     assert h["days"] == 364
     assert abs(h["avg_shares"] - 100) < 1e-9
     assert h["covered"] is False        # avg_price 0 must never be used as cost
     assert h["pre_existing"] is True
+
+
+def test_no_sof_section_means_no_seeding():
+    # Without Statement of Funds the parser can't tell buy-and-hold from a
+    # mid-window purchase — seeding would stamp the latter as deployed all
+    # year and understate its annualized yield ~6x.
+    acct = parse([
+        _pnl(), _nav(),
+        (POS_HDR, [_stock_pos("MSFT", 100, 30000)]),
+        (CASH_HDR, [_cash_div(83.00, "MSFT(US5949181045) Cash Dividend USD 0.83"
+                              " per Share (Ordinary Dividend)", sym="MSFT")]),
+    ])
+    assert acct["cost_history"] == {}
 
 
 # ---------------------------------------------------------------------------

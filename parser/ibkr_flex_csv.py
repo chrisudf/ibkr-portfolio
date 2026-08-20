@@ -103,6 +103,7 @@ def _empty_account() -> dict[str, Any]:
         "_div_sof": [],     # from Statement of Funds
         "_div_ids": set(),
         "_div_synth_seq": {},  # synth-key occurrence counter, like _cf_synth_seq
+        "_sof_seen": False,  # any Statement of Funds row ingested; stripped
         "_nav_date": "",   # latest ReportDate seen in the NAV series; stripped
         "_starting_cash": 0.0,
         "_from_date": "",
@@ -718,7 +719,12 @@ def _finalize_cost_history(account: dict[str, Any]) -> None:
     # avg_price stays 0 — the dashboard prefers IBKR's own CostBasisPrice for
     # anything still open, and the covered=False guard keeps the zero from
     # ever being used as a rebuilt cost.
-    if from_d and to_d and to_d > from_d:
+    #
+    # Only when Statement of Funds was actually ingested: "no trade rows for
+    # this symbol" is evidence of buy-and-hold only if trade rows were being
+    # collected at all. On a query without SoF every symbol has no rows, and
+    # seeding would stamp a mid-window purchase as deployed the whole year.
+    if from_d and to_d and to_d > from_d and account.get("_sof_seen"):
         window_days = (to_d - from_d).days
         for sym, qty in open_qty.items():
             if qty <= 1e-9 or sym in account["cost_history"]:
@@ -738,6 +744,7 @@ def _finalize_cost_history(account: dict[str, Any]) -> None:
 
 
 def _ingest_statement_of_funds(account: dict[str, Any], row: dict[str, str]) -> None:
+    account["_sof_seen"] = True
     _ingest_trade_cost(account, row)
     code = row.get("ActivityCode", "")
     if code in _DIV_GROSS_CODES or code in _DIV_TAX_CODES:
@@ -872,7 +879,8 @@ def parse_ibkr_flex_csv(content: str) -> dict[str, Any]:
         # and would blow up json.dump if it ever survived to the writer.
         for k in ("_cash_flows", "_cf_ids", "_cf_synth_seq",
                   "_div_cash", "_div_sof", "_div_ids", "_div_synth_seq",
-                  "_nav_date", "_starting_cash", "_from_date", "_to_date"):
+                  "_sof_seen", "_nav_date", "_starting_cash",
+                  "_from_date", "_to_date"):
             acct.pop(k, None)
 
     return {"accounts": dict(accounts)}
