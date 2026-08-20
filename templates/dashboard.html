@@ -149,6 +149,28 @@
         </div>
       </section>
 
+      <!-- Expiry calendar -->
+      <section class="panel" id="expiry-panel" hidden>
+        <div class="panel-head">
+          <h2>卖方到期日历</h2>
+          <span class="panel-note" id="expiry-note"></span>
+        </div>
+        <div class="table-wrap">
+          <table class="holdings">
+            <thead>
+              <tr>
+                <th>到期周</th><th class="num">DTE</th><th>卖出合约</th>
+                <th class="num">张数</th><th class="num">权利金负债</th>
+                <th class="num">卖put名义</th><th class="num">ITM</th>
+              </tr>
+            </thead>
+            <tbody id="expiry-body"></tbody>
+          </table>
+        </div>
+        <div class="margin-foot">只列卖出（空头）合约，按到期所在周分组。ITM 按当前正股价判定，
+          无报价的合约计入「价?」。权利金负债 = 平仓需付的当前市值；卖put名义 = 全部被行权需接货的资金。</div>
+      </section>
+
       <!-- Margin usage -->
       <section class="panel" id="margin-panel" hidden>
         <div class="panel-head">

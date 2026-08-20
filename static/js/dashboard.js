@@ -604,6 +604,9 @@ function render(data) {
   // Options
   renderOptions(options);
 
+  // Expiry calendar (short options by expiry week)
+  renderExpiries(data, currentDataRef.allAccounts);
+
   // Dividends
   renderDividends(data);
 
@@ -944,6 +947,104 @@ function renderMargin(data, accounts) {
   $("margin-foot").textContent =
     `卖出看跌名义抵押合计 ${fmtMoney(m.notional)}（若全部现金担保需要的资金）· `
     + `当前卖方权利金负债 ${fmtMoney(m.premium)}`;
+}
+
+/* ---------------------------------------------------------------------------
+ * Expiry calendar — short options grouped by the week they expire.
+ * ------------------------------------------------------------------------- */
+
+const _EXPIRY_MON = { JAN: 1, FEB: 2, MAR: 3, APR: 4, MAY: 5, JUN: 6,
+                      JUL: 7, AUG: 8, SEP: 9, OCT: 10, NOV: 11, DEC: 12 };
+
+// "15JAN27" → UTC ms; null on anything unparseable. Both ingestion paths
+// emit this spelling (Flex via _fmt_expiry, Activity Statements natively).
+function parseExpiryTs(s) {
+  const m = (s || "").trim().match(/^(\d{1,2})([A-Z]{3})(\d{2})$/);
+  if (!m) return null;
+  const mon = _EXPIRY_MON[m[2]];
+  if (!mon) return null;
+  return Date.UTC(2000 + Number(m[3]), mon - 1, Number(m[1]));
+}
+
+const DAY_MS = 86400000;
+
+function groupExpiries(options, priceBook, todayTs) {
+  const buckets = {};
+  for (const o of options || []) {
+    if (!(o.quantity < 0)) continue;
+    const ts = parseExpiryTs(o.expiry);
+    const qty = Math.abs(o.quantity);
+    const mult = o.multiplier || CONTRACT_MULTIPLIER;
+    // Monday of the expiry's week keys the bucket; unparseable expiries get
+    // their own row instead of silently vanishing from a risk view.
+    const key = ts != null
+      ? ts - (((new Date(ts)).getUTCDay() + 6) % 7) * DAY_MS
+      : Infinity;
+    const b = buckets[key] || (buckets[key] = {
+      weekStart: key, firstExpiry: Infinity, contracts: 0,
+      premium: 0, putNotional: 0, itm: 0, unpriced: 0, items: [],
+    });
+    if (ts != null) b.firstExpiry = Math.min(b.firstExpiry, ts);
+    b.contracts += qty;
+    b.premium += Math.abs(o.value || 0);
+    if (o.right === "P" && o.strike > 0) b.putNotional += o.strike * qty * mult;
+    const spot = priceBook[o.underlying];
+    if (spot > 0 && o.strike > 0 && (o.right === "P" || o.right === "C")) {
+      const itm = o.right === "P" ? spot < o.strike : spot > o.strike;
+      if (itm) b.itm += qty;
+    } else {
+      b.unpriced += qty;
+    }
+    b.items.push(`${o.underlying} ${o.strike || "?"}${o.right || "?"} ×${qty}`);
+  }
+  return Object.values(buckets)
+    .map(b => ({
+      ...b,
+      dte: b.firstExpiry === Infinity ? null
+        : Math.max(0, Math.round((b.firstExpiry - todayTs) / DAY_MS)),
+    }))
+    .sort((a, b) => a.weekStart - b.weekStart);
+}
+
+function renderExpiries(data, accounts) {
+  const panel = $("expiry-panel");
+  const book = buildPriceBook(accounts);
+  const weeks = groupExpiries(data.options || [], book, Date.now());
+  if (!weeks.length) { panel.hidden = true; return; }
+  panel.hidden = false;
+
+  const totPrem = weeks.reduce((s, w) => s + w.premium, 0);
+  const totNotional = weeks.reduce((s, w) => s + w.putNotional, 0);
+  $("expiry-note").textContent =
+    `${weeks.reduce((s, w) => s + w.contracts, 0)} 张卖方合约 · `
+    + `权利金负债合计 ${fmtMoney(totPrem)} · 卖put名义合计 ${fmtMoney(totNotional)}`;
+
+  const weekLabel = (w) => {
+    if (w.weekStart === Infinity) return "到期日未识别";
+    const mon = new Date(w.weekStart);
+    const fri = new Date(w.weekStart + 4 * DAY_MS);
+    const f = (d) => `${d.getUTCMonth() + 1}/${d.getUTCDate()}`;
+    return `${f(mon)}–${f(fri)}`;
+  };
+  const tbody = $("expiry-body");
+  tbody.innerHTML = "";
+  for (const w of weeks) {
+    const itmCell = [
+      w.itm ? `<span class="down"><b>${w.itm}</b></span>` : "0",
+      w.unpriced ? `<span class="muted">价? ${w.unpriced}</span>` : "",
+    ].filter(Boolean).join(" · ");
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td><b>${weekLabel(w)}</b></td>
+      <td class="num">${w.dte == null ? "—" : w.dte}</td>
+      <td class="muted">${w.items.join(" · ")}</td>
+      <td class="num">${w.contracts}</td>
+      <td class="num">${fmtMoney(w.premium, 0)}</td>
+      <td class="num">${w.putNotional ? fmtMoney(w.putNotional, 0) : "—"}</td>
+      <td class="num">${itmCell}</td>
+    `;
+    tbody.appendChild(tr);
+  }
 }
 
 /* ---------------------------------------------------------------------------
