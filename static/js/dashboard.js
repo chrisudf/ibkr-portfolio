@@ -141,7 +141,10 @@ function mergeAccounts(accounts) {
       // double it. Take the widest coverage instead: the account that held
       // through the most ex-dates saw the most of the year's rate.
       t.non_dividend += s.non_dividend || 0;   // cash, so this one does add
-      t.rate_missing = Math.max(t.rate_missing, s.rate_missing || 0);
+      // A count of rate-less PIL cash events; events in different accounts
+      // are distinct payments, so counts add (same as `count` above) — max
+      // undercounts whenever both accounts had them.
+      t.rate_missing += s.rate_missing || 0;
       t.last_date = t.last_date > s.last_date ? t.last_date : s.last_date;
     }
     for (const m of d.by_month || []) {
