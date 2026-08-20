@@ -468,7 +468,14 @@ function computeMargin(data, priceBook) {
 
     let covered = 0;
     if (o.right === "C") {
-      covered = Math.min(shares, Math.max(sharesLeft[o.underlying] || 0, 0));
+      // Reg-T covers by whole 100-share lots: a call is either backed by its
+      // full deliverable or it is naked. 80 shares against one short call earn
+      // no per-share credit — IBKR charges the full uncovered requirement.
+      // Prorating per share would understate exactly the odd-lot cases
+      // (fractional ETF positions) where the panel matters most.
+      const lots = Math.floor(Math.max(sharesLeft[o.underlying] || 0, 0) / CONTRACT_MULTIPLIER);
+      const coveredContracts = Math.min(qty, lots);
+      covered = coveredContracts * CONTRACT_MULTIPLIER;
       sharesLeft[o.underlying] = (sharesLeft[o.underlying] || 0) - covered;
     }
     const nakedShares = shares - covered;
