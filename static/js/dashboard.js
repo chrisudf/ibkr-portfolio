@@ -1010,9 +1010,15 @@ function renderMargin(data, accounts) {
 
 function computeClusters(data, map) {
   if (!map || !Object.keys(map).length) return null;
-  const symToCluster = {};
+  // A symbol may legitimately belong to several clusters ("MU" in both
+  // AI-infra and Memory): correlated exposure counts in EVERY cluster that
+  // claims it — a symbol→single-cluster map would silently drop it from
+  // all but the last, shrinking exactly the concentration number this
+  // panel exists to surface. (其他 only catches symbols claimed by none;
+  // per-cluster totals may overlap by design and must not be summed.)
+  const symClusters = {};
   for (const [name, syms] of Object.entries(map)) {
-    for (const s of syms || []) symToCluster[s] = name;
+    for (const s of syms || []) (symClusters[s] || (symClusters[s] = [])).push(name);
   }
   const rows = {};
   const bucket = (name) => rows[name]
@@ -1021,16 +1027,20 @@ function computeClusters(data, map) {
     || (b.members[sym] = { mv: 0, notional: 0 });
   for (const s of data.stocks || []) {
     if (CASH_EQUIVALENTS.has(s.symbol)) continue;
-    const b = bucket(symToCluster[s.symbol] || "其他");
-    b.stockMV += s.value || 0;
-    member(b, s.symbol).mv += s.value || 0;
+    for (const name of symClusters[s.symbol] || ["其他"]) {
+      const b = bucket(name);
+      b.stockMV += s.value || 0;
+      member(b, s.symbol).mv += s.value || 0;
+    }
   }
   for (const o of data.options || []) {
     if (!(o.quantity < 0) || o.right !== "P" || !(o.strike > 0)) continue;
     const notional = o.strike * Math.abs(o.quantity) * (o.multiplier || CONTRACT_MULTIPLIER);
-    const b = bucket(symToCluster[o.underlying] || "其他");
-    b.putNotional += notional;
-    member(b, o.underlying).notional += notional;
+    for (const name of symClusters[o.underlying] || ["其他"]) {
+      const b = bucket(name);
+      b.putNotional += notional;
+      member(b, o.underlying).notional += notional;
+    }
   }
   const nav = data.nav || {};
   const totalNav = nav.total || (nav.cash + nav.stock + nav.options) || 0;
@@ -1127,11 +1137,18 @@ function groupExpiries(options, priceBook, todayTs) {
     }
     b.items.push(`${o.underlying} ${o.strike || "?"}${o.right || "?"} ×${qty}`);
   }
+  // DTE counts calendar days, so compare dates, not instants: expiries sit
+  // at UTC midnight while todayTs is a local "now" — in UTC+ timezones
+  // (Brisbane +10) the raw difference rounds a Friday expiry to 0 while it
+  // is still Thursday evening local. Map the local calendar date to UTC
+  // midnight first and the difference is an exact whole number of days.
+  const now = new Date(todayTs);
+  const today0 = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate());
   return Object.values(buckets)
     .map(b => ({
       ...b,
       dte: b.firstExpiry === Infinity ? null
-        : Math.max(0, Math.round((b.firstExpiry - todayTs) / DAY_MS)),
+        : Math.max(0, Math.round((b.firstExpiry - today0) / DAY_MS)),
     }))
     .sort((a, b) => a.weekStart - b.weekStart);
 }
