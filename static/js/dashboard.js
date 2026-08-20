@@ -12,6 +12,34 @@ const fmtMoney = (v, digits = 0) => {
 const fmtPct = (v, digits = 1) => (v * 100).toFixed(digits) + "%";
 const fmtNum = (v, digits = 2) => Number(v).toLocaleString("en-US", { maximumFractionDigits: digits, minimumFractionDigits: digits });
 
+// Statement periods come in two spellings and both must parse: the Flex path
+// synthesizes "2025-08-20 → 2026-08-19", while the Activity Statement path
+// passes IBKR's own wording through verbatim — "January 1, 2026 - June 30,
+// 2026". Matching only the ISO form silently disabled every window-derived
+// number (period days, chart bounds, 月均) on Activity uploads.
+// Kept as plain {y,m,d} — no Date round-trips, so no UTC/local off-by-one.
+const MONTH_NUM = {
+  january: 1, february: 2, march: 3, april: 4, may: 5, june: 6,
+  july: 7, august: 8, september: 9, october: 10, november: 11, december: 12,
+};
+const parsePeriodBounds = (period) => {
+  const p = period || "";
+  const iso = p.match(/(\d{4})-(\d{2})-(\d{2})\D+(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) {
+    return [{ y: +iso[1], m: +iso[2], d: +iso[3] },
+            { y: +iso[4], m: +iso[5], d: +iso[6] }];
+  }
+  const named = p.match(/([A-Za-z]+) (\d{1,2}), (\d{4})\s*[-–—]\s*([A-Za-z]+) (\d{1,2}), (\d{4})/);
+  if (named) {
+    const m1 = MONTH_NUM[named[1].toLowerCase()], m2 = MONTH_NUM[named[4].toLowerCase()];
+    if (m1 && m2) {
+      return [{ y: +named[3], m: m1, d: +named[2] },
+              { y: +named[6], m: m2, d: +named[5] }];
+    }
+  }
+  return null;
+};
+
 // The return KPI is computed over the Flex query's period, NOT since account
 // inception — a "Last 365 Calendar Days" query on an account opened earlier
 // simply can't see the first months. Label the window explicitly so the
@@ -19,9 +47,10 @@ const fmtNum = (v, digits = 2) => Number(v).toLocaleString("en-US", { maximumFra
 // "2025-07-10 → 2026-07-09" → 364. Returns 0 for the "截至 YYYY-MM-DD"
 // fallback period and anything else we can't read two dates out of.
 const periodDays = (period) => {
-  const m = (period || "").match(/(\d{4}-\d{2}-\d{2})\D+(\d{4}-\d{2}-\d{2})/);
-  if (!m) return 0;
-  const days = Math.round((Date.parse(m[2]) - Date.parse(m[1])) / 86400000);
+  const b = parsePeriodBounds(period);
+  if (!b) return 0;
+  const days = Math.round((Date.UTC(b[1].y, b[1].m - 1, b[1].d)
+    - Date.UTC(b[0].y, b[0].m - 1, b[0].d)) / 86400000);
   return days > 0 ? days : 0;
 };
 
@@ -904,12 +933,14 @@ function monthRange(months, period) {
   // quarterly payer inside a 12-month window otherwise renders ~10 bars and
   // the monthly average divides by the wrong number of months — and the empty
   // months at the edges are exactly where a missed ex-date would show.
-  const bounds = (period || "").match(/(\d{4}-\d{2})-\d{2}\D+(\d{4}-\d{2})-\d{2}/);
+  const bounds = parsePeriodBounds(period);
   let cur = months[0].month;
   let last = months[months.length - 1].month;
   if (bounds) {
-    if (bounds[1] < cur) cur = bounds[1];
-    if (bounds[2] > last) last = bounds[2];
+    const ym = (b) => `${b.y}-${String(b.m).padStart(2, "0")}`;
+    const b1 = ym(bounds[0]), b2 = ym(bounds[1]);
+    if (b1 < cur) cur = b1;
+    if (b2 > last) last = b2;
   }
   const out = [];
   for (let i = 0; i < 240 && cur <= last; i++) {
