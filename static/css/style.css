@@ -347,3 +347,12 @@ ul.rank .sym { font-weight: 600; }
 .nav-stat b { color: var(--text); font-weight: 600; margin-left: 4px; }
 .nav-stat b.up { color: var(--green); }
 .nav-stat b.down { color: var(--red); }
+
+/* Margin gap-stress table */
+.margin-stress { margin-top: 14px; }
+.stress-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.stress-table th, .stress-table td { padding: 7px 10px; text-align: left; }
+.stress-table th { color: var(--text-faint); font-weight: 600; font-size: 12px; border-bottom: 1px solid var(--border); }
+.stress-table td { border-bottom: 1px solid rgba(35,42,66,0.5); }
+.stress-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+.stress-table tr.stress-bust td { color: var(--red); font-weight: 600; }

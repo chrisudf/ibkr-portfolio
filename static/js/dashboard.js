@@ -672,11 +672,17 @@ function regTPerShare(right, strike, underlying) {
   return Math.max(0.20 * underlying - otm, floorPct, MARGIN_FLOOR_PER_SHARE);
 }
 
-function computeMargin(data, priceBook) {
+// shock: uniform gap applied to every underlying spot AND the stock sleeve
+// (e.g. -0.2 = everything opens 20% down). Option premiums are NOT repriced —
+// in a real gap the short-put mark explodes, so the stressed requirement here
+// is a floor, not a forecast. shock=0 is the live estimate.
+function computeMargin(data, priceBook, shock = 0) {
   const stocks = data.stocks || [];
   const options = data.options || [];
   const nav = data.nav || {};
-  const totalNav = nav.total || (nav.cash + nav.stock + nav.options);
+  // Stressed NAV moves by the stock sleeve only (options unrepriced, cash fixed).
+  const totalNav = (nav.total || (nav.cash + nav.stock + nav.options))
+    + (nav.stock || 0) * shock;
 
   // Shares available to cover short calls, spent longest-dated first.
   const sharesLeft = {};
@@ -715,7 +721,8 @@ function computeMargin(data, priceBook) {
     // No price anywhere in the portfolio → assume the contract sits at the
     // money. That lands the estimate on 20% of strike, the middle of the
     // Reg-T range, and every such contract is counted so the UI can say so.
-    const spot = known || o.strike;
+    // The gap shock hits the assumed spot the same as a real one.
+    const spot = (known || o.strike) * (1 + shock);
     if (!known) assumedContracts += qty;
 
     let covered = 0;
@@ -768,7 +775,7 @@ function computeMargin(data, priceBook) {
   // into a single 75% haircut would turn the maintenance into a credit.
   // Unparsed short options also come off: their Reg-T leg is unknown (see
   // above) but their market value is a known lower bound on the liability.
-  const stockValue = nav.stock || 0;
+  const stockValue = (nav.stock || 0) * (1 + shock);
   const longStock = Math.max(stockValue, 0);
   const shortStock = Math.min(stockValue, 0);
   return {
@@ -887,6 +894,34 @@ function renderMargin(data, accounts) {
     ? "平值假设对价外的卖put偏保守 —— 实际保证金通常低于此。"
       + "买入这些标的的正股后，价格会自动接入，数字随之收紧。"
     : "";
+
+  // Gap stress: same estimator, spot and stock sleeve shocked together.
+  // Premiums are not repriced, so every stressed number is a FLOOR — the
+  // honest headline is "at least this bad", which is the side a crisis
+  // dashboard should err on.
+  const stressFor = (shock) => merged
+    ? mergeMargin(Object.values(accounts || {}).map(a => computeMargin(a, book, shock)))
+    : computeMargin(data, book, shock);
+  const scenarios = [0, -0.10, -0.20, -0.30];
+  const stressRows = scenarios.map(s => ({ s, m: s === 0 ? m : stressFor(s) }));
+  $("margin-stress").innerHTML = `
+    <table class="stress-table">
+      <thead><tr>
+        <th>跳空情景</th><th class="num">保证金占用</th>
+        <th class="num">剩余流动性</th><th class="num">占用/净值</th>
+      </tr></thead>
+      <tbody>${stressRows.map(({ s, m: sm }) => {
+        const busted = sm.excess < 0;
+        return `<tr class="${busted ? "stress-bust" : ""}">
+          <td>${s === 0 ? "现价" : `全线 ${fmtPct(s, 0)}`}</td>
+          <td class="num">${fmtMoney(sm.requirement)}</td>
+          <td class="num ${busted ? "down" : ""}">${fmtMoney(sm.excess)}${busted ? " ⚠" : ""}</td>
+          <td class="num">${sm.totalNav > 0 ? fmtPct(sm.requirement / sm.totalNav, 1) : "—"}</td>
+        </tr>`;
+      }).join("")}</tbody>
+    </table>
+    <div class="margin-foot">正股与期权标的同步跳空；权利金负债按现价不重估（真实跳空中会更贵），
+      所以每一行都是下界。剩余流动性转负 ⚠ ≈ 追保/强平区。</div>`;
 
   const tbody = $("margin-body");
   tbody.innerHTML = "";
