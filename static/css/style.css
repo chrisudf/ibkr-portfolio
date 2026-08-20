@@ -356,3 +356,6 @@ ul.rank .sym { font-weight: 600; }
 .stress-table td { border-bottom: 1px solid rgba(35,42,66,0.5); }
 .stress-table .num { text-align: right; font-variant-numeric: tabular-nums; }
 .stress-table tr.stress-bust td { color: var(--red); font-weight: 600; }
+
+/* Cluster exposure */
+.holdings td.amber, .holdings td.amber b { color: var(--amber); }

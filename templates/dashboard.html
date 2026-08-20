@@ -102,6 +102,31 @@
         <div id="alloc-legend" class="alloc-legend"></div>
       </section>
 
+      <!-- Cluster exposure -->
+      <section class="panel" id="cluster-panel" hidden>
+        <div class="panel-head">
+          <h2>标的簇敞口</h2>
+          <span class="panel-note" id="cluster-note"></span>
+        </div>
+        <div class="table-wrap">
+          <table class="holdings">
+            <thead>
+              <tr>
+                <th>簇</th><th>成员</th>
+                <th class="num">正股市值</th>
+                <th class="num">卖put被行权名义</th>
+                <th class="num">合计敞口</th>
+                <th class="num">占净值</th>
+              </tr>
+            </thead>
+            <tbody id="cluster-body"></tbody>
+          </table>
+        </div>
+        <div class="margin-foot">敞口口径 = 正股市值 + 该簇卖出 put 全部被行权需接货的名义（同涨同跌的簇要按
+          一个仓管）。分组在 <b>static/clusters.json</b> 手工维护（簇名 → 标的数组），改完刷新页面；
+          未分组的标的归入「其他」，现金等价物（SGOV/BOXX）不计。占净值 ≥50% 黄 / ≥100% 红。</div>
+      </section>
+
       <!-- Holdings table -->
       <section class="panel">
         <div class="panel-head">

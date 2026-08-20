@@ -594,6 +594,10 @@ function render(data) {
   const shortOptMV = options.filter(o => o.value < 0).reduce((s, o) => s + Math.abs(o.value), 0);
   renderAllocation({ cash: adjCash, stock: adjStock, longOptions: longOptMV, shortOptionsNote: shortOptMV }, totalNav);
 
+  // Cluster exposure (mapping loads async from static/clusters.json; the
+  // panel re-renders once it arrives)
+  renderClusters(data, currentDataRef.clusters);
+
   // Margin — prices are pooled across every loaded account, so pass the whole
   // set rather than just the account being viewed.
   renderMargin(data, currentDataRef.allAccounts);
@@ -947,6 +951,87 @@ function renderMargin(data, accounts) {
   $("margin-foot").textContent =
     `卖出看跌名义抵押合计 ${fmtMoney(m.notional)}（若全部现金担保需要的资金）· `
     + `当前卖方权利金负债 ${fmtMoney(m.premium)}`;
+}
+
+/* ---------------------------------------------------------------------------
+ * Cluster exposure — names that move together managed as one position.
+ *
+ * The mapping lives in static/clusters.json ({"AI-infra": ["RKLB", ...]}),
+ * hand-maintained. Exposure = stock market value + assigned-if notional of
+ * every short put on the cluster's members: correlated names gap together,
+ * so the question is "if this whole cluster gets put to me, how much of NAV
+ * is it" — not each ticker on its own.
+ * ------------------------------------------------------------------------- */
+
+function computeClusters(data, map) {
+  if (!map || !Object.keys(map).length) return null;
+  const symToCluster = {};
+  for (const [name, syms] of Object.entries(map)) {
+    for (const s of syms || []) symToCluster[s] = name;
+  }
+  const rows = {};
+  const bucket = (name) => rows[name]
+    || (rows[name] = { name, stockMV: 0, putNotional: 0, members: {} });
+  const member = (b, sym) => b.members[sym]
+    || (b.members[sym] = { mv: 0, notional: 0 });
+  for (const s of data.stocks || []) {
+    if (CASH_EQUIVALENTS.has(s.symbol)) continue;
+    const b = bucket(symToCluster[s.symbol] || "其他");
+    b.stockMV += s.value || 0;
+    member(b, s.symbol).mv += s.value || 0;
+  }
+  for (const o of data.options || []) {
+    if (!(o.quantity < 0) || o.right !== "P" || !(o.strike > 0)) continue;
+    const notional = o.strike * Math.abs(o.quantity) * (o.multiplier || CONTRACT_MULTIPLIER);
+    const b = bucket(symToCluster[o.underlying] || "其他");
+    b.putNotional += notional;
+    member(b, o.underlying).notional += notional;
+  }
+  const nav = data.nav || {};
+  const totalNav = nav.total || (nav.cash + nav.stock + nav.options) || 0;
+  const list = Object.values(rows).map(r => ({
+    ...r,
+    total: r.stockMV + r.putNotional,
+    pct: totalNav > 0 ? (r.stockMV + r.putNotional) / totalNav : 0,
+  }));
+  // Defined clusters by size, the catch-all 其他 bucket last.
+  list.sort((a, b) =>
+    (a.name === "其他") - (b.name === "其他") || b.total - a.total);
+  return { totalNav, rows: list };
+}
+
+function renderClusters(data, map) {
+  const panel = $("cluster-panel");
+  const c = computeClusters(data, map);
+  if (!c || !c.rows.length) { panel.hidden = true; return; }
+  panel.hidden = false;
+
+  const defined = c.rows.filter(r => r.name !== "其他");
+  $("cluster-note").textContent = defined.length
+    ? `${defined.length} 个簇 · 最大簇敞口占净值 ${fmtPct(Math.max(...defined.map(r => r.pct), 0), 1)}`
+    : "clusters.json 里还没有分组，全部标的在「其他」";
+
+  const tbody = $("cluster-body");
+  tbody.innerHTML = "";
+  for (const r of c.rows) {
+    const tone = r.pct >= 1 ? "down" : r.pct >= 0.5 ? "amber" : "";
+    const members = Object.entries(r.members).map(([sym, m]) => {
+      const bits = [];
+      if (m.mv) bits.push(fmtMoney(m.mv, 0));
+      if (m.notional) bits.push(`put ${fmtMoney(m.notional, 0)}`);
+      return `${sym} ${bits.join("+")}`;
+    }).join(" · ");
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td><b>${r.name}</b></td>
+      <td class="muted">${members}</td>
+      <td class="num">${r.stockMV ? fmtMoney(r.stockMV, 0) : "—"}</td>
+      <td class="num">${r.putNotional ? fmtMoney(r.putNotional, 0) : "—"}</td>
+      <td class="num"><b>${fmtMoney(r.total, 0)}</b></td>
+      <td class="num ${tone}"><b>${fmtPct(r.pct, 1)}</b></td>
+    `;
+    tbody.appendChild(tr);
+  }
 }
 
 /* ---------------------------------------------------------------------------
@@ -1718,6 +1803,16 @@ async function refreshFromIBKR() {
 
 document.addEventListener("DOMContentLoaded", () => {
   $("refresh-btn").addEventListener("click", refreshFromIBKR);
+
+  // Cluster mapping — a static file the user edits by hand. 404/parse
+  // failure just leaves the panel hidden; nothing else depends on it.
+  fetch("/static/clusters.json")
+    .then(r => (r.ok ? r.json() : null))
+    .catch(() => null)
+    .then(map => {
+      currentDataRef.clusters = map;
+      if (currentDataRef.data) renderClusters(currentDataRef.data, map);
+    });
 
   $("file").addEventListener("change", async (e) => {
     const f = e.target.files[0];
