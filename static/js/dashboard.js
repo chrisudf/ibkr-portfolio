@@ -723,7 +723,6 @@ function computeMargin(data, priceBook, shock = 0) {
     const qty = Math.abs(o.quantity);
     const mult = o.multiplier || CONTRACT_MULTIPLIER;
     const shares = qty * mult;
-    const mv = Math.abs(o.value);
     const known = priceBook[o.underlying];
     // No price anywhere in the portfolio → assume the contract sits at the
     // money. That lands the estimate on 20% of strike, the middle of the
@@ -731,6 +730,15 @@ function computeMargin(data, priceBook, shock = 0) {
     // The gap shock hits the assumed spot the same as a real one.
     const spot = (known || o.strike) * (1 + shock);
     if (!known) assumedContracts += qty;
+    // Premium leg: the mark, floored at intrinsic value — an option is never
+    // worth less than intrinsic, so after a gap the unrepriced mark would
+    // otherwise make the requirement SHRINK as the 20%-of-spot leg deflates
+    // while a deep-ITM put's real liability explodes. The floor keeps every
+    // stressed number an honest lower bound that moves the right way.
+    const intrinsicPS = o.right === "P"
+      ? Math.max(0, o.strike - spot)
+      : Math.max(0, spot - o.strike);
+    const mv = Math.max(Math.abs(o.value), intrinsicPS * shares);
 
     let covered = 0;
     if (o.right === "C") {
@@ -927,8 +935,8 @@ function renderMargin(data, accounts) {
         </tr>`;
       }).join("")}</tbody>
     </table>
-    <div class="margin-foot">正股与期权标的同步跳空；权利金负债按现价不重估（真实跳空中会更贵），
-      所以每一行都是下界。剩余流动性转负 ⚠ ≈ 追保/强平区。</div>`;
+    <div class="margin-foot">正股与期权标的同步跳空；权利金负债取 max(现价, 跳空后内在价值) ——
+      不含时间价值与 IV 爆炸，所以每一行仍是下界（实际会更糟）。剩余流动性转负 ⚠ ≈ 追保/强平区。</div>`;
 
   const tbody = $("margin-body");
   tbody.innerHTML = "";
