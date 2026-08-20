@@ -409,6 +409,8 @@ const CAPTURE_FLAG_DOLLARS = 10;
 
 // Reg-T floor for an uncovered contract: $250, i.e. $2.50/share.
 const MARGIN_FLOOR_PER_SHARE = 2.5;
+// Fallback deliverable for JSONs saved before the parser exported the
+// contract's own Multiplier column; standard US equity options are 100.
 const CONTRACT_MULTIPLIER = 100;
 
 // Underlying mark prices, pooled across every loaded account — a price is a
@@ -457,7 +459,8 @@ function computeMargin(data, priceBook) {
 
   for (const o of shorts) {
     const qty = Math.abs(o.quantity);
-    const shares = qty * CONTRACT_MULTIPLIER;
+    const mult = o.multiplier || CONTRACT_MULTIPLIER;
+    const shares = qty * mult;
     const mv = Math.abs(o.value);
     const known = priceBook[o.underlying];
     // No price anywhere in the portfolio → assume the contract sits at the
@@ -473,9 +476,9 @@ function computeMargin(data, priceBook) {
       // no per-share credit — IBKR charges the full uncovered requirement.
       // Prorating per share would understate exactly the odd-lot cases
       // (fractional ETF positions) where the panel matters most.
-      const lots = Math.floor(Math.max(sharesLeft[o.underlying] || 0, 0) / CONTRACT_MULTIPLIER);
+      const lots = Math.floor(Math.max(sharesLeft[o.underlying] || 0, 0) / mult);
       const coveredContracts = Math.min(qty, lots);
-      covered = coveredContracts * CONTRACT_MULTIPLIER;
+      covered = coveredContracts * mult;
       sharesLeft[o.underlying] = (sharesLeft[o.underlying] || 0) - covered;
     }
     const nakedShares = shares - covered;
@@ -498,7 +501,7 @@ function computeMargin(data, priceBook) {
     });
     b.contracts += qty;
     b[o.right === "P" ? "puts" : "calls"] += qty;
-    b.covered += covered / CONTRACT_MULTIPLIER;
+    b.covered += covered / mult;
     b.requirement += req;
     b.notional += notionalHere;
     b.premium += mv;

@@ -240,6 +240,8 @@ def parse_ibkr_csv(content: str) -> dict[str, Any]:
                 "expiry": parsed.get("expiry", ""),
                 "strike": parsed.get("strike", 0.0),
                 "right": parsed.get("right", ""),
+                # Activity Statement spells the contract multiplier "Mult".
+                "multiplier": _to_float(r.get("Mult", "")) or 100.0,
                 "quantity": qty,
                 "cost_price": cost_price,
                 "close_price": close_price,

@@ -202,6 +202,10 @@ def _ingest_position(account: dict[str, Any], row: dict[str, str]) -> None:
             "expiry": _fmt_expiry(row.get("Expiry", "")),
             "strike": _to_float(row.get("Strike")),
             "right": row.get("Put/Call", ""),
+            # Deliverable per contract. 100 for standard US equity options,
+            # something else after corporate-action adjustments — the margin
+            # math scales by it, so don't let the frontend hard-code 100.
+            "multiplier": _to_float(row.get("Multiplier")) or 100.0,
             "quantity": qty,
             "cost_price": _to_float(row.get("CostBasisPrice")),
             "close_price": _to_float(row.get("MarkPrice")),
