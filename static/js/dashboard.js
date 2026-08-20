@@ -1082,7 +1082,13 @@ function renderDividends(data) {
         + (h && h.pre_existing ? "（建仓早于报表期间，只算期内）" : "")
         + (rebuilt ? ` · 已清仓，成本由本期 ${fmtNum(h.bought_qty, 2)} 股买入记录重建` : "")
         + (s.rate_missing ? ` · ${s.rate_missing} 笔代付股息(PIL)不含每股报价，实际略高于此` : "")
-      : "建仓在报表期间之前，本期数据里没有买入记录，无法重建成本";
+      // The Activity Statement path builds no cost_history at all (no
+      // Statement of Funds trade rows), so "opened before the window" would
+      // be a fabricated explanation there — the machinery is simply absent.
+      : div.source === "activity_statement"
+        ? "Activity Statement 不含逐笔资金记录，无法重建成本与持有天数 ——"
+          + " 用 Flex 刷新（含 Statement of Funds）可得成本股息率"
+        : "建仓在报表期间之前，本期数据里没有买入记录，无法重建成本";
     tr.innerHTML = `
       <td><b>${s.symbol}</b>${soldTag}${nonDivShare >= 0.05 ? ` <span class="tag tag-capgain" title="${
         `其中 ${fmtMoney(nonDiv, 2)}（占税前 ${fmtPct(nonDivShare, 0)}）是资本利得/资本返还分配，`
