@@ -277,8 +277,13 @@ function mergeAccounts(accounts) {
     for (const [sym, h] of Object.entries(a.cost_history || {})) {
       const t = histAcc[sym] || (histAcc[sym] = {
         qty: 0, cost: 0, sold: 0, covered: true, start: "", end: "", shares: 0, pre: false,
-        should: 0,
+        should: 0, split: false,
       });
+      // A forward split is a corporate action — it hits the name in every
+      // account. One flagged entry poisons the merged one: its start/end
+      // still span the window, so recomputing days below would resurrect
+      // the exact phantom annualization the parser just suppressed.
+      t.split = t.split || !!h.split_suspect;
       // The "what a steady holder would have collected" benchmark must be
       // built per account and summed — each avg_shares is a time-average over
       // that account's OWN window, so multiplying the summed shares by the
@@ -305,16 +310,21 @@ function mergeAccounts(accounts) {
     // deployment). Both deserve a merged entry — dropping the seeded-only
     // case would lose days/avg_shares in the 总账户 view that every
     // per-account view still shows.
-    if (t.qty > 0 || t.shares > 0) {
-      cost_history[sym] = {
-        avg_price: t.qty > 0 ? t.cost / t.qty : 0, bought_qty: t.qty, sold_qty: t.sold,
-        covered: t.covered && t.qty > 0,
-        days: (t.start && t.end)
-          ? Math.max(0, Math.round((Date.parse(t.end) - Date.parse(t.start)) / 86400000))
-          : 0,
-        avg_shares: t.shares, pre_existing: t.pre,
-        should_gross: t.should,
-      };
+    if (t.qty > 0 || t.shares > 0 || t.split) {
+      cost_history[sym] = t.split
+        // Split-poisoned: keep the entry (so the row renders) but with every
+        // time-derived stat suppressed, matching the per-account views.
+        ? { avg_price: 0, bought_qty: t.qty, sold_qty: t.sold, covered: false,
+            days: 0, avg_shares: 0, pre_existing: t.pre, should_gross: 0,
+            split_suspect: true }
+        : { avg_price: t.qty > 0 ? t.cost / t.qty : 0, bought_qty: t.qty, sold_qty: t.sold,
+            covered: t.covered && t.qty > 0,
+            days: (t.start && t.end)
+              ? Math.max(0, Math.round((Date.parse(t.end) - Date.parse(t.start)) / 86400000))
+              : 0,
+            avg_shares: t.shares, pre_existing: t.pre,
+            should_gross: t.should,
+          };
     }
   }
 
