@@ -594,6 +594,7 @@ def _finalize_cost_history(account: dict[str, Any]) -> None:
     from_d = _parse_date(account.get("_from_date", ""))
     to_d = _parse_date(account.get("_to_date", ""))
     open_qty = {s["symbol"]: s["quantity"] for s in account["stocks"]}
+    cost_basis_now = {s["symbol"]: s.get("cost_basis", 0.0) for s in account["stocks"]}
     out: dict[str, Any] = {}
     for sym, h in account["cost_history"].items():
         bq = h["bought_qty"]
@@ -612,6 +613,22 @@ def _finalize_cost_history(account: dict[str, Any]) -> None:
             end = to_d
         else:
             end = moves[-1][0]  # fully closed: capital came out on the last sell
+        # pre_existing infers "shares predate the window" from counts alone,
+        # but a forward split mid-window mints shares without a trade row and
+        # trips the same test — the integration then seeds phantom shares from
+        # the window start and stretches days to the full window. IBKR's own
+        # cost basis arbitrates: if the whole open position's CostBasisMoney
+        # matches what the window's buys cost, nothing predates the window —
+        # the extra shares came from a split, and share counts before/after
+        # the event are in different units. Suppress the time stats (days=0
+        # hides the annualized yield and disarms the ex-date gap check)
+        # rather than integrate across a unit change. Only attempted when
+        # nothing was sold — FIFO makes the comparison ambiguous otherwise.
+        split_suspect = False
+        if pre_existing and held_now > 1e-9 and h["sold_qty"] <= 1e-9:
+            cb = cost_basis_now.get(sym, 0.0)
+            if cb > 0 and abs(cb - h["bought_cost"]) <= max(1.0, 0.01 * cb):
+                split_suspect = True
         entry = {
             "avg_price": h["bought_cost"] / bq,
             "bought_qty": bq,
@@ -623,7 +640,10 @@ def _finalize_cost_history(account: dict[str, Any]) -> None:
             "days": (end - start).days if (start and end and end > start) else 0,
             "avg_shares": 0.0,
         }
-        if start and end and end > start:
+        if split_suspect:
+            entry["days"] = 0
+            entry["split_suspect"] = True
+        if start and end and end > start and not split_suspect:
             # Shares already held when the statement opens never appear as a
             # trade, so the integration has to be seeded with them or it starts
             # from zero on a position that was there all along. Back it out of
