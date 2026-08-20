@@ -1159,7 +1159,9 @@ function navStats(series, flows) {
     const r = (pts[i].total - flow) / pts[i - 1].total - 1;
     rets.push(r);
     index *= 1 + r;
-    if (index > peak) { peak = index; peakDate = pts[i].date; }
+    // >= so a flat stretch at the peak advances the date: the drawdown
+    // "starts" at the last day you were whole, not the first.
+    if (index >= peak) { peak = index; peakDate = pts[i].date; }
     const dd = 1 - index / peak;
     if (dd > maxDD) { maxDD = dd; ddStart = peakDate; ddEnd = pts[i].date; }
   }
