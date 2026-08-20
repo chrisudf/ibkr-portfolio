@@ -530,12 +530,18 @@ function mergeMargin(parts) {
       out[k] += m[k];
     }
     for (const r of m.rows) {
-      const b = byU[r.underlying] || (byU[r.underlying] = { ...r });
-      if (b !== r) {
-        for (const k of ["contracts", "puts", "calls", "covered", "requirement",
-                         "notional", "premium"]) b[k] += r[k];
-        b.priceKnown = b.priceKnown && r.priceKnown;
+      // First sight of an underlying seeds the bucket with a copy of the row;
+      // that copy already carries the row's values, so it must NOT be added
+      // into again. (Comparing `b !== r` doesn't express that — the spread
+      // copy is never === the source row, so it re-added the first account.)
+      const b = byU[r.underlying];
+      if (!b) {
+        byU[r.underlying] = { ...r };
+        continue;
       }
+      for (const k of ["contracts", "puts", "calls", "covered", "requirement",
+                       "notional", "premium"]) b[k] += r[k];
+      b.priceKnown = b.priceKnown && r.priceKnown;
     }
   }
   out.pctOfNav = out.totalNav > 0 ? out.requirement / out.totalNav : 0;
