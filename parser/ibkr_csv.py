@@ -39,8 +39,9 @@ def _parse_option_symbol(symbol: str) -> dict[str, Any] | None:
 
 # "MSFT(US5949181045) Cash Dividend USD 0.83 per Share" → MSFT. The Activity
 # Statement's Dividends / Withholding Tax sections have no Symbol column, so
-# the ticker has to come out of the description.
-_DIV_SYMBOL_RE = re.compile(r"^([A-Z][A-Z0-9\.]{0,9})\s*\(")
+# the ticker has to come out of the description. Class shares are spelled with
+# a space ("BRK B(US0846707026) ..."), hence the optional trailing letter.
+_DIV_SYMBOL_RE = re.compile(r"^([A-Z][A-Z0-9\.]{0,9}(?: [A-Z])?)\s*\(")
 
 # The Activity Statement carries the rate and the income class in the same
 # description string the Flex export splits into columns:

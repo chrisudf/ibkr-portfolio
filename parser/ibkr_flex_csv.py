@@ -343,8 +343,11 @@ _DIV_CASH_TYPES = {
 }
 
 # "MSFT(US5949181045) Cash Dividend USD 0.83 per Share" → MSFT. Used only when
-# the row itself has no Symbol column filled in.
-_DIV_SYMBOL_RE = re.compile(r"^([A-Z][A-Z0-9\.]{0,9})\s*\(")
+# the row itself has no Symbol column filled in. Class shares are spelled with
+# a space ("BRK B(US0846707026) ..."), so allow one trailing class letter —
+# without it the match fails outright and the withholding row behind it gets
+# discarded by the unattributed-tax guard.
+_DIV_SYMBOL_RE = re.compile(r"^([A-Z][A-Z0-9\.]{0,9}(?: [A-Z])?)\s*\(")
 
 # ...and the rate out of the same string: "USD 0.346643 PER SHARE" → 0.346643.
 # Case-insensitive because live Flex output shouts it while the docs don't.
