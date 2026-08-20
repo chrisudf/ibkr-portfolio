@@ -428,12 +428,17 @@ def _ingest_dividend_row(account: dict[str, Any], bucket: str, d: date, sym: str
                          kind: str, amount: float, row: dict[str, str]) -> None:
     if _dividend_id(account, bucket, d, sym, kind, amount, row) is None:
         return
+    # A correction arrives as a negative-amount row whose description still
+    # reads "USD 0.25 PER SHARE" — the rate text never flips sign. Sign it by
+    # the cash direction so a cancel + re-book nets the per-share sum out to
+    # the corrected rate instead of adding every rate it ever printed.
+    rate = _dividend_rate(row) if kind == "gross" else 0.0
     account[bucket].append({
         "date": d.isoformat(),
         "symbol": sym,
         "kind": kind,  # "gross" (dividend / payment in lieu) or "tax" (withheld)
         "amount": amount,
-        "per_share": _dividend_rate(row) if kind == "gross" else 0.0,
+        "per_share": rate if amount >= 0 else -rate,
         "income_class": _income_class(row.get("DividendType", "")) if kind == "gross" else "",
         "description": (row.get("Description") or row.get("ActivityDescription") or "").strip(),
     })
@@ -486,7 +491,12 @@ def _finalize_dividends(account: dict[str, Any]) -> None:
         s[r["kind"]] += r["amount"]
         s["net"] = s["gross"] + s["tax"]
         if r["kind"] == "gross":
-            s["count"] += 1
+            # Reversal rows (negative cash) still flow through the per-share
+            # and non-dividend sums so a cancel + re-book nets out, but they
+            # are not payments: they don't bump the count, and a rate-less
+            # reversal isn't a missing PIL rate.
+            if r["amount"] > 0:
+                s["count"] += 1
             # Per-share rates add up across payments regardless of how the
             # position was sized between them — that's the whole point.
             s["per_share"] += r["per_share"]
@@ -496,7 +506,7 @@ def _finalize_dividends(account: dict[str, Any]) -> None:
                 # Kept in gross (the cash did arrive) but excluded from yield.
                 s["non_dividend"] += r["amount"]
                 non_dividend_total += r["amount"]
-            if not r["per_share"]:
+            if not r["per_share"] and r["amount"] > 0:
                 s["rate_missing"] += 1
         s["last_date"] = max(s["last_date"], r["date"])
         m = by_month.setdefault(r["date"][:7], {"month": r["date"][:7], "gross": 0.0, "tax": 0.0, "net": 0.0})

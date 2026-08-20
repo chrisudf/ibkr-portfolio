@@ -96,6 +96,10 @@ def _parse_dividends(sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
             # overstate the tax drag. See parser/ibkr_flex_csv.py.
             if kind == "tax" and not sym:
                 continue
+            # Sign the description-parsed rate by the cash direction — a
+            # reversal row still prints the positive rate text. See the same
+            # handling in ibkr_flex_csv._ingest_dividend_row.
+            rate = _dividend_rate(desc) if kind == "gross" else 0.0
             rows.append({
                 "date": date,
                 "symbol": sym or "—",
@@ -104,7 +108,7 @@ def _parse_dividends(sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
                 # This statement has no DividendType column, but the same
                 # facts are in the description tail: the per-share rate and a
                 # "(Ordinary Dividend)" / "(Short Term Capital Gain)" suffix.
-                "per_share": _dividend_rate(desc) if kind == "gross" else 0.0,
+                "per_share": rate if amount >= 0 else -rate,
                 "income_class": _income_class_from_desc(desc) if kind == "gross" else "",
                 "description": desc,
             })
@@ -127,14 +131,16 @@ def _parse_dividends(sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
         s[r["kind"]] += r["amount"]
         s["net"] = s["gross"] + s["tax"]
         if r["kind"] == "gross":
-            s["count"] += 1
+            # Reversals (negative cash) net the sums out but aren't payments.
+            if r["amount"] > 0:
+                s["count"] += 1
             s["per_share"] += r["per_share"]
             if r["income_class"] == "ordinary":
                 s["per_share_ordinary"] += r["per_share"]
             else:
                 s["non_dividend"] += r["amount"]
                 non_dividend_total += r["amount"]
-            if not r["per_share"]:
+            if not r["per_share"] and r["amount"] > 0:
                 s["rate_missing"] += 1
         s["last_date"] = max(s["last_date"], r["date"])
         m = by_month.setdefault(r["date"][:7], {"month": r["date"][:7], "gross": 0.0, "tax": 0.0, "net": 0.0})
