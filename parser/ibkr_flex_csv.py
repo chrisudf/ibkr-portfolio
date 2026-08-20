@@ -502,11 +502,16 @@ def _finalize_dividends(account: dict[str, Any]) -> None:
     # ~8x. Rows outside the dominant currency are reported separately rather
     # than silently added; empty currency (query without the column) is
     # treated as base so old exports keep behaving exactly as before.
-    ccy_weight: dict[str, float] = {}
+    # Dominance is by NUMBER of payments, amount only breaks ties: nominal
+    # amounts aren't comparable across currencies, and one large foreign
+    # payout must not flip which currency the whole panel is denominated in.
+    ccy_weight: dict[str, list[float]] = {}
     for r in rows:
         if r["kind"] == "gross" and r.get("currency"):
-            ccy_weight[r["currency"]] = ccy_weight.get(r["currency"], 0.0) + abs(r["amount"])
-    base_ccy = max(ccy_weight, key=ccy_weight.get) if ccy_weight else ""
+            w = ccy_weight.setdefault(r["currency"], [0.0, 0.0])
+            w[0] += 1
+            w[1] += abs(r["amount"])
+    base_ccy = max(ccy_weight, key=lambda c: tuple(ccy_weight[c])) if ccy_weight else ""
     foreign: dict[str, dict[str, float]] = {}
     main_rows: list[dict[str, Any]] = []
     for r in rows:

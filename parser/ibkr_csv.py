@@ -119,11 +119,15 @@ def _parse_dividends(sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
 
     # Same no-FX segregation as the Flex path: rows outside the dominant
     # currency are reported separately, never summed at 1:1 into the totals.
-    ccy_weight: dict[str, float] = {}
+    # Dominance by payment count (amount breaks ties) — nominal amounts
+    # aren't comparable across currencies.
+    ccy_weight: dict[str, list[float]] = {}
     for r in rows:
         if r["kind"] == "gross" and r.get("currency"):
-            ccy_weight[r["currency"]] = ccy_weight.get(r["currency"], 0.0) + abs(r["amount"])
-    base_ccy = max(ccy_weight, key=ccy_weight.get) if ccy_weight else ""
+            w = ccy_weight.setdefault(r["currency"], [0.0, 0.0])
+            w[0] += 1
+            w[1] += abs(r["amount"])
+    base_ccy = max(ccy_weight, key=lambda c: tuple(ccy_weight[c])) if ccy_weight else ""
     foreign: dict[str, dict[str, float]] = {}
     main_rows: list[dict[str, Any]] = []
     for r in rows:
