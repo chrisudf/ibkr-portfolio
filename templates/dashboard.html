@@ -71,6 +71,18 @@
         </div>
       </div>
 
+      <!-- NAV history -->
+      <section class="panel" id="nav-history-panel" hidden>
+        <div class="panel-head">
+          <h2>净值曲线</h2>
+          <span class="panel-note" id="nav-history-note"></span>
+        </div>
+        <div id="nav-chart" class="nav-chart"></div>
+        <div id="nav-stats" class="nav-stats"></div>
+        <div class="margin-foot">收益 / 回撤 / 波动按剔除出入金的 TWR 链计算（入金不算涨、出金不算跌）；
+          曲线本身画的是原始净值。窗口 = 报表期间，旧数据需重新「刷新 IBKR」后才有此面板。</div>
+      </section>
+
       <!-- Treemap -->
       <section class="panel">
         <div class="panel-head">

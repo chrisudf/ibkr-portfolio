@@ -412,12 +412,37 @@ function mergeAccounts(accounts) {
     }
   }
 
+  // NAV history — dates are a union, each account forward-filled from its
+  // own first observation, and the merged curve starts only where EVERY
+  // account has begun reporting (a partial sum would read as a fake crash).
+  // Any account without a history (old JSON) disables the merged curve
+  // rather than misrepresenting the household as one thinner account.
+  const histories = list.map(a => a.nav_history || []);
+  let nav_history = [];
+  if (histories.length && histories.every(h => h.length)) {
+    const dates = [...new Set(histories.flat().map(p => p.date))].sort();
+    const startDate = histories.map(h => h[0].date).reduce((a, b) => (a > b ? a : b));
+    const idx = histories.map(() => 0);
+    const lastVal = histories.map(() => 0);
+    for (const d of dates) {
+      histories.forEach((h, i) => {
+        while (idx[i] < h.length && h[idx[i]].date <= d) { lastVal[i] = h[idx[i]].total; idx[i]++; }
+      });
+      if (d < startDate) continue;
+      nav_history.push({ date: d, total: lastVal.reduce((s, v) => s + v, 0) });
+    }
+  }
+  // External flows: plain concat — navStats needs them to strip deposits
+  // out of the merged return chain, and each flow belongs to exactly one
+  // account so no dedupe question arises.
+  const cash_flows = list.flatMap(a => a.cash_flows || []);
+
   // If accounts share the same period (the usual case) collapse to one.
   const periods = [...new Set(list.map(a => a.statement?.Period).filter(Boolean))];
   return {
     account: { Account: "ALL" },
     statement: { Period: periods.length === 1 ? periods[0] : periods.join(" / ") },
-    nav, stocks, options, dividends, cost_history,
+    nav, stocks, options, dividends, cost_history, nav_history, cash_flows,
     performance: {
       realized_total: realizedTotal,
       unrealized_total: unrealizedTotal,
@@ -556,6 +581,9 @@ function render(data) {
   kpiUnr.classList.toggle("up", unr >= 0);
   kpiUnr.classList.toggle("down", unr < 0);
   $("kpi-realized").textContent = `已实现 ${fmtMoney(performance.realized_total)}`;
+
+  // NAV history (equity curve + drawdown/vol stats)
+  renderNavHistory(data);
 
   // Treemap
   renderTreemap(stocks);
@@ -881,6 +909,96 @@ function renderMargin(data, accounts) {
   $("margin-foot").textContent =
     `卖出看跌名义抵押合计 ${fmtMoney(m.notional)}（若全部现金担保需要的资金）· `
     + `当前卖方权利金负债 ${fmtMoney(m.premium)}`;
+}
+
+/* ---------------------------------------------------------------------------
+ * NAV history — the equity curve the Flex NAV section has carried all along.
+ *
+ * The curve plots raw NAV, but every statistic is computed on a TWR chain
+ * with external flows stripped out: a $50k deposit is not a +50% day, and a
+ * withdrawal is not a drawdown. Flows dated between two NAV points attach to
+ * the later point (weekend deposits land on Monday's return).
+ * ------------------------------------------------------------------------- */
+
+function navStats(series, flows) {
+  const pts = (series || []).filter(p => p.total > 0);
+  if (pts.length < 5) return null;
+  const fl = (flows || [])
+    .map(f => ({ date: f.date, amount: f.amount || 0 }))
+    .sort((a, b) => (a.date < b.date ? -1 : 1));
+  let fi = 0;
+  // Flows on or before the first observation are starting capital, not P&L.
+  while (fi < fl.length && fl[fi].date <= pts[0].date) fi++;
+  let index = 1, peak = 1, peakDate = pts[0].date;
+  let maxDD = 0, ddStart = pts[0].date, ddEnd = pts[0].date;
+  const rets = [];
+  for (let i = 1; i < pts.length; i++) {
+    let flow = 0;
+    while (fi < fl.length && fl[fi].date <= pts[i].date) { flow += fl[fi].amount; fi++; }
+    const r = (pts[i].total - flow) / pts[i - 1].total - 1;
+    rets.push(r);
+    index *= 1 + r;
+    if (index > peak) { peak = index; peakDate = pts[i].date; }
+    const dd = 1 - index / peak;
+    if (dd > maxDD) { maxDD = dd; ddStart = peakDate; ddEnd = pts[i].date; }
+  }
+  const n = rets.length;
+  const mean = rets.reduce((s, r) => s + r, 0) / n;
+  const variance = rets.reduce((s, r) => s + (r - mean) ** 2, 0) / Math.max(n - 1, 1);
+  const annVol = Math.sqrt(variance) * Math.sqrt(252);
+  const annRet = n > 0 ? Math.pow(Math.max(index, 1e-9), 252 / n) - 1 : 0;
+  return {
+    maxDD, ddStart, ddEnd,
+    curDD: 1 - index / peak,
+    annVol, annRet,
+    // rf=0 return/vol — labelled as such, not passed off as a true Sharpe.
+    retOverVol: annVol > 0 ? annRet / annVol : 0,
+    calmar: maxDD > 0 ? annRet / maxDD : 0,
+    high: Math.max(...pts.map(p => p.total)),
+    low: Math.min(...pts.map(p => p.total)),
+    first: pts[0], last: pts[pts.length - 1],
+  };
+}
+
+function renderNavHistory(data) {
+  const panel = $("nav-history-panel");
+  const series = (data.nav_history || []).filter(p => p.total > 0);
+  const stats = navStats(series, data.cash_flows || []);
+  if (!stats) { panel.hidden = true; return; }
+  panel.hidden = false;
+
+  $("nav-history-note").textContent =
+    `${stats.first.date} → ${stats.last.date} · ${series.length} 个交易日`;
+
+  // Plain SVG polyline — no library, no external anything.
+  const W = 800, H = 200, PAD = 4;
+  const lo = stats.low, hi = stats.high;
+  const spanY = Math.max(hi - lo, 1e-9);
+  const x = (i) => PAD + (W - 2 * PAD) * (series.length > 1 ? i / (series.length - 1) : 0);
+  const y = (v) => H - PAD - (H - 2 * PAD) * ((v - lo) / spanY);
+  const points = series.map((p, i) => `${x(i).toFixed(1)},${y(p.total).toFixed(1)}`).join(" ");
+  const area = `M${x(0).toFixed(1)},${H - PAD} L${points.replaceAll(" ", " L")} L${x(series.length - 1).toFixed(1)},${H - PAD} Z`;
+  $("nav-chart").innerHTML = `
+    <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-label="净值曲线">
+      <path d="${area}" fill="rgba(107,215,255,0.08)"></path>
+      <polyline points="${points}" fill="none" stroke="var(--accent)" stroke-width="1.6"
+        vector-effect="non-scaling-stroke"></polyline>
+    </svg>`;
+
+  const chip = (label, val, cls = "") =>
+    `<span class="nav-stat"><span class="muted">${label}</span> <b class="${cls}">${val}</b></span>`;
+  $("nav-stats").innerHTML = [
+    chip("期末", fmtMoney(stats.last.total)),
+    chip("期间高/低", `${fmtMoney(stats.high)} / ${fmtMoney(stats.low)}`),
+    chip("最大回撤", `−${fmtPct(stats.maxDD, 1)}（${stats.ddStart.slice(5)} → ${stats.ddEnd.slice(5)}）`,
+      stats.maxDD >= 0.2 ? "down" : ""),
+    chip("当前回撤", stats.curDD > 0.001 ? `−${fmtPct(stats.curDD, 1)}` : "在高点",
+      stats.curDD >= 0.1 ? "down" : ""),
+    chip("年化收益 TWR", fmtPct(stats.annRet, 1), stats.annRet >= 0 ? "up" : "down"),
+    chip("年化波动", fmtPct(stats.annVol, 1)),
+    chip("收益/波动 (rf=0)", stats.retOverVol.toFixed(2)),
+    chip("Calmar", stats.calmar ? stats.calmar.toFixed(2) : "—"),
+  ].join("");
 }
 
 function renderTreemap(stocks) {

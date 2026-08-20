@@ -405,6 +405,14 @@ def _full_statement_sections():
     ]
 
 
+def test_nav_history_kept_and_sorted():
+    acct = parse(_full_statement_sections())
+    hist = acct["nav_history"]
+    assert len(hist) == 5                       # every daily row survives
+    assert [p["date"] for p in hist] == sorted(p["date"] for p in hist)
+    assert hist[-1]["total"] == acct["nav"]["total"]  # last point = the snapshot
+
+
 def test_row_order_invariance():
     base = parse(_full_statement_sections())
     shuffled = _full_statement_sections()
@@ -413,6 +421,7 @@ def test_row_order_invariance():
     other = parse(shuffled)
 
     assert base["nav"] == other["nav"]
+    assert base["nav_history"] == other["nav_history"]
     for k in ("gross", "tax", "net", "non_dividend", "base_currency"):
         assert base["dividends"][k] == other["dividends"][k]
     assert base["dividends"]["by_symbol"] == other["dividends"]["by_symbol"]
