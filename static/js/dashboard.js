@@ -697,9 +697,16 @@ function computeMargin(data, priceBook, shock = 0) {
   const stocks = data.stocks || [];
   const options = data.options || [];
   const nav = data.nav || {};
-  // Stressed NAV moves by the stock sleeve only (options unrepriced, cash fixed).
+  // Cash equivalents (SGOV/BOXX) are T-bill parking, not equity — the rest
+  // of the dashboard already reclassifies them as cash, and "T-bills gap
+  // −30%" is not the scenario this table models. Only the true equity
+  // sleeve takes the shock.
+  const cashEq = stocks.reduce(
+    (s, x) => s + (CASH_EQUIVALENTS.has(x.symbol) ? (x.value || 0) : 0), 0);
+  const equitySleeve = (nav.stock || 0) - cashEq;
+  // Stressed NAV moves by the equity sleeve only (options unrepriced, cash fixed).
   const totalNav = (nav.total || (nav.cash + nav.stock + nav.options))
-    + (nav.stock || 0) * shock;
+    + equitySleeve * shock;
 
   // Shares available to cover short calls, spent longest-dated first.
   const sharesLeft = {};
@@ -740,15 +747,21 @@ function computeMargin(data, priceBook, shock = 0) {
     // The gap shock hits the assumed spot the same as a real one.
     const spot = (known || o.strike) * (1 + shock);
     if (!known) assumedContracts += qty;
-    // Premium leg: the mark, floored at intrinsic value — an option is never
-    // worth less than intrinsic, so after a gap the unrepriced mark would
-    // otherwise make the requirement SHRINK as the 20%-of-spot leg deflates
-    // while a deep-ITM put's real liability explodes. The floor keeps every
-    // stressed number an honest lower bound that moves the right way.
+    // Premium leg. In STRESS scenarios only, the mark is floored at intrinsic
+    // value — an option is never worth less than intrinsic, so after a gap
+    // the unrepriced mark would otherwise make the requirement SHRINK as the
+    // 20%-of-spot leg deflates while a deep-ITM put's real liability
+    // explodes. At shock=0 the floor must stay OFF: the price book pools
+    // spots across accounts refreshed on different dates, and intrinsic
+    // against a stale spot would silently overwrite the statement's own
+    // mark — the live estimate belongs to the statement, gaps belong to
+    // the stress table.
     const intrinsicPS = o.right === "P"
       ? Math.max(0, o.strike - spot)
       : Math.max(0, spot - o.strike);
-    const mv = Math.max(Math.abs(o.value), intrinsicPS * shares);
+    const mv = shock !== 0
+      ? Math.max(Math.abs(o.value), intrinsicPS * shares)
+      : Math.abs(o.value);
 
     let covered = 0;
     if (o.right === "C") {
@@ -800,17 +813,21 @@ function computeMargin(data, priceBook, shock = 0) {
   // into a single 75% haircut would turn the maintenance into a credit.
   // Unparsed short options also come off: their Reg-T leg is unknown (see
   // above) but their market value is a known lower bound on the liability.
-  const stockValue = (nav.stock || 0) * (1 + shock);
+  const stockValue = cashEq + equitySleeve * (1 + shock);
   const longStock = Math.max(stockValue, 0);
   const shortStock = Math.min(stockValue, 0);
+  const excess = (nav.cash || 0) + longStock * 0.75 + shortStock * 1.3
+    - requirement - unparsedMv;
   return {
     requirement,
     notional,
     premium: premium + unparsedMv,
     totalNav,
     pctOfNav: totalNav > 0 ? requirement / totalNav : 0,
-    excess: (nav.cash || 0) + longStock * 0.75 + shortStock * 1.3
-      - requirement - unparsedMv,
+    excess,
+    // Worst single account — for the merged view's margin-call flag, since
+    // IBKR never lets one account's surplus bail out another's deficit.
+    minExcess: excess,
     // Negative cash is a real margin loan — that part accrues interest, unlike
     // collateral tied up behind short options.
     borrowed: Math.max(0, -(nav.cash || 0)),
@@ -837,12 +854,16 @@ function mergeMargin(parts) {
     unparsedMv: 0, shortStockCharge: 0, rows: [],
   };
   const byU = {};
+  out.minExcess = Infinity;
   for (const m of parts) {
     for (const k of ["requirement", "notional", "premium", "totalNav", "excess",
                      "borrowed", "assumedContracts", "assumedRequirement",
                      "unparsedContracts", "unparsedMv", "shortStockCharge"]) {
       out[k] += m[k] || 0;
     }
+    // The sum can look fine while one account is under water — margin calls
+    // fire per account, so the flag must track the worst one.
+    out.minExcess = Math.min(out.minExcess, m.minExcess != null ? m.minExcess : m.excess);
     for (const r of m.rows) {
       // First sight of an underlying seeds the bucket with a copy of the row;
       // that copy already carries the row's values, so it must NOT be added
@@ -936,11 +957,17 @@ function renderMargin(data, accounts) {
         <th class="num">剩余流动性</th><th class="num">占用/净值</th>
       </tr></thead>
       <tbody>${stressRows.map(({ s, m: sm }) => {
-        const busted = sm.excess < 0;
+        // Margin calls fire per account: the merged sum can be positive
+        // while one account is already under water.
+        const worst = sm.minExcess != null ? sm.minExcess : sm.excess;
+        const busted = worst < 0;
+        const partial = busted && sm.excess >= 0;
         return `<tr class="${busted ? "stress-bust" : ""}">
           <td>${s === 0 ? "现价" : `全线 ${fmtPct(s, 0)}`}</td>
           <td class="num">${fmtMoney(sm.requirement)}</td>
-          <td class="num ${busted ? "down" : ""}">${fmtMoney(sm.excess)}${busted ? " ⚠" : ""}</td>
+          <td class="num ${busted ? "down" : ""}">${fmtMoney(sm.excess)}${
+            busted ? (partial ? ` <span title="跨账户不共享抵押品：至少一个账户的剩余流动性已为负">⚠ 单账户</span>` : " ⚠") : ""
+          }</td>
           <td class="num">${sm.totalNav > 0 ? fmtPct(sm.requirement / sm.totalNav, 1) : "—"}</td>
         </tr>`;
       }).join("")}</tbody>
