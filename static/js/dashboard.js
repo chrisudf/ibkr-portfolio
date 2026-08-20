@@ -196,9 +196,15 @@ function mergeAccounts(accounts) {
   }
   const cost_history = {};
   for (const [sym, t] of Object.entries(histAcc)) {
-    if (t.qty > 0) {
+    // qty > 0 = at least one account traded it; shares > 0 = at least one
+    // account carries a seeded buy-and-hold entry (zero trades, whole-window
+    // deployment). Both deserve a merged entry — dropping the seeded-only
+    // case would lose days/avg_shares in the 总账户 view that every
+    // per-account view still shows.
+    if (t.qty > 0 || t.shares > 0) {
       cost_history[sym] = {
-        avg_price: t.cost / t.qty, bought_qty: t.qty, sold_qty: t.sold, covered: t.covered,
+        avg_price: t.qty > 0 ? t.cost / t.qty : 0, bought_qty: t.qty, sold_qty: t.sold,
+        covered: t.covered && t.qty > 0,
         days: (t.start && t.end)
           ? Math.max(0, Math.round((Date.parse(t.end) - Date.parse(t.start)) / 86400000))
           : 0,

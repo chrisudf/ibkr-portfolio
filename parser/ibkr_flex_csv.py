@@ -645,6 +645,32 @@ def _finalize_cost_history(account: dict[str, Any]) -> None:
             area += max(pos, 0.0) * (end - prev).days
             entry["avg_shares"] = area / entry["days"]
         out[sym] = entry
+
+    # A position opened before the window and untouched since never shows up
+    # above — it has no trade rows — so it would get no entry at all, days=0
+    # downstream, and the annualized yield goes missing for exactly the
+    # steadiest dividend holdings. For an open position with zero period
+    # trades both facts are certain: capital was deployed the whole statement
+    # window and the average size is the held quantity. Seed those.
+    # avg_price stays 0 — the dashboard prefers IBKR's own CostBasisPrice for
+    # anything still open, and the covered=False guard keeps the zero from
+    # ever being used as a rebuilt cost.
+    if from_d and to_d and to_d > from_d:
+        window_days = (to_d - from_d).days
+        for sym, qty in open_qty.items():
+            if qty <= 1e-9 or sym in account["cost_history"]:
+                continue
+            out[sym] = {
+                "avg_price": 0.0,
+                "bought_qty": 0.0,
+                "sold_qty": 0.0,
+                "covered": False,
+                "pre_existing": True,
+                "start": from_d.isoformat(),
+                "end": to_d.isoformat(),
+                "days": window_days,
+                "avg_shares": qty,
+            }
     account["cost_history"] = out
 
 
