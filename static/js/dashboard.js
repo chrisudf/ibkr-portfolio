@@ -54,14 +54,19 @@ const periodDays = (period) => {
   return days > 0 ? days : 0;
 };
 
-const fmtSpan = (days) => {
+// "近 N" (= the last N) is only true for trailing windows — Flex "Last 365
+// Calendar Days" queries. An Activity Statement covers a FIXED calendar
+// range that may have ended months ago; calling CY2025 "近 12 个月" in
+// August 2026 mislabels which year the return belongs to.
+const fmtSpan = (days, trailing = true) => {
   if (!days || days <= 0) return "";
+  const p = trailing ? "近 " : "";
   if (days >= 350) {
     const yrs = days / 365;
-    return yrs >= 1.9 ? `近 ${yrs.toFixed(1)} 年` : "近 12 个月";
+    return yrs >= 1.9 ? `${p}${yrs.toFixed(1)} 年` : `${p}12 个月`;
   }
   const months = Math.round(days / 30.44);
-  return months >= 2 ? `近 ${months} 个月` : `近 ${days} 天`;
+  return months >= 2 ? `${p}${months} 个月` : `${p}${days} 天`;
 };
 
 const $ = (id) => document.getElementById(id);
@@ -432,7 +437,10 @@ function render(data) {
   // parsing that string would label the number with the wrong window —
   // it'd pick up whichever range happens to be listed first.
   const spanDays = (acct === "ALL" ? 0 : periodDays(period)) || (mm && mm.days) || 0;
-  const span = fmtSpan(spanDays);
+  // Month-name periods (Activity Statements) are fixed calendar ranges, not
+  // trailing windows — label them by length only, without "近".
+  const fixedWindow = /[A-Za-z]+ \d{1,2}, \d{4}/.test(period);
+  const span = fmtSpan(spanDays, !fixedWindow);
   const suffix = span ? `（${span}）` : "";
   const scopeHint = `${span ? span + "，" : ""}按报表期间计算，非开户至今`;
   if (nav.twr) {
@@ -1062,6 +1070,7 @@ function renderDividends(data) {
     cash_transactions: "Cash Transactions",
     statement_of_funds: "Statement of Funds",
     activity_statement: "Activity Statement",
+    mixed: "多来源（各账户报表类型不同）",
   }[div.source] || "报表";
   $("div-note").textContent = `${data.statement?.Period || ""} · 数据来自 ${sourceLabel}`
     + (accrued ? ` · 另有应计未付 ${fmtMoney(accrued, 2)}` : "");
@@ -1157,10 +1166,15 @@ function renderDividends(data) {
       // The Activity Statement path builds no cost_history at all (no
       // Statement of Funds trade rows), so "opened before the window" would
       // be a fabricated explanation there — the machinery is simply absent.
+      // In a merged view with heterogeneous sources one flag can't say which
+      // pipeline this symbol came through, so the wording stays neutral.
       : div.source === "activity_statement"
         ? "Activity Statement 不含逐笔资金记录，无法重建成本与持有天数 ——"
           + " 用 Flex 刷新（含 Statement of Funds）可得成本股息率"
-        : "建仓在报表期间之前，本期数据里没有买入记录，无法重建成本";
+        : div.source === "mixed"
+          ? "该标的所在账户的报表不含逐笔资金记录（Activity Statement），"
+            + "或建仓早于报表期间 —— 两种情况都无法重建成本"
+          : "建仓在报表期间之前，本期数据里没有买入记录，无法重建成本";
     tr.innerHTML = `
       <td><b>${s.symbol}</b>${soldTag}${nonDivShare >= 0.05 ? ` <span class="tag tag-capgain" title="${
         `其中 ${fmtMoney(nonDiv, 2)}（占税前 ${fmtPct(nonDivShare, 0)}）是资本利得/资本返还分配，`
