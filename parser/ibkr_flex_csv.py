@@ -446,14 +446,21 @@ def _ingest_dividend_row(account: dict[str, Any], bucket: str, d: date, sym: str
     # the cash direction so a cancel + re-book nets the per-share sum out to
     # the corrected rate instead of adding every rate it ever printed.
     rate = _dividend_rate(row) if kind == "gross" else 0.0
+    desc = (row.get("Description") or row.get("ActivityDescription") or "").strip()
+    # DividendType is a Cash Transactions column; Statement of Funds rows
+    # never carry it, and classifying every SoF payout as "ordinary" would
+    # resurrect the leveraged-ETF bug on any query that enables SoF without
+    # Cash Transactions. The description tail states the same fact
+    # ("... (Short Term Capital Gain)"), and _income_class only does
+    # substring matching — so fall back to the description text.
     account[bucket].append({
         "date": d.isoformat(),
         "symbol": sym,
         "kind": kind,  # "gross" (dividend / payment in lieu) or "tax" (withheld)
         "amount": amount,
         "per_share": rate if amount >= 0 else -rate,
-        "income_class": _income_class(row.get("DividendType", "")) if kind == "gross" else "",
-        "description": (row.get("Description") or row.get("ActivityDescription") or "").strip(),
+        "income_class": _income_class(row.get("DividendType") or desc) if kind == "gross" else "",
+        "description": desc,
     })
 
 
