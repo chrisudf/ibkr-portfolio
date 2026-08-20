@@ -158,8 +158,15 @@ def upload():
         return jsonify({"error": f"parse failed: {exc}"}), 400
 
     saved, skipped = _save_accounts(payload)
-    if skipped and not saved:
-        return jsonify({"error": "statement contains no valid account ids"}), 400
+    # Nothing saved is a failure regardless of *why* — the old guard
+    # (`skipped and not saved`) let a statement that parsed to zero accounts
+    # (every section unrecognized, or blank ClientAccountIDs) return
+    # ok:true, and the UI printed 已更新 ✓ while uploads/ was never touched.
+    if not saved:
+        msg = ("statement contains no valid account ids" if skipped
+               else "statement parsed but contained no account data "
+                    "(no recognizable sections or account ids)")
+        return jsonify({"error": msg}), 400
 
     resp = {"ok": True, "accounts": saved}
     if skipped:
