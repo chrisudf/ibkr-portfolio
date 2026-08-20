@@ -581,12 +581,15 @@ function computeMargin(data, priceBook) {
   // Contracts whose strike/right didn't parse (adjusted symbols the Activity
   // Statement path couldn't read) must NOT fall through the formula: with
   // strike 0 and no right, regTPerShare degenerates to the $2.50 floor and a
-  // multi-thousand-dollar requirement quietly prints as ~$250. Exclude them
-  // and say so — an admitted gap beats a silently wrong total.
-  let unparsedContracts = 0;
+  // multi-thousand-dollar requirement quietly prints as ~$250. Exclude their
+  // Reg-T leg and say so — but their market value is parsed independently of
+  // the symbol, and it is a hard lower bound on the liability, so it still
+  // belongs in the premium total and comes off the excess.
+  let unparsedContracts = 0, unparsedMv = 0;
   for (const o of shorts) {
     if (!(o.strike > 0) || (o.right !== "P" && o.right !== "C")) {
       unparsedContracts += Math.abs(o.quantity);
+      unparsedMv += Math.abs(o.value || 0);
       continue;
     }
     const qty = Math.abs(o.quantity);
@@ -644,15 +647,23 @@ function computeMargin(data, priceBook) {
   // puts), and long stock carries ~25% maintenance. NAV − requirement would
   // overstate "can I sell another put" headroom by the whole LEAP sleeve
   // plus a quarter of the stock — the dangerous direction for this panel.
-  //   excess ≈ (cash + stock) − (25% × stock + short-option requirement)
+  //   excess ≈ cash + 75% × long stock − 130% × |short stock| − requirement
+  // Short stock gets a charge, not a credit: its sale proceeds already sit
+  // in cash at 100%, and Reg-T maintenance adds ~30% on top — folding it
+  // into a single 75% haircut would turn the maintenance into a credit.
+  // Unparsed short options also come off: their Reg-T leg is unknown (see
+  // above) but their market value is a known lower bound on the liability.
   const stockValue = nav.stock || 0;
+  const longStock = Math.max(stockValue, 0);
+  const shortStock = Math.min(stockValue, 0);
   return {
     requirement,
     notional,
-    premium,
+    premium: premium + unparsedMv,
     totalNav,
     pctOfNav: totalNav > 0 ? requirement / totalNav : 0,
-    excess: (nav.cash || 0) + stockValue * 0.75 - requirement,
+    excess: (nav.cash || 0) + longStock * 0.75 + shortStock * 1.3
+      - requirement - unparsedMv,
     // Negative cash is a real margin loan — that part accrues interest, unlike
     // collateral tied up behind short options.
     borrowed: Math.max(0, -(nav.cash || 0)),
@@ -660,6 +671,7 @@ function computeMargin(data, priceBook) {
     assumedRequirement,
     assumedShare: requirement > 0 ? assumedRequirement / requirement : 0,
     unparsedContracts,
+    unparsedMv,
     rows: Object.values(byUnderlying).sort((a, b) => b.requirement - a.requirement),
   };
 }
@@ -671,13 +683,14 @@ function computeMargin(data, priceBook) {
 function mergeMargin(parts) {
   const out = {
     requirement: 0, notional: 0, premium: 0, totalNav: 0, excess: 0, borrowed: 0,
-    assumedContracts: 0, assumedRequirement: 0, unparsedContracts: 0, rows: [],
+    assumedContracts: 0, assumedRequirement: 0, unparsedContracts: 0,
+    unparsedMv: 0, rows: [],
   };
   const byU = {};
   for (const m of parts) {
     for (const k of ["requirement", "notional", "premium", "totalNav", "excess",
                      "borrowed", "assumedContracts", "assumedRequirement",
-                     "unparsedContracts"]) {
+                     "unparsedContracts", "unparsedMv"]) {
       out[k] += m[k] || 0;
     }
     for (const r of m.rows) {
@@ -738,7 +751,9 @@ function renderMargin(data, accounts) {
       + `（占估算额 ${fmtPct(m.assumedShare, 0)}）`
     : "Reg-T 估算 · 正股价格取自当前持仓")
     + (m.unparsedContracts > 0
-      ? ` · ${m.unparsedContracts} 张合约读不出行权价/方向，未计入 —— 实际占用高于显示`
+      ? ` · ${m.unparsedContracts} 张合约读不出行权价/方向，其权利金负债`
+        + `（${fmtMoney(m.unparsedMv)}）已计入并从剩余流动性扣除，`
+        + `Reg-T 腿未计 —— 实际占用高于显示`
       : "");
   note.title = m.assumedContracts > 0
     ? "平值假设对价外的卖put偏保守 —— 实际保证金通常低于此。"
