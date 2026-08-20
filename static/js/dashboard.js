@@ -457,7 +457,17 @@ function computeMargin(data, priceBook) {
   const shorts = options.filter(o => o.quantity < 0)
     .sort((a, b) => (a.right === "C" ? 0 : 1) - (b.right === "C" ? 0 : 1));
 
+  // Contracts whose strike/right didn't parse (adjusted symbols the Activity
+  // Statement path couldn't read) must NOT fall through the formula: with
+  // strike 0 and no right, regTPerShare degenerates to the $2.50 floor and a
+  // multi-thousand-dollar requirement quietly prints as ~$250. Exclude them
+  // and say so — an admitted gap beats a silently wrong total.
+  let unparsedContracts = 0;
   for (const o of shorts) {
+    if (!(o.strike > 0) || (o.right !== "P" && o.right !== "C")) {
+      unparsedContracts += Math.abs(o.quantity);
+      continue;
+    }
     const qty = Math.abs(o.quantity);
     const mult = o.multiplier || CONTRACT_MULTIPLIER;
     const shares = qty * mult;
@@ -528,6 +538,7 @@ function computeMargin(data, priceBook) {
     assumedContracts,
     assumedRequirement,
     assumedShare: requirement > 0 ? assumedRequirement / requirement : 0,
+    unparsedContracts,
     rows: Object.values(byUnderlying).sort((a, b) => b.requirement - a.requirement),
   };
 }
@@ -539,13 +550,14 @@ function computeMargin(data, priceBook) {
 function mergeMargin(parts) {
   const out = {
     requirement: 0, notional: 0, premium: 0, totalNav: 0, excess: 0, borrowed: 0,
-    assumedContracts: 0, assumedRequirement: 0, rows: [],
+    assumedContracts: 0, assumedRequirement: 0, unparsedContracts: 0, rows: [],
   };
   const byU = {};
   for (const m of parts) {
     for (const k of ["requirement", "notional", "premium", "totalNav", "excess",
-                     "borrowed", "assumedContracts", "assumedRequirement"]) {
-      out[k] += m[k];
+                     "borrowed", "assumedContracts", "assumedRequirement",
+                     "unparsedContracts"]) {
+      out[k] += m[k] || 0;
     }
     for (const r of m.rows) {
       // First sight of an underlying seeds the bucket with a copy of the row;
@@ -575,7 +587,7 @@ function renderMargin(data, accounts) {
   const m = merged
     ? mergeMargin(Object.values(accounts || {}).map(a => computeMargin(a, book)))
     : computeMargin(data, book);
-  if (!m.rows.length) { panel.hidden = true; return; }
+  if (!m.rows.length && !m.unparsedContracts) { panel.hidden = true; return; }
   panel.hidden = false;
 
   $("margin-amount").textContent = fmtMoney(m.requirement);
@@ -600,10 +612,13 @@ function renderMargin(data, accounts) {
     + "正股按 25% 维持保证金扣减，所以不是「净值 − 占用」。";
 
   const note = $("margin-note");
-  note.textContent = m.assumedContracts > 0
+  note.textContent = (m.assumedContracts > 0
     ? `Reg-T 估算 · ${m.assumedContracts} 张合约无正股报价，按平值估算`
       + `（占估算额 ${fmtPct(m.assumedShare, 0)}）`
-    : "Reg-T 估算 · 正股价格取自当前持仓";
+    : "Reg-T 估算 · 正股价格取自当前持仓")
+    + (m.unparsedContracts > 0
+      ? ` · ${m.unparsedContracts} 张合约读不出行权价/方向，未计入 —— 实际占用高于显示`
+      : "");
   note.title = m.assumedContracts > 0
     ? "平值假设对价外的卖put偏保守 —— 实际保证金通常低于此。"
       + "买入这些标的的正股后，价格会自动接入，数字随之收紧。"

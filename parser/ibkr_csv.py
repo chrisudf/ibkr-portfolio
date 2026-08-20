@@ -17,8 +17,11 @@ def _to_float(value: str) -> float:
         return 0.0
 
 
+# Underlying accepts digits and one internal space: corporate-action-adjusted
+# contracts are spelled "COHR1 17OCT25 85 P" and class shares "BRK B ...".
+# Non-greedy so the expiry token, not the regex, decides where the ticker ends.
 _OPTION_RE = re.compile(
-    r"^(?P<underlying>[A-Z\.]+)\s+(?P<expiry>\d{1,2}[A-Z]{3}\d{2})\s+(?P<strike>[\d\.]+)\s+(?P<right>[CP])$"
+    r"^(?P<underlying>[A-Z][A-Z0-9\. ]*?)\s+(?P<expiry>\d{1,2}[A-Z]{3}\d{2})\s+(?P<strike>[\d\.]+)\s+(?P<right>[CP])$"
 )
 
 
