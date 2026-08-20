@@ -192,10 +192,21 @@ function mergeAccounts(accounts) {
   // averaging averages, which would ignore how many shares each account held.
   const histAcc = {};
   for (const a of list) {
+    // Each account's own per-share rates, for the ex-date benchmark below.
+    const rateBySym = {};
+    for (const s of a.dividends?.by_symbol || []) rateBySym[s.symbol] = s.per_share || 0;
     for (const [sym, h] of Object.entries(a.cost_history || {})) {
       const t = histAcc[sym] || (histAcc[sym] = {
         qty: 0, cost: 0, sold: 0, covered: true, start: "", end: "", shares: 0, pre: false,
+        should: 0,
       });
+      // The "what a steady holder would have collected" benchmark must be
+      // built per account and summed — each avg_shares is a time-average over
+      // that account's OWN window, so multiplying the summed shares by the
+      // union-of-windows rate would claim every account attended every
+      // ex-date either of them saw, firing a phantom 除息日缺口 exactly when
+      // the accounts held the name over different stretches.
+      t.should += (h.avg_shares || 0) * (rateBySym[sym] || 0);
       t.qty += h.bought_qty;
       t.cost += h.avg_price * h.bought_qty;
       t.sold += h.sold_qty;
@@ -223,6 +234,7 @@ function mergeAccounts(accounts) {
           ? Math.max(0, Math.round((Date.parse(t.end) - Date.parse(t.start)) / 86400000))
           : 0,
         avg_shares: t.shares, pre_existing: t.pre,
+        should_gross: t.should,
       };
     }
   }
@@ -1008,9 +1020,12 @@ function renderDividends(data) {
     const nonDiv = s.non_dividend || 0;
     // Worth flagging only when it moves the number, not on a rounding tail.
     const nonDivShare = s.gross > 0 ? nonDiv / s.gross : 0;
-    // Did the shares actually exist on the ex-dates?
+    // Did the shares actually exist on the ex-dates? The merged view ships a
+    // pre-summed benchmark (each account's avg_shares × its own rates) —
+    // summed avg_shares times the unioned rate would overstate it whenever
+    // the accounts held the name over different stretches.
     const avgShares = h && h.avg_shares ? h.avg_shares : 0;
-    const should = avgShares * dps;
+    const should = h && h.should_gross != null ? h.should_gross : avgShares * dps;
     const shortfall = should - s.gross;
     const missed = should > 0 && s.gross / should < CAPTURE_FLAG_RATIO
       && shortfall >= CAPTURE_FLAG_DOLLARS;
