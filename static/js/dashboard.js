@@ -417,18 +417,28 @@ function mergeAccounts(accounts) {
   // account has begun reporting (a partial sum would read as a fake crash).
   // Any account without a history (old JSON) disables the merged curve
   // rather than misrepresenting the household as one thinner account.
-  const histories = list.map(a => a.nav_history || []);
+  // Pre-filter with the same total>0 predicate the single-account stats use:
+  // a padded/blank NAV row parses to 0.0, and forward-filling a zero would
+  // paint a full-NAV one-day crash on the household curve that neither
+  // per-account view shows.
+  const histories = list.map(a => (a.nav_history || []).filter(p => p.total > 0));
   let nav_history = [];
   if (histories.length && histories.every(h => h.length)) {
     const dates = [...new Set(histories.flat().map(p => p.date))].sort();
     const startDate = histories.map(h => h[0].date).reduce((a, b) => (a > b ? a : b));
+    // Truncate the tail symmetrically: accounts are refreshed independently,
+    // and past the stale one's last observation the merged point would be
+    // "today's A + last week's B" — worse, a deposit booked after B's NAV
+    // series ends would be stripped from a merged NAV that never received
+    // it, printing a fake drawdown at exactly the staleness boundary.
+    const endDate = histories.map(h => h[h.length - 1].date).reduce((a, b) => (a < b ? a : b));
     const idx = histories.map(() => 0);
     const lastVal = histories.map(() => 0);
     for (const d of dates) {
       histories.forEach((h, i) => {
         while (idx[i] < h.length && h[idx[i]].date <= d) { lastVal[i] = h[idx[i]].total; idx[i]++; }
       });
-      if (d < startDate) continue;
+      if (d < startDate || d > endDate) continue;
       nav_history.push({ date: d, total: lastVal.reduce((s, v) => s + v, 0) });
     }
   }
@@ -1164,7 +1174,16 @@ function navStats(series, flows) {
   for (let i = 1; i < pts.length; i++) {
     let flow = 0;
     while (fi < fl.length && fl[fi].date <= pts[i].date) { flow += fl[fi].amount; fi++; }
-    const r = (pts[i].total - flow) / pts[i - 1].total - 1;
+    // Deposits use the begin-of-day convention (they join the denominator),
+    // withdrawals the end-of-day one (added back to the numerator): both
+    // keep the base large. The naive (end − flow) / begin link divides the
+    // day's P&L by the pre-deposit base — seed a $5k account with $200k on
+    // a red day and it prints a −20% "drawdown", or flips the whole chain
+    // negative. Clamp guards the chain's sign against any residual gap.
+    const dep = Math.max(flow, 0), wd = Math.min(flow, 0);
+    const denom = pts[i - 1].total + dep;
+    let r = denom > 0 ? (pts[i].total - wd) / denom - 1 : 0;
+    if (r < -0.99) r = -0.99;
     rets.push(r);
     index *= 1 + r;
     // >= so a flat stretch at the peak advances the date: the drawdown
