@@ -665,6 +665,10 @@ const MARGIN_FLOOR_PER_SHARE = 2.5;
 // Fallback deliverable for JSONs saved before the parser exported the
 // contract's own Multiplier column; standard US equity options are 100.
 const CONTRACT_MULTIPLIER = 100;
+// Mark-to-strike ratio above which an option without an underlying quote is
+// treated as probably in-the-money. Listed equity options don't carry 10% of
+// strike in pure time value at the DTEs a seller's calendar shows.
+const MARK_ITM_RATIO = 0.10;
 
 // Underlying mark prices, pooled across every loaded account — a price is a
 // market fact, not account data, so a stock held only in U22 still prices a
@@ -1055,8 +1059,16 @@ function computeClusters(data, map) {
   return { totalNav, rows: list };
 }
 
+// Cluster panel is built and tested but switched off: with clusters.json
+// holding a single group, the dominant row is the catch-all "其他", whose
+// percentage is a property of how little has been grouped rather than a
+// concentration signal — and it renders red on every load. Flip to true after
+// filling in static/clusters.json.
+const SHOW_CLUSTER_PANEL = false;
+
 function renderClusters(data, map) {
   const panel = $("cluster-panel");
+  if (!SHOW_CLUSTER_PANEL) { panel.hidden = true; return; }
   const c = computeClusters(data, map);
   if (!c || !c.rows.length) { panel.hidden = true; return; }
   panel.hidden = false;
@@ -1122,7 +1134,7 @@ function groupExpiries(options, priceBook, todayTs) {
       : Infinity;
     const b = buckets[key] || (buckets[key] = {
       weekStart: key, firstExpiry: Infinity, contracts: 0,
-      premium: 0, putNotional: 0, itm: 0, unpriced: 0, items: [],
+      premium: 0, putNotional: 0, itm: 0, likelyItm: 0, unpriced: 0, items: [],
     });
     if (ts != null) b.firstExpiry = Math.min(b.firstExpiry, ts);
     b.contracts += qty;
@@ -1134,6 +1146,18 @@ function groupExpiries(options, priceBook, todayTs) {
       if (itm) b.itm += qty;
     } else {
       b.unpriced += qty;
+      // No underlying quote (nothing in the portfolio prices this name), so
+      // moneyness can't be settled from spot. The contract's OWN mark still
+      // says something: an option can't be worth much more than its time
+      // value unless it carries intrinsic. A mark above MARK_ITM_RATIO of the
+      // strike is not a far-OTM lottery ticket at any listed IV/DTE — that is
+      // assignment risk, and reporting it as "0 ITM" reads as reassurance the
+      // data does not support. Flagged separately from confirmed ITM because
+      // it is inferred from price, not measured against spot.
+      const markPerShare = Math.abs(o.value || 0) / (qty * mult);
+      if (o.strike > 0 && markPerShare > MARK_ITM_RATIO * o.strike) {
+        b.likelyItm += qty;
+      }
     }
     b.items.push(`${o.underlying} ${o.strike || "?"}${o.right || "?"} ×${qty}`);
   }
@@ -1176,10 +1200,21 @@ function renderExpiries(data, accounts) {
   const tbody = $("expiry-body");
   tbody.innerHTML = "";
   for (const w of weeks) {
-    const itmCell = [
-      w.itm ? `<span class="down"><b>${w.itm}</b></span>` : "0",
-      w.unpriced ? `<span class="muted">价? ${w.unpriced}</span>` : "",
-    ].filter(Boolean).join(" · ");
+    // "0" may only be printed when every contract in the week was actually
+    // measured. With an unpriced contract present, 0 is not a finding — it is
+    // a gap — and the deep-ITM ones are exactly the contracts that matter.
+    const itmCell = w.unpriced
+      ? [
+          w.itm ? `<span class="down"><b>${w.itm}</b></span>` : "",
+          w.likelyItm
+            ? `<span class="down" title="无正股报价，按合约自身市价推断：`
+              + `权利金已超行权价的 ${fmtPct(MARK_ITM_RATIO, 0)}，几乎不可能是纯时间价值">`
+              + `<b>可能 ${w.likelyItm}</b></span>`
+            : "",
+          `<span class="muted" title="组合里没有该标的正股，无法用现价判定价内外">`
+            + `价? ${w.unpriced}</span>`,
+        ].filter(Boolean).join(" · ")
+      : (w.itm ? `<span class="down"><b>${w.itm}</b></span>` : "0");
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td><b>${weekLabel(w)}</b></td>
