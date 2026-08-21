@@ -304,11 +304,37 @@ def refresh():
 # hammering a throttled endpoint into a lockout.
 
 AUTO_SYNC = os.environ.get("AUTO_SYNC", "off").strip().lower()
-AUTO_SYNC_UTC_HOUR = int(os.environ.get("AUTO_SYNC_UTC_HOUR", "9") or 9)
-AUTO_SYNC_UTC_DAY = (os.environ.get("AUTO_SYNC_UTC_DAY", "sat").strip().lower() or "sat")[:3]
 SYNC_STATE_FILE = UPLOAD_DIR / ".auto_sync_state.json"
 
 _WEEKDAY_NUM = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+
+
+def _parse_sync_hour(raw: str) -> int:
+    """0-23, defaulting to 9 — a typo in an env file must degrade the
+    schedule, never crash the whole app at import (gunicorn + restart:
+    unless-stopped would turn that into a boot loop taking the dashboard
+    down with it)."""
+    try:
+        hour = int((raw or "").strip().strip('"').strip("'") or 9)
+    except ValueError:
+        app.logger.warning("AUTO_SYNC_UTC_HOUR=%r is not an integer; using 9", raw)
+        return 9
+    if not 0 <= hour <= 23:
+        app.logger.warning("AUTO_SYNC_UTC_HOUR=%r out of 0-23; using 9", raw)
+        return 9
+    return hour
+
+
+def _parse_sync_day(raw: str) -> str:
+    day = ((raw or "").strip().strip('"').strip("'").lower() or "sat")[:3]
+    if day not in _WEEKDAY_NUM:
+        app.logger.warning("AUTO_SYNC_UTC_DAY=%r not mon..sun; using sat", raw)
+        return "sat"
+    return day
+
+
+AUTO_SYNC_UTC_HOUR = _parse_sync_hour(os.environ.get("AUTO_SYNC_UTC_HOUR", "9"))
+AUTO_SYNC_UTC_DAY = _parse_sync_day(os.environ.get("AUTO_SYNC_UTC_DAY", "sat"))
 
 
 def _auto_sync_due(now_utc: datetime, mode: str, hour: int, day: str,
@@ -362,9 +388,20 @@ def _auto_sync_loop() -> None:
             # Stamp the attempt BEFORE running: a crash mid-pull must not
             # turn into a retry loop against a throttled endpoint.
             today = now.date().isoformat()
+            prev_date = state.get("last_attempt_date", "")
             _write_sync_state({**state, "last_attempt_date": today,
                                "last_attempt": now.isoformat(timespec="seconds")})
             payload, status = _run_refresh("auto")
+            if status == 429:
+                # Our OWN throttle/lock refused — zero requests reached IBKR,
+                # so this must not consume the day's single attempt (a button
+                # press at 08:57 would otherwise skip a whole daily/weekly
+                # slot). Restore the stamp; the next 60s tick retries once
+                # the cool-down passes. The one-attempt-per-day rule guards
+                # IBKR quota, and this branch never spent any.
+                _write_sync_state({**state, "last_attempt_date": prev_date,
+                                   "last_attempt": now.isoformat(timespec="seconds")})
+                continue
             ok = status == 200 and bool(payload.get("ok"))
             detail = "; ".join(
                 f"{r.get('tag', '?')}: {'ok' if r.get('ok') else (r.get('error') or '?')}"
@@ -384,12 +421,14 @@ def _auto_sync_loop() -> None:
 
 if AUTO_SYNC in ("daily", "weekly"):
     # Started at import so an unattended droplet syncs without anyone
-    # opening the page. The flask dev reloader imports the module twice —
-    # a duplicate thread is benign here: the shared refresh lock turns the
-    # loser's attempt into a 429 and the due-day stamp keeps both quiet for
-    # the rest of the day. Gunicorn runs a single worker (see Dockerfile),
-    # so production gets exactly one.
-    threading.Thread(target=_auto_sync_loop, daemon=True, name="auto-sync").start()
+    # opening the page. Under the flask dev reloader the module imports in
+    # TWO processes, and _refresh_lock is per-process memory — the parent's
+    # scheduler could fetch concurrently with a button press served by the
+    # child. Only the serving process (WERKZEUG_RUN_MAIN=true) may start
+    # the thread; under gunicorn (module imported, __name__ != "__main__",
+    # single worker per Dockerfile) production gets exactly one.
+    if os.environ.get("WERKZEUG_RUN_MAIN") == "true" or __name__ != "__main__":
+        threading.Thread(target=_auto_sync_loop, daemon=True, name="auto-sync").start()
 
 
 if __name__ == "__main__":
