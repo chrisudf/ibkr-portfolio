@@ -388,7 +388,6 @@ def _auto_sync_loop() -> None:
             # Stamp the attempt BEFORE running: a crash mid-pull must not
             # turn into a retry loop against a throttled endpoint.
             today = now.date().isoformat()
-            prev_date = state.get("last_attempt_date", "")
             _write_sync_state({**state, "last_attempt_date": today,
                                "last_attempt": now.isoformat(timespec="seconds")})
             payload, status = _run_refresh("auto")
@@ -396,11 +395,16 @@ def _auto_sync_loop() -> None:
                 # Our OWN throttle/lock refused — zero requests reached IBKR,
                 # so this must not consume the day's single attempt (a button
                 # press at 08:57 would otherwise skip a whole daily/weekly
-                # slot). Restore the stamp; the next 60s tick retries once
-                # the cool-down passes. The one-attempt-per-day rule guards
-                # IBKR quota, and this branch never spent any.
-                _write_sync_state({**state, "last_attempt_date": prev_date,
-                                   "last_attempt": now.isoformat(timespec="seconds")})
+                # slot). Restore the state VERBATIM; the next 60s tick retries
+                # once the cool-down passes. The one-attempt-per-day rule
+                # guards IBKR quota, and this branch never spent any.
+                #
+                # Writing a fresh last_attempt here would be a lie in the
+                # header: ok/detail still describe the PREVIOUS run, so the
+                # top bar would pair a just-now timestamp with an older ✓ and
+                # claim a sync that never reached IBKR. prev_date is implicit
+                # in `state` — no field of it changed.
+                _write_sync_state(state)
                 continue
             ok = status == 200 and bool(payload.get("ok"))
             detail = "; ".join(

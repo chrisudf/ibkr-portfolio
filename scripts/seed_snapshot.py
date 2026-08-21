@@ -20,24 +20,18 @@ from __future__ import annotations
 
 import json
 import random
-import re
 import sys
 from datetime import date, timedelta
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from parser.snapshots import _as_of_date  # noqa: E402
 
 UPLOAD_DIR = Path(__file__).resolve().parents[1] / "uploads"
 
 # 价格变动候选：三涨三跌，保证两侧榜单都有内容。
 _MOVES = (0.05, 0.03, 0.015, -0.02, -0.04, -0.07)
-
-
-def _as_of(data: dict) -> str:
-    """报表自身的 as-of 日期，与 parser/snapshots.py 的 _as_of_date 同源。"""
-    hist = data.get("nav_history") or []
-    if hist:
-        return hist[-1]["date"]
-    iso = re.findall(r"\d{4}-\d{2}-\d{2}", (data.get("statement") or {}).get("Period", ""))
-    return max(iso) if iso else date.today().isoformat()
 
 
 def seed(force: bool = False) -> int:
@@ -52,14 +46,27 @@ def seed(force: bool = False) -> int:
         return 1
 
     random.seed(7)
-    accounts = sorted(UPLOAD_DIR.glob("U*.json"))
+    # 与 app.py._load_all_accounts 同一套发现规则：只认 U*.json 会漏掉
+    # DU 开头的模拟盘和回退到 "default" 的账户，还会谎称「没有账户 JSON」。
+    accounts = [f for f in sorted(UPLOAD_DIR.glob("*.json"))
+                if not f.name.startswith(".") and f.name != "last_portfolio.json"]
     if not accounts:
         print(f"{UPLOAD_DIR} 下没有账户 JSON，先上传或刷新一次报表。")
         return 1
 
+    skipped = []
     for src in accounts:
         data = json.load(src.open(encoding="utf-8"))
-        base_date = (date.fromisoformat(_as_of(data)) - timedelta(days=7)).isoformat()
+        # 复用 parser.snapshots 的解析器而不是重写一份：AS 的
+        # "January 1, 2026 - June 30, 2026" 里没有 ISO 日期，自写正则会
+        # 静默回退到「今天」，基线就锚错位置 —— 正是本脚本 docstring
+        # 警告过的坑。解析不出时它返回 ""，那种报表没有可靠 as-of 日期，
+        # 跳过比瞎猜一个好。
+        asof = _as_of_date(data)
+        if not asof:
+            skipped.append(src.stem)
+            continue
+        base_date = (date.fromisoformat(asof) - timedelta(days=7)).isoformat()
 
         holdings = [s for s in data.get("stocks", []) if s.get("symbol")]
         resized = set(random.sample([s["symbol"] for s in holdings],
@@ -94,6 +101,8 @@ def seed(force: bool = False) -> int:
         print(f"  {src.stem}: 基线 {base_date} → {out.name}"
               f"（{len(stocks)} 标的，{len(perf)} 条 perf，仓位变动 {'/'.join(sorted(resized))}）")
 
+    for acct in skipped:
+        print(f"  {acct}: 报表里没有可靠的 as-of 日期，跳过")
     print("\n刷新页面即可看到「本周复盘」。看完请跑 clean。")
     return 0
 

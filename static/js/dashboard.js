@@ -1197,8 +1197,17 @@ function renderWeekly(data, accounts, selected) {
   // own navNow so both sides come from exactly the accounts being diffed.
   const navNow = diffs.reduce((s, d) => s + (d.navNow || 0), 0);
   const navBase = diffs.reduce((s, d) => s + (d.navBase || 0), 0);
-  const slice = (data.nav_history || []).filter(p => p.date >= baseDates[0]);
-  const st = navStats(slice, data.cash_flows || []);
+  // Same account-set rule as the NAV delta above, which the delta learned
+  // the hard way: nav_history/cash_flows here cover EVERY loaded account,
+  // while `diffs` covers only the baselined ones. Showing a return built
+  // from the full household beside a delta built from a subset recreates
+  // the same false-household-return the P0 fix removed — one account short
+  // of a baseline is enough. Only publish the statistic when every target
+  // actually produced a diff.
+  const allDiffed = diffs.length === targets.length;
+  const slice = allDiffed
+    ? (data.nav_history || []).filter(p => p.date >= baseDates[0]) : [];
+  const st = allDiffed ? navStats(slice, data.cash_flows || []) : null;
   const navDelta = navNow - navBase;
   $("weekly-summary").innerHTML =
     `<span class="nav-stat"><span class="muted">净值变化</span> <b class="${navDelta >= 0 ? "up" : "down"}">`
@@ -1476,15 +1485,23 @@ function navStats(series, flows) {
   let maxDD = 0, ddStart = pts[0].date, ddEnd = pts[0].date;
   const rets = [];
   for (let i = 1; i < pts.length; i++) {
-    let flow = 0;
-    while (fi < fl.length && fl[fi].date <= pts[i].date) { flow += fl[fi].amount; fi++; }
+    // Accumulate the two directions SEPARATELY. Netting them first would
+    // cancel a deposit against a withdrawal landing in the same interval
+    // (a $50k transfer in and $50k out over one weekend nets to zero) and
+    // both timing conventions below would then be applied to nothing,
+    // distorting the link exactly when the flows were largest.
+    let dep = 0, wd = 0;
+    while (fi < fl.length && fl[fi].date <= pts[i].date) {
+      const amt = fl[fi].amount;
+      if (amt > 0) dep += amt; else wd += amt;
+      fi++;
+    }
     // Deposits use the begin-of-day convention (they join the denominator),
     // withdrawals the end-of-day one (added back to the numerator): both
     // keep the base large. The naive (end − flow) / begin link divides the
     // day's P&L by the pre-deposit base — seed a $5k account with $200k on
     // a red day and it prints a −20% "drawdown", or flips the whole chain
     // negative. Clamp guards the chain's sign against any residual gap.
-    const dep = Math.max(flow, 0), wd = Math.min(flow, 0);
     const denom = pts[i - 1].total + dep;
     let r = denom > 0 ? (pts[i].total - wd) / denom - 1 : 0;
     if (r < -0.99) r = -0.99;
