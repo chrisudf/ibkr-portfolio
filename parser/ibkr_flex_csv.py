@@ -345,10 +345,11 @@ _DIV_CASH_TYPES = {
 
 # "MSFT(US5949181045) Cash Dividend USD 0.83 per Share" → MSFT. Used only when
 # the row itself has no Symbol column filled in. Class shares are spelled with
-# a space ("BRK B(US0846707026) ..."), so allow one trailing class letter —
-# without it the match fails outright and the withholding row behind it gets
-# discarded by the unattributed-tax guard.
-_DIV_SYMBOL_RE = re.compile(r"^([A-Z][A-Z0-9\.]{0,9}(?: [A-Z])?)\s*\(")
+# a space ("BRK B(US0846707026) ..."), so allow one trailing class letter, and
+# the leading character may be a digit — HK tickers are numeric ("0005(...)").
+# Without either the match fails outright and the withholding row behind it
+# gets discarded by the unattributed-tax guard.
+_DIV_SYMBOL_RE = re.compile(r"^([A-Z0-9][A-Z0-9\.]{0,9}(?: [A-Z])?)\s*\(")
 
 # ...and the rate out of the same string: "USD 0.346643 PER SHARE" → 0.346643.
 # Case-insensitive because live Flex output shouts it while the docs don't.
@@ -518,7 +519,11 @@ def _finalize_dividends(account: dict[str, Any]) -> None:
             w[0] += 1 if r["amount"] > 0 else -1
             if r["amount"] > 0:
                 w[1] += r["amount"]  # deterministic tie-break only
-    base_ccy = max(ccy_weight, key=lambda c: tuple(ccy_weight[c])) if ccy_weight else ""
+    # Currency code is the final tie-break: without it an exact tie in both
+    # net count and amount falls through to dict insertion order, so merely
+    # reordering otherwise identical rows would move totals between the main
+    # and foreign buckets. Row-order invariance is a promise this parser keeps.
+    base_ccy = max(ccy_weight, key=lambda c: (*ccy_weight[c], c)) if ccy_weight else ""
     foreign: dict[str, dict[str, float]] = {}
     main_rows: list[dict[str, Any]] = []
     for r in rows:

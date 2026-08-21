@@ -40,8 +40,11 @@ def _parse_option_symbol(symbol: str) -> dict[str, Any] | None:
 # "MSFT(US5949181045) Cash Dividend USD 0.83 per Share" → MSFT. The Activity
 # Statement's Dividends / Withholding Tax sections have no Symbol column, so
 # the ticker has to come out of the description. Class shares are spelled with
-# a space ("BRK B(US0846707026) ..."), hence the optional trailing letter.
-_DIV_SYMBOL_RE = re.compile(r"^([A-Z][A-Z0-9\.]{0,9}(?: [A-Z])?)\s*\(")
+# a space ("BRK B(US0846707026) ..."), hence the optional trailing letter, and
+# the first character may be a digit — HK tickers are numeric ("0005(...)").
+# Rejecting those buckets their gross under "—" and then the unattributed-tax
+# guard drops the matching withholding, overstating net.
+_DIV_SYMBOL_RE = re.compile(r"^([A-Z0-9][A-Z0-9\.]{0,9}(?: [A-Z])?)\s*\(")
 
 # The Activity Statement carries the rate and the income class in the same
 # description string the Flex export splits into columns:
@@ -131,7 +134,11 @@ def _parse_dividends(sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
             w[0] += 1 if r["amount"] > 0 else -1
             if r["amount"] > 0:
                 w[1] += r["amount"]
-    base_ccy = max(ccy_weight, key=lambda c: tuple(ccy_weight[c])) if ccy_weight else ""
+    # Currency code is the final tie-break: without it an exact tie in both
+    # net count and amount falls through to dict insertion order, so merely
+    # reordering otherwise identical rows would move totals between the main
+    # and foreign buckets. Row-order invariance is a promise this parser keeps.
+    base_ccy = max(ccy_weight, key=lambda c: (*ccy_weight[c], c)) if ccy_weight else ""
     foreign: dict[str, dict[str, float]] = {}
     main_rows: list[dict[str, Any]] = []
     for r in rows:

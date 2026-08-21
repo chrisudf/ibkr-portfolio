@@ -9,6 +9,17 @@ const fmtMoney = (v, digits = 0) => {
   const abs = Math.abs(v);
   return sign + "$" + abs.toLocaleString("en-US", { maximumFractionDigits: digits, minimumFractionDigits: digits });
 };
+// fmtMoney hard-codes "$". The dividend panel is denominated in whatever
+// currency the parser elected as that account's base, which is USD for most
+// books but need not be — printing HKD 780 as "$780" is exactly the 1:1
+// conflation the currency segregation exists to prevent, just moved into the
+// label. Empty / USD keeps the bare "$" so nothing changes for the common case.
+const fmtCcy = (v, digits = 0, ccy = "") => {
+  if (!ccy || ccy === "USD") return fmtMoney(v, digits);
+  const sign = v < 0 ? "-" : "";
+  return sign + ccy + " " + Math.abs(v).toLocaleString("en-US",
+    { maximumFractionDigits: digits, minimumFractionDigits: digits });
+};
 const fmtPct = (v, digits = 1) => (v * 100).toFixed(digits) + "%";
 const fmtNum = (v, digits = 2) => Number(v).toLocaleString("en-US", { maximumFractionDigits: digits, minimumFractionDigits: digits });
 
@@ -160,13 +171,28 @@ function mergeAccounts(accounts) {
     const d = a.dividends;
     if (!d || !d.by_symbol || !d.base_currency) continue;
     const v = ccyVotes[d.base_currency] || (ccyVotes[d.base_currency] = [0, 0]);
-    for (const s of d.by_symbol) v[0] += s.count || 0;
+    // NET payment count, matching the parser's own election. by_symbol.count
+    // only tallies positive bookings, so a corrected payout (+780/−780/+780)
+    // would cast two votes here for what the parser counts as one — enough to
+    // elect the wrong merged base and push the real base's totals into the
+    // foreign bucket. Signed gross events give the same −1 for a reversal the
+    // parser applies; count stays as the fallback for legacy payloads that
+    // predate the per-event currency field.
+    const evs = (d.events || []).filter(e => e.kind === "gross" && e.currency);
+    if (evs.length) {
+      for (const e of evs) v[0] += e.amount > 0 ? 1 : -1;
+    } else {
+      for (const s of d.by_symbol) v[0] += s.count || 0;
+    }
     v[1] += Math.abs(d.gross || 0);
   }
+  // Currency code breaks an exact count+amount tie so the election can't turn
+  // on object key order — same determinism the parsers guarantee.
   const divBase = Object.keys(ccyVotes).reduce((best, c) => {
     if (!best) return c;
     const [a, b] = [ccyVotes[best], ccyVotes[c]];
-    return (b[0] > a[0] || (b[0] === a[0] && b[1] > a[1])) ? c : best;
+    return (b[0] > a[0] || (b[0] === a[0] && b[1] > a[1])
+      || (b[0] === a[0] && b[1] === a[1] && c > best)) ? c : best;
   }, "");
   const otherBase = (d) =>
     !!(d.base_currency && divBase && d.base_currency !== divBase);
@@ -680,6 +706,9 @@ function computeMargin(data, priceBook) {
     assumedShare: requirement > 0 ? assumedRequirement / requirement : 0,
     unparsedContracts,
     unparsedMv,
+    // Magnitude of the short-stock deduction, so the panel can name the term
+    // only when it actually applies.
+    shortStockCharge: -shortStock * 1.3,
     rows: Object.values(byUnderlying).sort((a, b) => b.requirement - a.requirement),
   };
 }
@@ -692,13 +721,13 @@ function mergeMargin(parts) {
   const out = {
     requirement: 0, notional: 0, premium: 0, totalNav: 0, excess: 0, borrowed: 0,
     assumedContracts: 0, assumedRequirement: 0, unparsedContracts: 0,
-    unparsedMv: 0, rows: [],
+    unparsedMv: 0, shortStockCharge: 0, rows: [],
   };
   const byU = {};
   for (const m of parts) {
     for (const k of ["requirement", "notional", "premium", "totalNav", "excess",
                      "borrowed", "assumedContracts", "assumedRequirement",
-                     "unparsedContracts", "unparsedMv"]) {
+                     "unparsedContracts", "unparsedMv", "shortStockCharge"]) {
       out[k] += m[k] || 0;
     }
     for (const r of m.rows) {
@@ -746,12 +775,22 @@ function renderMargin(data, accounts) {
   const tone = pct >= 60 ? "var(--red)" : pct >= 30 ? "var(--amber)" : "var(--green)";
   gauge.innerHTML = `<div class="margin-gauge-fill" style="width:${pct}%;background:${tone}"></div>`;
   const gaugeNote = $("margin-gauge-note");
+  // The printed formula has to list every term actually deducted, or an
+  // account carrying short stock / unparsed contracts sees a number that
+  // can't be reconciled with the text sitting next to it. Both extra terms
+  // are conditional, so they only show when they're non-zero.
+  const excessTerms = "现金 + 75% 正股"
+    + (m.shortStockCharge > 0 ? " − 130% 做空正股" : "")
+    + (m.unparsedMv > 0 ? " − 未解析合约权利金" : "")
+    + " − 占用";
   gaugeNote.textContent =
     `账户总值 ${fmtMoney(m.totalNav)} · 估算剩余流动性 ${fmtMoney(m.excess)}`
-    + `（现金 + 75% 正股 − 占用）`;
+    + `（${excessTerms}）`;
   gaugeNote.title =
     "近似 IBKR 的 Excess Liquidity：Reg-T 下长期权（含 LEAP）没有抵押价值、"
-    + "正股按 25% 维持保证金扣减，所以不是「净值 − 占用」。";
+    + "正股按 25% 维持保证金扣减，所以不是「净值 − 占用」。"
+    + "做空正股不是抵押品 —— 卖出所得已 100% 记在现金里，Reg-T 再加约 30% "
+    + "维持保证金，故按 130% 扣减。";
 
   const note = $("margin-note");
   note.textContent = (m.assumedContracts > 0
@@ -1048,9 +1087,12 @@ function renderDividends(data) {
   empty.hidden = true;
   body.hidden = false;
 
-  $("div-net").textContent = fmtMoney(div.net, 2);
+  // Every money value below is dividend cash in the elected base currency.
+  const fm = (v, d) => fmtCcy(v, d, div.base_currency);
+
+  $("div-net").textContent = fm(div.net, 2);
   const foreignCcys = Object.keys(div.foreign || {});
-  $("div-gross").textContent = `税前 ${fmtMoney(div.gross, 2)} · 预扣税 ${fmtMoney(div.tax, 2)}`
+  $("div-gross").textContent = `税前 ${fm(div.gross, 2)} · 预扣税 ${fm(div.tax, 2)}`
     + (foreignCcys.length
       ? ` · 另有 ${foreignCcys.map(c => `${c} ${fmtNum(div.foreign[c].net, 2)}`).join(" / ")}`
         + ` 未计入（多币种不换汇）`
@@ -1073,7 +1115,7 @@ function renderDividends(data) {
     mixed: "多来源（各账户报表类型不同）",
   }[div.source] || "报表";
   $("div-note").textContent = `${data.statement?.Period || ""} · 数据来自 ${sourceLabel}`
-    + (accrued ? ` · 另有应计未付 ${fmtMoney(accrued, 2)}` : "");
+    + (accrued ? ` · 另有应计未付 ${fm(accrued, 2)}` : "");
 
   // Monthly bars
   const months = monthRange(div.by_month || [], data.statement?.Period);
@@ -1082,15 +1124,15 @@ function renderDividends(data) {
   chart.innerHTML = months.map(m => {
     const h = Math.max(2, Math.abs(m.net) / maxNet * 100);
     const label = m.month.slice(2).replace("-", "/");
-    return `<div class="div-bar" title="${m.month} 净分红 ${fmtMoney(m.net, 2)}">
+    return `<div class="div-bar" title="${m.month} 净分红 ${fm(m.net, 2)}">
         <div class="div-bar-fill" style="height:${h}%"></div>
         <div class="div-bar-label">${label}</div>
       </div>`;
   }).join("");
   const best = months.reduce((a, b) => (b.net > (a?.net ?? -Infinity) ? b : a), null);
   $("div-chart-note").textContent = months.length
-    ? `${months.length} 个月 · 月均 ${fmtMoney(div.net / months.length, 2)}`
-      + (best && best.net > 0 ? ` · 最高 ${best.month} ${fmtMoney(best.net, 2)}` : "")
+    ? `${months.length} 个月 · 月均 ${fm(div.net / months.length, 2)}`
+      + (best && best.net > 0 ? ` · 最高 ${best.month} ${fm(best.net, 2)}` : "")
     : "";
 
   const tbody = $("div-body");
@@ -1154,9 +1196,9 @@ function renderDividends(data) {
           + `<div class="yield-days">${days ? days + " 天，太短" : ""}</div>`
         : `<span class="muted">—</span>`;
     const yieldTitle = (cp && dps)
-      ? `每股股息 ${fmtMoney(dpsIncome, 4)}`
-        + (nonDiv ? `（已扣除每股 ${fmtMoney(dps - dpsIncome, 4)} 的资本利得分配）` : "")
-        + ` ÷ ${rebuilt ? "重建" : "平均"}成本 ${fmtMoney(cp, 2)}`
+      ? `每股股息 ${fm(dpsIncome, 4)}`
+        + (nonDiv ? `（已扣除每股 ${fm(dps - dpsIncome, 4)} 的资本利得分配）` : "")
+        + ` ÷ ${rebuilt ? "重建" : "平均"}成本 ${fm(cp, 2)}`
         + ` = 实收 ${fmtPct(realized, 2)}`
         + (days ? `（${days} 天）` : "")
         + (annual ? ` · 年化 ${fmtPct(annual, 2)}` : days ? " · 不足 30 天，不做年化" : "")
@@ -1177,19 +1219,19 @@ function renderDividends(data) {
           : "建仓在报表期间之前，本期数据里没有买入记录，无法重建成本";
     tr.innerHTML = `
       <td><b>${s.symbol}</b>${soldTag}${nonDivShare >= 0.05 ? ` <span class="tag tag-capgain" title="${
-        `其中 ${fmtMoney(nonDiv, 2)}（占税前 ${fmtPct(nonDivShare, 0)}）是资本利得/资本返还分配，`
+        `其中 ${fm(nonDiv, 2)}（占税前 ${fmtPct(nonDivShare, 0)}）是资本利得/资本返还分配，`
         + `不是股息收入。已计入税前与净额，但不计入成本股息率。`
       }">含资本利得</span>` : ""}${missed ? ` <span class="tag tag-miss" title="${
-        `期间平均持仓 ${fmtNum(avgShares, 2)} 股，若整段持有本可收 ${fmtMoney(should, 2)}，`
-        + `实收 ${fmtMoney(s.gross, 2)}，差 ${fmtMoney(shortfall, 2)}。`
+        `期间平均持仓 ${fmtNum(avgShares, 2)} 股，若整段持有本可收 ${fm(should, 2)}，`
+        + `实收 ${fm(s.gross, 2)}，差 ${fm(shortfall, 2)}。`
         + `常见原因：除息日前清仓（当期分红作废），或期间才建仓（错过前几次）。`
-      }">除息日缺口 ${fmtMoney(shortfall, 0)}</span>` : ""}</td>
+      }">除息日缺口 ${fm(shortfall, 0)}</span>` : ""}</td>
       <td class="num">${s.count}</td>
-      <td class="num muted">${fmtMoney(s.gross, 2)}</td>
-      <td class="num ${s.tax < 0 ? "down" : "muted"}">${s.tax ? fmtMoney(s.tax, 2) : "—"}</td>
-      <td class="num"><b>${fmtMoney(s.net, 2)}</b></td>
+      <td class="num muted">${fm(s.gross, 2)}</td>
+      <td class="num ${s.tax < 0 ? "down" : "muted"}">${s.tax ? fm(s.tax, 2) : "—"}</td>
+      <td class="num"><b>${fm(s.net, 2)}</b></td>
       <td class="num">${fmtPct(div.net ? s.net / div.net : 0, 1)}</td>
-      <td class="num muted">${dps ? fmtMoney(dps, 4) : "—"}</td>
+      <td class="num muted">${dps ? fm(dps, 4) : "—"}</td>
       <td class="num" title="${yieldTitle}">${yieldCell}</td>
       <td class="muted">${s.last_date || "—"}</td>
     `;

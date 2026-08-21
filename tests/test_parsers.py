@@ -257,6 +257,38 @@ def test_class_share_ticker_and_withholding():
     assert all(x["symbol"] != "—" for x in acct["dividends"]["by_symbol"])
 
 
+def test_numeric_leading_ticker_and_withholding():
+    """HK tickers are numeric ("0005"). A first-character [A-Z] requirement
+    bucketed their gross under "—" and then the unattributed-tax guard threw
+    the matching withholding away, overstating net."""
+    acct = parse([
+        _pnl(), _nav(),
+        (CASH_HDR, [
+            _cash_div(780.00, "0005(HK0000005000) Cash Dividend HKD 2.00 per"
+                      " Share (Ordinary Dividend)", ccy="HKD"),
+            _cash_div(-78.00, "0005(HK0000005000) Cash Dividend HKD 2.00 per"
+                      " Share - HK Tax", ccy="HKD", typ="Withholding Tax"),
+        ]),
+    ])
+    ev = acct["dividends"]["events"]
+    assert {e["symbol"] for e in ev} == {"0005"}     # was "—" before
+    assert any(e["kind"] == "tax" for e in ev)       # was discarded before
+
+
+def test_base_currency_tie_break_is_deterministic():
+    """An exact tie in net count AND amount must not fall through to dict
+    insertion order — reordering equal rows would otherwise move totals
+    between the main and foreign buckets."""
+    usd = _cash_div(100.00, "AAA(US0000000001) Cash Dividend USD 1.00 per"
+                    " Share (Ordinary Dividend)", ccy="USD")
+    hkd = _cash_div(100.00, "BBB(HK0000000002) Cash Dividend HKD 1.00 per"
+                    " Share (Ordinary Dividend)", ccy="HKD")
+    a = parse([_pnl(), _nav(), (CASH_HDR, [usd, hkd])])
+    b = parse([_pnl(), _nav(), (CASH_HDR, [hkd, usd])])
+    assert a["dividends"]["base_currency"] == b["dividends"]["base_currency"]
+    assert abs(a["dividends"]["gross"] - b["dividends"]["gross"]) < 1e-9
+
+
 def test_interest_withholding_still_skipped():
     acct = parse([
         _pnl(), _nav(),
