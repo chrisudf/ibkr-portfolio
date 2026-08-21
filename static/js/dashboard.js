@@ -595,6 +595,9 @@ function render(data) {
   // NAV history (equity curve + drawdown/vol stats)
   renderNavHistory(data);
 
+  // Weekly recap (per-underlying movers vs the ~7-day-old snapshot)
+  renderWeekly(data, currentDataRef.allAccounts, currentDataRef.selected);
+
   // Treemap
   renderTreemap(stocks);
 
@@ -1003,6 +1006,183 @@ function renderMargin(data, accounts) {
 }
 
 /* ---------------------------------------------------------------------------
+ * Weekly recap — what moved this week, per underlying.
+ *
+ * Raw material: dated snapshots the server records on every refresh/upload
+ * (uploads/{acct}.snapshots.jsonl, attached to the payload as `snapshots`).
+ * The recap diffs the live book against the snapshot closest to seven days
+ * back. P&L per underlying = Δunrealized (position-based, clean) +
+ * Δrealized (rolling-window cumulative — a trade dropping off the window's
+ * far end can distort it, which the panel footnote admits).
+ * ------------------------------------------------------------------------- */
+
+const SNAP_MIN_GAP = 5, SNAP_TARGET_GAP = 7, SNAP_MAX_GAP = 16;
+
+// The live payload reduced to the exact shape the server snapshots.
+function liveSnapshot(data) {
+  const hist = data.nav_history || [];
+  const stocks = {};
+  for (const s of data.stocks || []) {
+    stocks[s.symbol] = [s.quantity, s.close_price, s.value, s.unrealized_pl];
+  }
+  const perf = {};
+  for (const [sym, p] of Object.entries(data.performance?.by_symbol || {})) {
+    perf[sym] = [p.realized_total || 0, p.unrealized_total || 0,
+                 p.asset_category === "Stocks" ? "S" : "O"];
+  }
+  return {
+    date: hist.length ? hist[hist.length - 1].date : "",
+    nav: data.nav?.total || 0,
+    stocks, perf,
+  };
+}
+
+function pickBaseline(snapshots, curDate) {
+  if (!curDate) return null;
+  const cur = Date.parse(curDate);
+  let best = null;
+  for (const s of snapshots || []) {
+    const gap = Math.round((cur - Date.parse(s.date)) / DAY_MS);
+    if (gap < SNAP_MIN_GAP || gap > SNAP_MAX_GAP) continue;
+    if (!best || Math.abs(gap - SNAP_TARGET_GAP) < Math.abs(best.gap - SNAP_TARGET_GAP)) {
+      best = { snap: s, gap };
+    }
+  }
+  return best;
+}
+
+function weeklyDiff(current, snapshots) {
+  const base = pickBaseline(snapshots, current.date);
+  if (!base) return null;
+  const rows = {};
+  const R = (u) => rows[u] || (rows[u] = {
+    u, pnlU: 0, pnlR: 0, pxPct: null, qtyNow: 0, qtyBase: 0,
+  });
+  // P&L per underlying: stock rows key by their own symbol, option rows by
+  // the underlying pulled from the contract description.
+  const keys = new Set([
+    ...Object.keys(current.perf || {}), ...Object.keys(base.snap.perf || {}),
+  ]);
+  for (const k of keys) {
+    const now = (current.perf || {})[k] || [0, 0, null];
+    const was = (base.snap.perf || {})[k] || [0, 0, null];
+    const kind = now[2] || was[2] || "O";
+    const u = kind === "S" ? k : optionUnderlying(k);
+    if (CASH_EQUIVALENTS.has(u)) continue;  // SGOV drift is not a "mover"
+    const r = R(u);
+    r.pnlR += now[0] - was[0];
+    r.pnlU += now[1] - was[1];
+  }
+  const syms = new Set([
+    ...Object.keys(current.stocks || {}), ...Object.keys(base.snap.stocks || {}),
+  ]);
+  for (const sym of syms) {
+    if (CASH_EQUIVALENTS.has(sym)) continue;
+    const now = (current.stocks || {})[sym];
+    const was = (base.snap.stocks || {})[sym];
+    const r = R(sym);
+    r.qtyNow = now ? now[0] : 0;
+    r.qtyBase = was ? was[0] : 0;
+    if (now && was && now[1] > 0 && was[1] > 0) r.pxPct = now[1] / was[1] - 1;
+  }
+  const list = Object.values(rows)
+    .map(r => ({ ...r, total: r.pnlU + r.pnlR }))
+    .filter(r => Math.abs(r.total) >= 1 || r.pxPct != null)
+    .sort((a, b) => b.total - a.total);
+  return { baseDate: base.snap.date, days: base.gap, navBase: base.snap.nav, rows: list };
+}
+
+function positionTag(r) {
+  if (r.qtyBase > 1e-9 && r.qtyNow <= 1e-9) return "清仓";
+  if (r.qtyBase <= 1e-9 && r.qtyNow > 1e-9) return "新建";
+  if (r.qtyNow > r.qtyBase + 1e-9) return "加仓";
+  if (r.qtyNow < r.qtyBase - 1e-9) return "减仓";
+  return "";
+}
+
+function renderWeekly(data, accounts, selected) {
+  const panel = $("weekly-panel");
+  const targets = selected === "ALL"
+    ? Object.values(accounts || {})
+    : [data];
+  const anySnapshots = targets.some(a => (a.snapshots || []).length);
+  if (!anySnapshots) { panel.hidden = true; return; }
+  panel.hidden = false;
+
+  const diffs = [];
+  let fresh = 0;
+  for (const a of targets) {
+    const d = weeklyDiff(liveSnapshot(a), a.snapshots || []);
+    if (d) diffs.push(d); else if ((a.snapshots || []).length) fresh++;
+  }
+  const winnersEl = $("weekly-winners"), losersEl = $("weekly-losers");
+  if (!diffs.length) {
+    $("weekly-note").textContent = "";
+    $("weekly-summary").innerHTML =
+      `<span class="muted">快照积累中 —— 最早基线距今不足 ${SNAP_MIN_GAP} 天，`
+      + `下次刷新间隔够一周后这里会出现对比。</span>`;
+    winnersEl.innerHTML = ""; losersEl.innerHTML = "";
+    return;
+  }
+
+  // Amounts are additive across accounts; per-account baselines may differ
+  // by a day or two, which the note reflects with the widest window.
+  const merged = {};
+  for (const d of diffs) {
+    for (const r of d.rows) {
+      const t = merged[r.u] || (merged[r.u] = {
+        u: r.u, pnlU: 0, pnlR: 0, total: 0, pxPct: null, qtyNow: 0, qtyBase: 0,
+      });
+      t.pnlU += r.pnlU; t.pnlR += r.pnlR; t.total += r.total;
+      t.qtyNow += r.qtyNow; t.qtyBase += r.qtyBase;
+      if (t.pxPct == null) t.pxPct = r.pxPct;  // same security, same move
+    }
+  }
+  const rows = Object.values(merged).sort((a, b) => b.total - a.total);
+  const winners = rows.filter(r => r.total > 0).slice(0, 5);
+  const losers = rows.filter(r => r.total < 0).reverse().slice(0, 5);
+
+  const baseDates = diffs.map(d => d.baseDate).sort();
+  const curDate = liveSnapshot(targets[0]).date || "";
+  $("weekly-note").textContent =
+    `${baseDates[0]} → ${curDate || "最新"} · ${diffs[0].days} 天`
+    + (fresh ? ` · ${fresh} 个账户快照尚新未计入` : "");
+
+  // Headline: NAV change over the same window, plus the flow-stripped TWR
+  // from the (merged) nav_history slice.
+  const navNow = targets.reduce((s, a) => s + (a.nav?.total || 0), 0);
+  const navBase = diffs.reduce((s, d) => s + (d.navBase || 0), 0);
+  const slice = (data.nav_history || []).filter(p => p.date >= baseDates[0]);
+  const st = navStats(slice, data.cash_flows || []);
+  const navDelta = navNow - navBase;
+  $("weekly-summary").innerHTML =
+    `<span class="nav-stat"><span class="muted">净值变化</span> <b class="${navDelta >= 0 ? "up" : "down"}">`
+    + `${navDelta >= 0 ? "+" : ""}${fmtMoney(navDelta)}</b></span>`
+    + (st ? `<span class="nav-stat"><span class="muted">期间收益(剔除出入金)</span> `
+      + `<b class="${st.periodReturn >= 0 ? "up" : "down"}">${st.periodReturn >= 0 ? "+" : ""}`
+      + `${fmtPct(st.periodReturn, 2)}</b></span>` : "")
+    + `<span class="nav-stat"><span class="muted">上涨/下跌标的</span> `
+    + `<b>${rows.filter(r => r.total > 0).length} / ${rows.filter(r => r.total < 0).length}</b></span>`;
+
+  const maxAbs = Math.max(...rows.map(r => Math.abs(r.total)), 1);
+  const bar = (r) => {
+    const tag = positionTag(r);
+    const px = r.pxPct != null
+      ? `${r.pxPct >= 0 ? "+" : ""}${fmtPct(r.pxPct, 1)}` : "";
+    const meta = [px, tag].filter(Boolean).join(" · ");
+    return `<div class="wk-row">
+      <span class="wk-sym"><b>${r.u}</b></span>
+      <div class="wk-bar"><div class="wk-fill ${r.total >= 0 ? "pos" : "neg"}"
+        style="width:${Math.max(3, Math.abs(r.total) / maxAbs * 100)}%"></div></div>
+      <span class="wk-val ${r.total >= 0 ? "up" : "down"}">${r.total >= 0 ? "+" : ""}${fmtMoney(r.total, 0)}</span>
+      <span class="wk-meta muted">${meta}</span>
+    </div>`;
+  };
+  winnersEl.innerHTML = winners.map(bar).join("") || '<div class="muted">无</div>';
+  losersEl.innerHTML = losers.map(bar).join("") || '<div class="muted">无</div>';
+}
+
+/* ---------------------------------------------------------------------------
  * Cluster exposure — names that move together managed as one position.
  *
  * The mapping lives in static/clusters.json ({"AI-infra": ["RKLB", ...]}),
@@ -1280,6 +1460,9 @@ function navStats(series, flows) {
     maxDD, ddStart, ddEnd,
     curDD: 1 - index / peak,
     annVol, annRet,
+    // Un-annualized chained return over the series — what a short window
+    // (the weekly recap) actually wants; annualizing 5 days is noise.
+    periodReturn: index - 1,
     // rf=0 return/vol — labelled as such, not passed off as a true Sharpe.
     retOverVol: annVol > 0 ? annRet / annVol : 0,
     calmar: maxDD > 0 ? annRet / maxDD : 0,

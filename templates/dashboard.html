@@ -83,6 +83,29 @@
           曲线本身画的是原始净值。窗口 = 报表期间，旧数据需重新「刷新 IBKR」后才有此面板。</div>
       </section>
 
+      <!-- Weekly recap -->
+      <section class="panel" id="weekly-panel" hidden>
+        <div class="panel-head">
+          <h2>本周复盘</h2>
+          <span class="panel-note" id="weekly-note"></span>
+        </div>
+        <div class="weekly-summary" id="weekly-summary"></div>
+        <div class="dual-list">
+          <div>
+            <h3 class="up">本周赢家 Top 5</h3>
+            <div id="weekly-winners" class="weekly-bars"></div>
+          </div>
+          <div>
+            <h3 class="down">本周输家 Top 5</h3>
+            <div id="weekly-losers" class="weekly-bars"></div>
+          </div>
+        </div>
+        <div class="margin-foot">按标的合并该 ticker 的股票 + 全部期权腿：盈亏 = 浮动盈亏变化 + 已实现变化
+          （权利金衰减、roll、行权都计入），分红不计入。已实现变化取自滚动一年窗口，若约一年前
+          同一周有大额平仓会失真。价格列只对持有正股的标的显示。快照在每次刷新/上传时自动留存，
+          对比基线取 5–16 天前最接近 7 天的一份。</div>
+      </section>
+
       <!-- Treemap -->
       <section class="panel">
         <div class="panel-head">

@@ -21,6 +21,7 @@ from flask import Flask, jsonify, render_template, request
 from parser import parse_ibkr_auto, parse_ibkr_pdf
 from parser.flex_fetch import FlexFetchError, fetch_one, parse_accounts_env
 from parser.ibkr_flex_csv import describe_sections
+from parser.snapshots import load_snapshots, record_snapshot
 
 BASE_DIR = Path(__file__).parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -92,6 +93,12 @@ def _save_accounts(payload: dict) -> tuple[list[str], list[str]]:
             except OSError:
                 pass
             raise
+        # Weekly-recap raw material. A snapshot failure must never fail the
+        # upload that produced perfectly good account data.
+        try:
+            record_snapshot(UPLOAD_DIR, acct_id, data)
+        except Exception:
+            app.logger.exception("snapshot record failed for %s", acct_id)
         saved.append(acct_id)
     return saved, skipped
 
@@ -117,6 +124,9 @@ def _load_all_accounts() -> dict:
                 accounts[path.stem] = json.load(f)
         except (OSError, json.JSONDecodeError):
             continue
+        # Attach the snapshot series (weekly recap baseline candidates).
+        # Read-time attach keeps the account JSON itself snapshot-free.
+        accounts[path.stem]["snapshots"] = load_snapshots(UPLOAD_DIR, path.stem)
     # Backward compat: migrate the legacy single-portfolio file if present
     # and no per-account files exist yet.
     if not accounts and LEGACY_STATE_FILE.exists():
