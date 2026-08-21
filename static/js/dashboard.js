@@ -178,7 +178,12 @@ function mergeAccounts(accounts) {
     // foreign bucket. Signed gross events give the same −1 for a reversal the
     // parser applies; count stays as the fallback for legacy payloads that
     // predate the per-event currency field.
-    const evs = (d.events || []).filter(e => e.kind === "gross" && e.currency);
+    // Only the account's OWN base-currency payouts vote for it — `events`
+    // carries its foreign rows too, and those belong to their own currency,
+    // not to this account's base. (by_symbol, the fallback, already holds
+    // main rows only, which is why the count version needed no such filter.)
+    const evs = (d.events || []).filter(
+      e => e.kind === "gross" && e.currency === d.base_currency);
     if (evs.length) {
       for (const e of evs) v[0] += e.amount > 0 ? 1 : -1;
     } else {
@@ -199,6 +204,35 @@ function mergeAccounts(accounts) {
 
   const divSym = {}, divMonth = {}, divForeign = {};
   let divGross = 0, divTax = 0, divNonDiv = 0, divSource = "";
+
+  // Ingest one raw event into the merged aggregates. Only needed for accounts
+  // whose own elected base differs from the merged one: their by_symbol /
+  // by_month sums are denominated in the wrong currency and can't be added,
+  // but individual payouts they made IN the merged base are ordinary
+  // merged-base cash. Mirrors _finalize_dividends' per-row logic so the two
+  // paths can't drift.
+  const ingestEvent = (e) => {
+    const t = divSym[e.symbol] || (divSym[e.symbol] = {
+      symbol: e.symbol, gross: 0, tax: 0, net: 0, count: 0,
+      per_share: 0, per_share_ordinary: 0, non_dividend: 0,
+      rate_missing: 0, last_date: "",
+    });
+    if (e.kind === "gross") {
+      divGross += e.amount; t.gross += e.amount;
+      if (e.amount > 0) t.count += 1;                       // reversals aren't payments
+      if (e.income_class !== "ordinary") { t.non_dividend += e.amount; divNonDiv += e.amount; }
+      if (!e.per_share && e.amount > 0) t.rate_missing += 1;
+    } else {
+      divTax += e.amount; t.tax += e.amount;
+    }
+    t.net = t.gross + t.tax;
+    if (e.date > t.last_date) t.last_date = e.date;
+    const mk = (e.date || "").slice(0, 7);
+    const m = divMonth[mk] || (divMonth[mk] = { month: mk, gross: 0, tax: 0, net: 0 });
+    if (e.kind === "gross") m.gross += e.amount; else m.tax += e.amount;
+    m.net = m.gross + m.tax;
+  };
+
   for (const a of list) {
     const d = a.dividends;
     if (!d || !d.by_symbol) continue;
@@ -206,7 +240,12 @@ function mergeAccounts(accounts) {
       : (d.source && d.source !== divSource ? "mixed" : divSource);
     // Foreign-currency payouts are excluded from every total, so summing the
     // per-currency buckets across accounts is safe — they're plain cash.
+    // One exception: a bucket denominated in the MERGED base isn't foreign
+    // here at all. An HKD-dominant account files its USD payouts under
+    // foreign.USD; if another account makes USD the merged base, that cash is
+    // ordinary merged-base income and gets re-ingested from events below.
     for (const [c, f] of Object.entries(d.foreign || {})) {
+      if (c === divBase) continue;
       const t = divForeign[c] || (divForeign[c] = { gross: 0, tax: 0, net: 0, count: 0 });
       t.gross += f.gross; t.tax += f.tax; t.net += f.net; t.count += f.count || 0;
     }
@@ -216,6 +255,11 @@ function mergeAccounts(accounts) {
         || (divForeign[d.base_currency] = { gross: 0, tax: 0, net: 0, count: 0 });
       t.gross += d.gross || 0; t.tax += d.tax || 0; t.net += d.net || 0;
       for (const s of d.by_symbol) t.count += s.count || 0;
+      // ...except whatever it paid in the merged base, which does belong in
+      // the totals, by_symbol and by_month like any other account's income.
+      for (const e of d.events || []) {
+        if (e.currency && e.currency === divBase) ingestEvent(e);
+      }
       continue;
     }
     divGross += d.gross || 0;
@@ -253,7 +297,6 @@ function mergeAccounts(accounts) {
   const seenPay = {};
   for (const a of list) {
     const d = a.dividends || {};
-    if (otherBase(d)) continue;  // whole account reported under foreign
     // Occurrence ordinal per account: a cancel + re-book at the same
     // date/rate is (+r, -r, +r) — without the ordinal the re-book collides
     // with the original's key and the union nets to zero, re-dropping in
@@ -263,11 +306,12 @@ function mergeAccounts(accounts) {
     const occ = {};
     for (const e of d.events || []) {
       if (e.kind !== "gross" || !e.per_share) continue;
-      // Foreign-currency rates never joined the account's own by_symbol
-      // sums, so they must not join the union either — an AUD rate divided
-      // by a USD cost is not a yield.
-      const base = d.base_currency || "";
-      if (e.currency && base && e.currency !== base) continue;
+      // Rates outside the MERGED base never joined the merged by_symbol sums,
+      // so they must not join the union either — an AUD rate divided by a USD
+      // cost is not a yield. Testing against divBase rather than the account's
+      // own base is what lets an other-base account still contribute the rates
+      // of the payouts it made in the merged base (those did join, above).
+      if (e.currency && divBase && e.currency !== divBase) continue;
       const t = divSym[e.symbol];
       if (!t) continue;
       const pay = `${e.symbol}|${e.date}|${e.per_share}`;
@@ -302,7 +346,16 @@ function mergeAccounts(accounts) {
     // Other-base accounts contribute nothing: their rates are denominated in
     // a currency whose cash never enters the merged gross either.
     const rateBySym = {};
-    if (!otherBase(a.dividends || {})) {
+    if (otherBase(a.dividends || {})) {
+      // by_symbol is denominated in this account's own base, which isn't the
+      // merged one — but the payouts it made in the merged base do count, and
+      // their rates are exactly the ones that joined the merged sums above.
+      for (const e of a.dividends?.events || []) {
+        if (e.kind === "gross" && e.currency === divBase && e.per_share) {
+          rateBySym[e.symbol] = (rateBySym[e.symbol] || 0) + e.per_share;
+        }
+      }
+    } else {
       for (const s of a.dividends?.by_symbol || []) rateBySym[s.symbol] = s.per_share || 0;
     }
     for (const [sym, h] of Object.entries(a.cost_history || {})) {
