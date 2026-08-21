@@ -94,6 +94,12 @@ def _empty_account() -> dict[str, Any]:
         # divide a dividend by. Open Positions only describes what you still
         # hold; this covers what you held and sold.
         "cost_history": {},
+        # Daily NAV series — the NAV section ships one row per trading day
+        # (~262 rows on a 365-day query). Keeping only the latest threw the
+        # whole equity curve away; this is the raw material for drawdown /
+        # volatility / rolling-return stats, a few KB per account.
+        "nav_history": [],  # [{date, total}], date-ascending, built in finalize
+        "_nav_rows": {},    # ReportDate → Total, deduped during the scan; stripped
         "_cash_flows": [],  # raw (date, amount) for IRR; stripped before serialising
         "_cf_ids": set(),   # flow ids already ingested this parse; stripped
         "_cf_synth_seq": {},  # composite-key occurrence counter; stripped
@@ -159,6 +165,10 @@ def _ingest_nav(account: dict[str, Any], row: dict[str, str]) -> None:
     """
     nav = account["nav"]
     rd = row.get("ReportDate", "")
+    # Every dated row joins the history (dict dedupes repeated dates,
+    # later row wins) regardless of arrival order.
+    if rd:
+        account["_nav_rows"][rd] = _to_float(row.get("Total"))
     seen = account.get("_nav_date", "")
     if rd and seen and rd < seen:
         return
@@ -884,13 +894,17 @@ def parse_ibkr_flex_csv(content: str) -> dict[str, Any]:
         acct["nav"]["money_multiplier"] = returns["money_multiplier"]
         acct["nav"]["return_method"] = returns["method"]
         acct["cash_flows"].sort(key=lambda f: (f["date"], f["id"]))
+        acct["nav_history"] = [
+            {"date": _fmt_iso_date(d), "total": v}
+            for d, v in sorted(acct["_nav_rows"].items())
+        ]
         _finalize_dividends(acct)
         _finalize_cost_history(acct)
         # Strip internal scratch state before serialising. _cf_ids is a set
         # and would blow up json.dump if it ever survived to the writer.
         for k in ("_cash_flows", "_cf_ids", "_cf_synth_seq",
                   "_div_cash", "_div_sof", "_div_ids", "_div_synth_seq",
-                  "_sof_seen", "_nav_date", "_starting_cash",
+                  "_sof_seen", "_nav_date", "_nav_rows", "_starting_cash",
                   "_from_date", "_to_date"):
             acct.pop(k, None)
 

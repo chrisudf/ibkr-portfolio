@@ -6,6 +6,9 @@ venv/
 scripts/sync.env
 .DS_Store
 uploads/*.json
+# Per-account snapshot series (weekly recap). Same class of private data
+# as the account JSONs above and *.json does NOT match *.jsonl.
+uploads/*.jsonl
 uploads/*.csv
 uploads/*.pdf
 !uploads/.gitkeep

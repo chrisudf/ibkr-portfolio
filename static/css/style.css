@@ -212,6 +212,10 @@ table.holdings tr:hover td { background: rgba(255,255,255,0.02); }
 .up { color: var(--green); }
 .down { color: var(--red); }
 .muted { color: var(--text-faint); }
+/* The expiry calendar's contract list is the row's actual content — which
+   strikes are short and in what size — not a secondary annotation, so it
+   gets full-contrast text rather than the .muted treatment. */
+.expiry-items { color: var(--text); }
 .tag {
   display: inline-block; padding: 2px 8px; border-radius: 6px;
   font-size: 10px; font-weight: 600; letter-spacing: 0.5px;
@@ -336,3 +340,43 @@ ul.rank .sym { font-weight: 600; }
 .tag-miss { background: rgba(236, 72, 153, 0.15); color: var(--pink); }
 .yield-days { font-size: 10px; color: var(--text-faint); font-weight: 400; margin-top: 2px; }
 .tag-capgain { background: rgba(251, 191, 36, 0.15); color: var(--amber); }
+
+/* NAV history */
+.nav-chart { height: 200px; margin-top: 4px; }
+.nav-chart svg { width: 100%; height: 100%; display: block; }
+.nav-stats {
+  display: flex; flex-wrap: wrap; gap: 8px 22px;
+  margin-top: 12px; font-size: 13px; color: var(--text-dim);
+}
+.nav-stat b { color: var(--text); font-weight: 600; margin-left: 4px; }
+.nav-stat b.up { color: var(--green); }
+.nav-stat b.down { color: var(--red); }
+
+/* Margin gap-stress table */
+.margin-stress { margin-top: 14px; }
+.stress-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.stress-table th, .stress-table td { padding: 7px 10px; text-align: left; }
+.stress-table th { color: var(--text-faint); font-weight: 600; font-size: 12px; border-bottom: 1px solid var(--border); }
+.stress-table td { border-bottom: 1px solid rgba(35,42,66,0.5); }
+.stress-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+.stress-table tr.stress-bust td { color: var(--red); font-weight: 600; }
+
+/* Cluster exposure */
+.holdings td.amber, .holdings td.amber b { color: var(--amber); }
+
+/* Weekly recap */
+.weekly-summary {
+  display: flex; flex-wrap: wrap; gap: 8px 22px;
+  margin-bottom: 14px; font-size: 13px; color: var(--text-dim);
+}
+.wk-row {
+  display: grid;
+  grid-template-columns: 64px 1fr 90px minmax(90px, auto);
+  gap: 10px; align-items: center; padding: 5px 0; font-size: 13px;
+}
+.wk-bar { height: 10px; background: var(--panel-2); border-radius: 5px; overflow: hidden; }
+.wk-fill { height: 100%; border-radius: 5px; }
+.wk-fill.pos { background: var(--green); }
+.wk-fill.neg { background: var(--red); }
+.wk-val { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+.wk-meta { font-size: 12px; }

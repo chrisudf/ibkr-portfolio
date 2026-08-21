@@ -1,5 +1,14 @@
 # 自动同步 IBKR 报表
 
+> **⚠ bash + cron 路径已弃用。** 自动同步现在由 app 内置调度器完成：在
+> `sync.env` 里设 `AUTO_SYNC=daily`（或 `weekly`，可配 `AUTO_SYNC_UTC_HOUR`
+> / `AUTO_SYNC_UTC_DAY`），重启容器即可，无需 crontab。它与「刷新 IBKR」
+> 按钮走同一条 Python 代码路径：同一把节流锁、同一套 token 脱敏、同一份
+> 错误码表（含 1025 锁定识别），且每次尝试的结果显示在 dashboard 顶栏。
+> 弃用原因：bash 脚本自带的重试梯子会把临时的 1001 一路重试到被 IBKR
+> `1025` 拉黑（见 lesson.md 第 11 条），且从面板上完全看不见。
+> 下面的内容仅留档。
+
 `ibkr_sync.sh` 通过 IBKR **Flex Web Service** 拉取你的 Activity Flex Query，
 然后 POST 到 dashboard 的 `/api/upload`。
 

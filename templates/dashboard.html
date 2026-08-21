@@ -71,6 +71,41 @@
         </div>
       </div>
 
+      <!-- NAV history -->
+      <section class="panel" id="nav-history-panel" hidden>
+        <div class="panel-head">
+          <h2>净值曲线</h2>
+          <span class="panel-note" id="nav-history-note"></span>
+        </div>
+        <div id="nav-chart" class="nav-chart"></div>
+        <div id="nav-stats" class="nav-stats"></div>
+        <div class="margin-foot">收益 / 回撤 / 波动按剔除出入金的 TWR 链计算（入金不算涨、出金不算跌）；
+          曲线本身画的是原始净值。窗口 = 报表期间，旧数据需重新「刷新 IBKR」后才有此面板。</div>
+      </section>
+
+      <!-- Weekly recap -->
+      <section class="panel" id="weekly-panel" hidden>
+        <div class="panel-head">
+          <h2>本周复盘</h2>
+          <span class="panel-note" id="weekly-note"></span>
+        </div>
+        <div class="weekly-summary" id="weekly-summary"></div>
+        <div class="dual-list">
+          <div>
+            <h3 class="up">本周赢家 Top 5</h3>
+            <div id="weekly-winners" class="weekly-bars"></div>
+          </div>
+          <div>
+            <h3 class="down">本周输家 Top 5</h3>
+            <div id="weekly-losers" class="weekly-bars"></div>
+          </div>
+        </div>
+        <div class="margin-foot">按标的合并该 ticker 的股票 + 全部期权腿：盈亏 = 浮动盈亏变化 + 已实现变化
+          （权利金衰减、roll、行权都计入），分红不计入。已实现变化取自滚动一年窗口，若约一年前
+          同一周有大额平仓会失真。价格列只对持有正股的标的显示。快照在每次刷新/上传时自动留存，
+          对比基线取 5–16 天前最接近 7 天的一份。</div>
+      </section>
+
       <!-- Treemap -->
       <section class="panel">
         <div class="panel-head">
@@ -88,6 +123,31 @@
         </div>
         <div id="alloc-bar" class="alloc-bar"></div>
         <div id="alloc-legend" class="alloc-legend"></div>
+      </section>
+
+      <!-- Cluster exposure -->
+      <section class="panel" id="cluster-panel" hidden>
+        <div class="panel-head">
+          <h2>标的簇敞口</h2>
+          <span class="panel-note" id="cluster-note"></span>
+        </div>
+        <div class="table-wrap">
+          <table class="holdings">
+            <thead>
+              <tr>
+                <th>簇</th><th>成员</th>
+                <th class="num">正股市值</th>
+                <th class="num">卖put被行权名义</th>
+                <th class="num">合计敞口</th>
+                <th class="num">占净值</th>
+              </tr>
+            </thead>
+            <tbody id="cluster-body"></tbody>
+          </table>
+        </div>
+        <div class="margin-foot">敞口口径 = 正股市值 + 该簇卖出 put 全部被行权需接货的名义（同涨同跌的簇要按
+          一个仓管）。分组在 <b>static/clusters.json</b> 手工维护（簇名 → 标的数组），改完刷新页面；
+          未分组的标的归入「其他」，现金等价物（SGOV/BOXX）不计。占净值 ≥50% 黄 / ≥100% 红。</div>
       </section>
 
       <!-- Holdings table -->
@@ -137,6 +197,28 @@
         </div>
       </section>
 
+      <!-- Expiry calendar -->
+      <section class="panel" id="expiry-panel" hidden>
+        <div class="panel-head">
+          <h2>卖方到期日历</h2>
+          <span class="panel-note" id="expiry-note"></span>
+        </div>
+        <div class="table-wrap">
+          <table class="holdings">
+            <thead>
+              <tr>
+                <th>到期周</th><th class="num">DTE</th><th>卖出合约</th>
+                <th class="num">张数</th><th class="num">权利金负债</th>
+                <th class="num">卖put名义</th><th class="num">ITM</th>
+              </tr>
+            </thead>
+            <tbody id="expiry-body"></tbody>
+          </table>
+        </div>
+        <div class="margin-foot">只列卖出（空头）合约，按到期所在周分组。ITM 按当前正股价判定，
+          无报价的合约计入「价?」。权利金负债 = 平仓需付的当前市值；卖put名义 = 全部被行权需接货的资金。</div>
+      </section>
+
       <!-- Margin usage -->
       <section class="panel" id="margin-panel" hidden>
         <div class="panel-head">
@@ -153,6 +235,7 @@
         <div class="margin-gauge" id="margin-gauge"></div>
         <div class="margin-gauge-note" id="margin-gauge-note"></div>
         <div class="margin-basis" id="margin-basis"></div>
+        <div class="margin-stress" id="margin-stress"></div>
         <div class="table-wrap" style="margin-top:16px">
           <table class="holdings">
             <thead>

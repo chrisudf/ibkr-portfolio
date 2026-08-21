@@ -12,7 +12,9 @@ import logging
 import os
 import re
 import tempfile
+import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 
@@ -21,6 +23,7 @@ from flask import Flask, jsonify, render_template, request
 from parser import parse_ibkr_auto, parse_ibkr_pdf
 from parser.flex_fetch import FlexFetchError, fetch_one, parse_accounts_env
 from parser.ibkr_flex_csv import describe_sections
+from parser.snapshots import load_snapshots, record_snapshot
 
 BASE_DIR = Path(__file__).parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -92,6 +95,12 @@ def _save_accounts(payload: dict) -> tuple[list[str], list[str]]:
             except OSError:
                 pass
             raise
+        # Weekly-recap raw material. A snapshot failure must never fail the
+        # upload that produced perfectly good account data.
+        try:
+            record_snapshot(UPLOAD_DIR, acct_id, data)
+        except Exception:
+            app.logger.exception("snapshot record failed for %s", acct_id)
         saved.append(acct_id)
     return saved, skipped
 
@@ -117,6 +126,9 @@ def _load_all_accounts() -> dict:
                 accounts[path.stem] = json.load(f)
         except (OSError, json.JSONDecodeError):
             continue
+        # Attach the snapshot series (weekly recap baseline candidates).
+        # Read-time attach keeps the account JSON itself snapshot-free.
+        accounts[path.stem]["snapshots"] = load_snapshots(UPLOAD_DIR, path.stem)
     # Backward compat: migrate the legacy single-portfolio file if present
     # and no per-account files exist yet.
     if not accounts and LEGACY_STATE_FILE.exists():
@@ -132,7 +144,16 @@ def get_portfolio():
     accounts = _load_all_accounts()
     if not accounts:
         return jsonify({"empty": True})
-    return jsonify({"accounts": accounts})
+    payload: dict = {"accounts": accounts}
+    # Auto-sync visibility: mode + last attempt/result, so "is the unattended
+    # sync alive" is answerable from the dashboard instead of ssh + logs
+    # (the failure mode that killed the cron era).
+    state = _read_sync_state()
+    if AUTO_SYNC in ("daily", "weekly") or state:
+        # The LIVE env decides the mode shown — a stale state file from a
+        # since-disabled schedule must not keep advertising "每日".
+        payload["sync"] = {**state, "mode": AUTO_SYNC}
+    return jsonify(payload)
 
 
 @app.post("/api/upload")
@@ -174,22 +195,23 @@ def upload():
     return jsonify(resp)
 
 
-@app.post("/api/refresh")
-def refresh():
-    """On-demand IBKR sync triggered by the dashboard button.
+def _run_refresh(trigger: str) -> tuple[dict, int]:
+    """One full IBKR sync pass — shared by the UI button and auto-sync.
 
-    Reads accounts config from the ACCOUNTS env var (same shape the bash
-    script reads from sync.env), fetches every account serially, parses
-    each CSV through parse_ibkr_auto and writes per-account JSON. Returns
-    a per-account result map so the UI can report partial success.
+    Reads accounts config from the ACCOUNTS env var, fetches every account
+    serially, parses each CSV through parse_ibkr_auto and writes per-account
+    JSON. Returns (payload, http_status); the payload carries a per-account
+    result map so callers can report partial success. Button and scheduler
+    share the same lock and cool-down, so they can never hit IBKR
+    concurrently or in quick succession.
     """
     accounts_env = os.environ.get("ACCOUNTS", "").strip()
     if not accounts_env:
-        return jsonify({"error": "ACCOUNTS env var not configured on server"}), 500
+        return {"error": "ACCOUNTS env var not configured on server"}, 500
 
     specs = parse_accounts_env(accounts_env)
     if not specs:
-        return jsonify({"error": "ACCOUNTS env var malformed"}), 500
+        return {"error": "ACCOUNTS env var malformed"}, 500
 
     # Throttle: refuse if another refresh is in flight or one *started* too
     # recently (we don't care whether it succeeded — IBKR throttles by
@@ -198,14 +220,14 @@ def refresh():
     now = time.time()
     with _refresh_lock:
         if _refresh_state["in_progress"]:
-            return jsonify({"error": "refresh already in progress"}), 429
+            return {"error": "refresh already in progress"}, 429
         elapsed = now - _refresh_state["last_started"]
         if elapsed < REFRESH_MIN_INTERVAL_SEC:
             wait = int(REFRESH_MIN_INTERVAL_SEC - elapsed)
-            return jsonify({
+            return {
                 "error": f"too soon — wait {wait}s before refreshing again",
                 "retry_after_sec": wait,
-            }), 429
+            }, 429
         _refresh_state["in_progress"] = True
         _refresh_state["last_started"] = now
 
@@ -251,7 +273,166 @@ def refresh():
             _refresh_state["in_progress"] = False
 
     any_ok = any(r.get("ok") for r in results)
-    return jsonify({"ok": any_ok, "results": results})
+    app.logger.info("[refresh:%s] %s", trigger,
+                    "ok" if any_ok else "all accounts failed")
+    return {"ok": any_ok, "results": results}, 200
+
+
+@app.post("/api/refresh")
+def refresh():
+    """On-demand IBKR sync triggered by the dashboard button."""
+    payload, status = _run_refresh("button")
+    return jsonify(payload), status
+
+
+# --- Auto-sync: the in-app replacement for the retired bash+cron path -------
+#
+# The old crontab ran scripts/ibkr_sync.sh on the host: a separate code path
+# with its own retry ladder that could walk itself into IBKR's 1025 lockout
+# (lesson 11), invisible from the dashboard. This thread reuses _run_refresh
+# verbatim — same fetcher, same token redaction, same PERMANENT_CODES (now
+# including 1025), same throttle as the button — and records every attempt
+# where the UI can show it.
+#
+#   AUTO_SYNC          off (default) | daily | weekly
+#   AUTO_SYNC_UTC_HOUR first attempt at/after this UTC hour (default 9 —
+#                      ≈ after the US close's statement is available)
+#   AUTO_SYNC_UTC_DAY  weekly only: mon..sun (default sat)
+#
+# One attempt per due-day, deliberately with NO automatic retry: a failed
+# pull waits for the next due day (or the manual button) rather than
+# hammering a throttled endpoint into a lockout.
+
+AUTO_SYNC = os.environ.get("AUTO_SYNC", "off").strip().lower()
+SYNC_STATE_FILE = UPLOAD_DIR / ".auto_sync_state.json"
+
+_WEEKDAY_NUM = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+
+
+def _parse_sync_hour(raw: str) -> int:
+    """0-23, defaulting to 9 — a typo in an env file must degrade the
+    schedule, never crash the whole app at import (gunicorn + restart:
+    unless-stopped would turn that into a boot loop taking the dashboard
+    down with it)."""
+    try:
+        hour = int((raw or "").strip().strip('"').strip("'") or 9)
+    except ValueError:
+        app.logger.warning("AUTO_SYNC_UTC_HOUR=%r is not an integer; using 9", raw)
+        return 9
+    if not 0 <= hour <= 23:
+        app.logger.warning("AUTO_SYNC_UTC_HOUR=%r out of 0-23; using 9", raw)
+        return 9
+    return hour
+
+
+def _parse_sync_day(raw: str) -> str:
+    day = ((raw or "").strip().strip('"').strip("'").lower() or "sat")[:3]
+    if day not in _WEEKDAY_NUM:
+        app.logger.warning("AUTO_SYNC_UTC_DAY=%r not mon..sun; using sat", raw)
+        return "sat"
+    return day
+
+
+AUTO_SYNC_UTC_HOUR = _parse_sync_hour(os.environ.get("AUTO_SYNC_UTC_HOUR", "9"))
+AUTO_SYNC_UTC_DAY = _parse_sync_day(os.environ.get("AUTO_SYNC_UTC_DAY", "sat"))
+
+
+def _auto_sync_due(now_utc: datetime, mode: str, hour: int, day: str,
+                   last_attempt_date: str) -> bool:
+    """True when a scheduled attempt should fire — at most once per due-day."""
+    if mode not in ("daily", "weekly"):
+        return False
+    if now_utc.hour < hour:
+        return False
+    if mode == "weekly" and now_utc.weekday() != _WEEKDAY_NUM.get(day, 5):
+        return False
+    return last_attempt_date != now_utc.date().isoformat()
+
+
+def _read_sync_state() -> dict:
+    try:
+        with open(SYNC_STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        return state if isinstance(state, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_sync_state(state: dict) -> None:
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(UPLOAD_DIR), prefix=SYNC_STATE_FILE.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            json.dump(state, out, ensure_ascii=False)
+        os.replace(tmp_name, SYNC_STATE_FILE)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _auto_sync_loop() -> None:
+    app.logger.info("[auto-sync] scheduler on: %s at %02d:00 UTC%s",
+                    AUTO_SYNC, AUTO_SYNC_UTC_HOUR,
+                    f" ({AUTO_SYNC_UTC_DAY})" if AUTO_SYNC == "weekly" else "")
+    while True:
+        time.sleep(60)
+        try:
+            now = datetime.now(timezone.utc)
+            state = _read_sync_state()
+            if not _auto_sync_due(now, AUTO_SYNC, AUTO_SYNC_UTC_HOUR,
+                                  AUTO_SYNC_UTC_DAY, state.get("last_attempt_date", "")):
+                continue
+            # Stamp the attempt BEFORE running: a crash mid-pull must not
+            # turn into a retry loop against a throttled endpoint.
+            today = now.date().isoformat()
+            _write_sync_state({**state, "last_attempt_date": today,
+                               "last_attempt": now.isoformat(timespec="seconds")})
+            payload, status = _run_refresh("auto")
+            if status == 429:
+                # Our OWN throttle/lock refused — zero requests reached IBKR,
+                # so this must not consume the day's single attempt (a button
+                # press at 08:57 would otherwise skip a whole daily/weekly
+                # slot). Restore the state VERBATIM; the next 60s tick retries
+                # once the cool-down passes. The one-attempt-per-day rule
+                # guards IBKR quota, and this branch never spent any.
+                #
+                # Writing a fresh last_attempt here would be a lie in the
+                # header: ok/detail still describe the PREVIOUS run, so the
+                # top bar would pair a just-now timestamp with an older ✓ and
+                # claim a sync that never reached IBKR. prev_date is implicit
+                # in `state` — no field of it changed.
+                _write_sync_state(state)
+                continue
+            ok = status == 200 and bool(payload.get("ok"))
+            detail = "; ".join(
+                f"{r.get('tag', '?')}: {'ok' if r.get('ok') else (r.get('error') or '?')}"
+                for r in payload.get("results", [])
+            ) or (payload.get("error") or "")
+            _write_sync_state({
+                "mode": AUTO_SYNC,
+                "last_attempt_date": today,
+                "last_attempt": now.isoformat(timespec="seconds"),
+                "ok": ok,
+                "detail": detail[:500],
+            })
+            app.logger.info("[auto-sync] %s: %s", "ok" if ok else "FAILED", detail)
+        except Exception:
+            app.logger.exception("[auto-sync] loop error")
+
+
+if AUTO_SYNC in ("daily", "weekly"):
+    # Started at import so an unattended droplet syncs without anyone
+    # opening the page. Under the flask dev reloader the module imports in
+    # TWO processes, and _refresh_lock is per-process memory — the parent's
+    # scheduler could fetch concurrently with a button press served by the
+    # child. Only the serving process (WERKZEUG_RUN_MAIN=true) may start
+    # the thread; under gunicorn (module imported, __name__ != "__main__",
+    # single worker per Dockerfile) production gets exactly one.
+    if os.environ.get("WERKZEUG_RUN_MAIN") == "true" or __name__ != "__main__":
+        threading.Thread(target=_auto_sync_loop, daemon=True, name="auto-sync").start()
 
 
 if __name__ == "__main__":

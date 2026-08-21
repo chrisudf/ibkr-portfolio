@@ -412,12 +412,47 @@ function mergeAccounts(accounts) {
     }
   }
 
+  // NAV history — dates are a union, each account forward-filled from its
+  // own first observation, and the merged curve starts only where EVERY
+  // account has begun reporting (a partial sum would read as a fake crash).
+  // Any account without a history (old JSON) disables the merged curve
+  // rather than misrepresenting the household as one thinner account.
+  // Pre-filter with the same total>0 predicate the single-account stats use:
+  // a padded/blank NAV row parses to 0.0, and forward-filling a zero would
+  // paint a full-NAV one-day crash on the household curve that neither
+  // per-account view shows.
+  const histories = list.map(a => (a.nav_history || []).filter(p => p.total > 0));
+  let nav_history = [];
+  if (histories.length && histories.every(h => h.length)) {
+    const dates = [...new Set(histories.flat().map(p => p.date))].sort();
+    const startDate = histories.map(h => h[0].date).reduce((a, b) => (a > b ? a : b));
+    // Truncate the tail symmetrically: accounts are refreshed independently,
+    // and past the stale one's last observation the merged point would be
+    // "today's A + last week's B" — worse, a deposit booked after B's NAV
+    // series ends would be stripped from a merged NAV that never received
+    // it, printing a fake drawdown at exactly the staleness boundary.
+    const endDate = histories.map(h => h[h.length - 1].date).reduce((a, b) => (a < b ? a : b));
+    const idx = histories.map(() => 0);
+    const lastVal = histories.map(() => 0);
+    for (const d of dates) {
+      histories.forEach((h, i) => {
+        while (idx[i] < h.length && h[idx[i]].date <= d) { lastVal[i] = h[idx[i]].total; idx[i]++; }
+      });
+      if (d < startDate || d > endDate) continue;
+      nav_history.push({ date: d, total: lastVal.reduce((s, v) => s + v, 0) });
+    }
+  }
+  // External flows: plain concat — navStats needs them to strip deposits
+  // out of the merged return chain, and each flow belongs to exactly one
+  // account so no dedupe question arises.
+  const cash_flows = list.flatMap(a => a.cash_flows || []);
+
   // If accounts share the same period (the usual case) collapse to one.
   const periods = [...new Set(list.map(a => a.statement?.Period).filter(Boolean))];
   return {
     account: { Account: "ALL" },
     statement: { Period: periods.length === 1 ? periods[0] : periods.join(" / ") },
-    nav, stocks, options, dividends, cost_history,
+    nav, stocks, options, dividends, cost_history, nav_history, cash_flows,
     performance: {
       realized_total: realizedTotal,
       unrealized_total: unrealizedTotal,
@@ -473,6 +508,7 @@ async function loadPortfolio() {
   // switcher doesn't label it as a masked "default".
   const accounts = payload.accounts || { [payload.account?.Account || "default"]: payload };
   currentDataRef.allAccounts = accounts;
+  currentDataRef.sync = payload.sync || null;
   // Default to the alphabetically-first account (puts U17xxxx ahead of U22xxxx)
   // rather than the merged view — most viewing happens per-account.
   if (!currentDataRef.selected || (currentDataRef.selected !== "ALL" && !accounts[currentDataRef.selected])) {
@@ -498,7 +534,19 @@ function render(data) {
   const acct = account.Account || "";
   const masked = acct === "ALL" ? "总账户" : maskAccountId(acct);
   const period = statement.Period || "";
-  $("account-line").textContent = [masked, period].filter(Boolean).join(" · ") || "已导入";
+  // Auto-sync heartbeat next to the account id — "is the unattended sync
+  // alive" should be answerable at a glance, not by ssh-ing into the box.
+  const sync = currentDataRef.sync;
+  let syncLabel = "";
+  if (sync && sync.mode && sync.mode !== "off") {
+    const cadence = sync.mode === "daily" ? "每日" : "每周";
+    syncLabel = sync.last_attempt
+      ? `自动同步(${cadence}) ${sync.last_attempt.slice(5, 16).replace("T", " ")}Z ${sync.ok ? "✓" : "✗"}`
+      : `自动同步(${cadence}) 待首跑`;
+  }
+  const line = $("account-line");
+  line.textContent = [masked, period, syncLabel].filter(Boolean).join(" · ") || "已导入";
+  line.title = sync && sync.detail ? sync.detail : "";
 
   // KPIs
   $("kpi-nav").textContent = fmtMoney(totalNav);
@@ -557,6 +605,12 @@ function render(data) {
   kpiUnr.classList.toggle("down", unr < 0);
   $("kpi-realized").textContent = `已实现 ${fmtMoney(performance.realized_total)}`;
 
+  // NAV history (equity curve + drawdown/vol stats)
+  renderNavHistory(data);
+
+  // Weekly recap (per-underlying movers vs the ~7-day-old snapshot)
+  renderWeekly(data, currentDataRef.allAccounts, currentDataRef.selected);
+
   // Treemap
   renderTreemap(stocks);
 
@@ -565,6 +619,10 @@ function render(data) {
   const longOptMV = options.filter(o => o.value > 0).reduce((s, o) => s + o.value, 0);
   const shortOptMV = options.filter(o => o.value < 0).reduce((s, o) => s + Math.abs(o.value), 0);
   renderAllocation({ cash: adjCash, stock: adjStock, longOptions: longOptMV, shortOptionsNote: shortOptMV }, totalNav);
+
+  // Cluster exposure (mapping loads async from static/clusters.json; the
+  // panel re-renders once it arrives)
+  renderClusters(data, currentDataRef.clusters);
 
   // Margin — prices are pooled across every loaded account, so pass the whole
   // set rather than just the account being viewed.
@@ -575,6 +633,9 @@ function render(data) {
 
   // Options
   renderOptions(options);
+
+  // Expiry calendar (short options by expiry week)
+  renderExpiries(data, currentDataRef.allAccounts);
 
   // Dividends
   renderDividends(data);
@@ -620,6 +681,10 @@ const MARGIN_FLOOR_PER_SHARE = 2.5;
 // Fallback deliverable for JSONs saved before the parser exported the
 // contract's own Multiplier column; standard US equity options are 100.
 const CONTRACT_MULTIPLIER = 100;
+// Mark-to-strike ratio above which an option without an underlying quote is
+// treated as probably in-the-money. Listed equity options don't carry 10% of
+// strike in pure time value at the DTEs a seller's calendar shows.
+const MARK_ITM_RATIO = 0.10;
 
 // Underlying mark prices, pooled across every loaded account — a price is a
 // market fact, not account data, so a stock held only in U22 still prices a
@@ -644,11 +709,24 @@ function regTPerShare(right, strike, underlying) {
   return Math.max(0.20 * underlying - otm, floorPct, MARGIN_FLOOR_PER_SHARE);
 }
 
-function computeMargin(data, priceBook) {
+// shock: uniform gap applied to every underlying spot AND the stock sleeve
+// (e.g. -0.2 = everything opens 20% down). Option premiums are NOT repriced —
+// in a real gap the short-put mark explodes, so the stressed requirement here
+// is a floor, not a forecast. shock=0 is the live estimate.
+function computeMargin(data, priceBook, shock = 0) {
   const stocks = data.stocks || [];
   const options = data.options || [];
   const nav = data.nav || {};
-  const totalNav = nav.total || (nav.cash + nav.stock + nav.options);
+  // Cash equivalents (SGOV/BOXX) are T-bill parking, not equity — the rest
+  // of the dashboard already reclassifies them as cash, and "T-bills gap
+  // −30%" is not the scenario this table models. Only the true equity
+  // sleeve takes the shock.
+  const cashEq = stocks.reduce(
+    (s, x) => s + (CASH_EQUIVALENTS.has(x.symbol) ? (x.value || 0) : 0), 0);
+  const equitySleeve = (nav.stock || 0) - cashEq;
+  // Stressed NAV moves by the equity sleeve only (options unrepriced, cash fixed).
+  const totalNav = (nav.total || (nav.cash + nav.stock + nav.options))
+    + equitySleeve * shock;
 
   // Shares available to cover short calls, spent longest-dated first.
   const sharesLeft = {};
@@ -682,13 +760,28 @@ function computeMargin(data, priceBook) {
     const qty = Math.abs(o.quantity);
     const mult = o.multiplier || CONTRACT_MULTIPLIER;
     const shares = qty * mult;
-    const mv = Math.abs(o.value);
     const known = priceBook[o.underlying];
     // No price anywhere in the portfolio → assume the contract sits at the
     // money. That lands the estimate on 20% of strike, the middle of the
     // Reg-T range, and every such contract is counted so the UI can say so.
-    const spot = known || o.strike;
+    // The gap shock hits the assumed spot the same as a real one.
+    const spot = (known || o.strike) * (1 + shock);
     if (!known) assumedContracts += qty;
+    // Premium leg. In STRESS scenarios only, the mark is floored at intrinsic
+    // value — an option is never worth less than intrinsic, so after a gap
+    // the unrepriced mark would otherwise make the requirement SHRINK as the
+    // 20%-of-spot leg deflates while a deep-ITM put's real liability
+    // explodes. At shock=0 the floor must stay OFF: the price book pools
+    // spots across accounts refreshed on different dates, and intrinsic
+    // against a stale spot would silently overwrite the statement's own
+    // mark — the live estimate belongs to the statement, gaps belong to
+    // the stress table.
+    const intrinsicPS = o.right === "P"
+      ? Math.max(0, o.strike - spot)
+      : Math.max(0, spot - o.strike);
+    const mv = shock !== 0
+      ? Math.max(Math.abs(o.value), intrinsicPS * shares)
+      : Math.abs(o.value);
 
     let covered = 0;
     if (o.right === "C") {
@@ -740,17 +833,21 @@ function computeMargin(data, priceBook) {
   // into a single 75% haircut would turn the maintenance into a credit.
   // Unparsed short options also come off: their Reg-T leg is unknown (see
   // above) but their market value is a known lower bound on the liability.
-  const stockValue = nav.stock || 0;
+  const stockValue = cashEq + equitySleeve * (1 + shock);
   const longStock = Math.max(stockValue, 0);
   const shortStock = Math.min(stockValue, 0);
+  const excess = (nav.cash || 0) + longStock * 0.75 + shortStock * 1.3
+    - requirement - unparsedMv;
   return {
     requirement,
     notional,
     premium: premium + unparsedMv,
     totalNav,
     pctOfNav: totalNav > 0 ? requirement / totalNav : 0,
-    excess: (nav.cash || 0) + longStock * 0.75 + shortStock * 1.3
-      - requirement - unparsedMv,
+    excess,
+    // Worst single account — for the merged view's margin-call flag, since
+    // IBKR never lets one account's surplus bail out another's deficit.
+    minExcess: excess,
     // Negative cash is a real margin loan — that part accrues interest, unlike
     // collateral tied up behind short options.
     borrowed: Math.max(0, -(nav.cash || 0)),
@@ -777,12 +874,16 @@ function mergeMargin(parts) {
     unparsedMv: 0, shortStockCharge: 0, rows: [],
   };
   const byU = {};
+  out.minExcess = Infinity;
   for (const m of parts) {
     for (const k of ["requirement", "notional", "premium", "totalNav", "excess",
                      "borrowed", "assumedContracts", "assumedRequirement",
                      "unparsedContracts", "unparsedMv", "shortStockCharge"]) {
       out[k] += m[k] || 0;
     }
+    // The sum can look fine while one account is under water — margin calls
+    // fire per account, so the flag must track the worst one.
+    out.minExcess = Math.min(out.minExcess, m.minExcess != null ? m.minExcess : m.excess);
     for (const r of m.rows) {
       // First sight of an underlying seeds the bucket with a copy of the row;
       // that copy already carries the row's values, so it must NOT be added
@@ -860,6 +961,40 @@ function renderMargin(data, accounts) {
       + "买入这些标的的正股后，价格会自动接入，数字随之收紧。"
     : "";
 
+  // Gap stress: same estimator, spot and stock sleeve shocked together.
+  // Premiums are not repriced, so every stressed number is a FLOOR — the
+  // honest headline is "at least this bad", which is the side a crisis
+  // dashboard should err on.
+  const stressFor = (shock) => merged
+    ? mergeMargin(Object.values(accounts || {}).map(a => computeMargin(a, book, shock)))
+    : computeMargin(data, book, shock);
+  const scenarios = [0, -0.10, -0.20, -0.30];
+  const stressRows = scenarios.map(s => ({ s, m: s === 0 ? m : stressFor(s) }));
+  $("margin-stress").innerHTML = `
+    <table class="stress-table">
+      <thead><tr>
+        <th>跳空情景</th><th class="num">保证金占用</th>
+        <th class="num">剩余流动性</th><th class="num">占用/净值</th>
+      </tr></thead>
+      <tbody>${stressRows.map(({ s, m: sm }) => {
+        // Margin calls fire per account: the merged sum can be positive
+        // while one account is already under water.
+        const worst = sm.minExcess != null ? sm.minExcess : sm.excess;
+        const busted = worst < 0;
+        const partial = busted && sm.excess >= 0;
+        return `<tr class="${busted ? "stress-bust" : ""}">
+          <td>${s === 0 ? "现价" : `全线 ${fmtPct(s, 0)}`}</td>
+          <td class="num">${fmtMoney(sm.requirement)}</td>
+          <td class="num ${busted ? "down" : ""}">${fmtMoney(sm.excess)}${
+            busted ? (partial ? ` <span title="跨账户不共享抵押品：至少一个账户的剩余流动性已为负">⚠ 单账户</span>` : " ⚠") : ""
+          }</td>
+          <td class="num">${sm.totalNav > 0 ? fmtPct(sm.requirement / sm.totalNav, 1) : "—"}</td>
+        </tr>`;
+      }).join("")}</tbody>
+    </table>
+    <div class="margin-foot">正股与期权标的同步跳空；权利金负债取 max(现价, 跳空后内在价值) ——
+      不含时间价值与 IV 爆炸，所以每一行仍是下界（实际会更糟）。剩余流动性转负 ⚠ ≈ 追保/强平区。</div>`;
+
   const tbody = $("margin-body");
   tbody.innerHTML = "";
   for (const r of m.rows) {
@@ -881,6 +1016,563 @@ function renderMargin(data, accounts) {
   $("margin-foot").textContent =
     `卖出看跌名义抵押合计 ${fmtMoney(m.notional)}（若全部现金担保需要的资金）· `
     + `当前卖方权利金负债 ${fmtMoney(m.premium)}`;
+}
+
+/* ---------------------------------------------------------------------------
+ * Weekly recap — what moved this week, per underlying.
+ *
+ * Raw material: dated snapshots the server records on every refresh/upload
+ * (uploads/{acct}.snapshots.jsonl, attached to the payload as `snapshots`).
+ * The recap diffs the live book against the snapshot closest to seven days
+ * back. P&L per underlying = Δunrealized (position-based, clean) +
+ * Δrealized (rolling-window cumulative — a trade dropping off the window's
+ * far end can distort it, which the panel footnote admits).
+ * ------------------------------------------------------------------------- */
+
+const SNAP_MIN_GAP = 5, SNAP_TARGET_GAP = 7, SNAP_MAX_GAP = 16;
+
+// The live payload reduced to the exact shape the server snapshots.
+function liveSnapshot(data) {
+  const hist = data.nav_history || [];
+  // As-of date: the NAV series tail (Flex), else the statement period's end
+  // (Activity Statement) — mirroring the server's _as_of_date, so AS-only
+  // accounts can diff too instead of forever showing "快照积累中".
+  let date = hist.length ? hist[hist.length - 1].date : "";
+  if (!date) {
+    const b = parsePeriodBounds(data.statement?.Period);
+    if (b) date = `${b[1].y}-${String(b[1].m).padStart(2, "0")}-${String(b[1].d).padStart(2, "0")}`;
+  }
+  const stocks = {};
+  for (const s of data.stocks || []) {
+    stocks[s.symbol] = [s.quantity, s.close_price, s.value, s.unrealized_pl];
+  }
+  const perf = {};
+  for (const [sym, p] of Object.entries(data.performance?.by_symbol || {})) {
+    perf[sym] = [p.realized_total || 0, p.unrealized_total || 0,
+                 p.asset_category === "Stocks" ? "S" : "O"];
+  }
+  return { date, nav: data.nav?.total || 0, stocks, perf };
+}
+
+function pickBaseline(snapshots, curDate) {
+  if (!curDate) return null;
+  const cur = Date.parse(curDate);
+  let best = null;
+  for (const s of snapshots || []) {
+    const gap = Math.round((cur - Date.parse(s.date)) / DAY_MS);
+    if (gap < SNAP_MIN_GAP || gap > SNAP_MAX_GAP) continue;
+    if (!best || Math.abs(gap - SNAP_TARGET_GAP) < Math.abs(best.gap - SNAP_TARGET_GAP)) {
+      best = { snap: s, gap };
+    }
+  }
+  return best;
+}
+
+function weeklyDiff(current, snapshots) {
+  const base = pickBaseline(snapshots, current.date);
+  if (!base) return null;
+  const rows = {};
+  const R = (u) => rows[u] || (rows[u] = {
+    u, pnlU: 0, pnlR: 0, pxPct: null, qtyNow: 0, qtyBase: 0,
+  });
+  // P&L per underlying: stock rows key by their own symbol, option rows by
+  // the underlying pulled from the contract description.
+  const keys = new Set([
+    ...Object.keys(current.perf || {}), ...Object.keys(base.snap.perf || {}),
+  ]);
+  for (const k of keys) {
+    const now = (current.perf || {})[k] || [0, 0, null];
+    const was = (base.snap.perf || {})[k] || [0, 0, null];
+    const kind = now[2] || was[2] || "O";
+    const u = kind === "S" ? k : optionUnderlying(k);
+    if (CASH_EQUIVALENTS.has(u)) continue;  // SGOV drift is not a "mover"
+    const r = R(u);
+    r.pnlR += now[0] - was[0];
+    // Stocks take ΔU from the position maps below, NOT from perf: a stock
+    // held at the baseline but absent from that statement's MTM section
+    // would otherwise default to 0 and book its entire LIFETIME unrealized
+    // as this week's move (a $2k phantom "winner" in live testing).
+    // Options have no stocks-map entry, so perf is their only source; a
+    // one-sided option row is a genuine open/close, not a data gap.
+    if (kind !== "S") r.pnlU += now[1] - was[1];
+  }
+  const syms = new Set([
+    ...Object.keys(current.stocks || {}), ...Object.keys(base.snap.stocks || {}),
+  ]);
+  for (const sym of syms) {
+    if (CASH_EQUIVALENTS.has(sym)) continue;
+    const now = (current.stocks || {})[sym];
+    const was = (base.snap.stocks || {})[sym];
+    const r = R(sym);
+    r.pnlU += (now ? now[3] : 0) - (was ? was[3] : 0);
+    r.qtyNow = now ? now[0] : 0;
+    r.qtyBase = was ? was[0] : 0;
+    if (now && was && now[1] > 0 && was[1] > 0) {
+      r.pxPct = now[1] / was[1] - 1;
+      // A split between the two snapshots changes the share-count unit:
+      // qty and price move in reciprocal proportion while the value stays
+      // continuous. "-75% · 加仓" would be doubly wrong, so suppress both.
+      if (r.qtyBase > 0 && r.qtyNow > 0) {
+        const qr = r.qtyNow / r.qtyBase, pr = was[1] / now[1];
+        if (Math.abs(qr - 1) > 0.05 && Math.abs(qr / pr - 1) < 0.02) {
+          r.pxPct = null;
+          r.splitLike = true;
+        }
+      }
+    }
+  }
+  const list = Object.values(rows)
+    .map(r => ({ ...r, total: r.pnlU + r.pnlR }))
+    .filter(r => Math.abs(r.total) >= 1 || r.pxPct != null)
+    .sort((a, b) => b.total - a.total);
+  return {
+    baseDate: base.snap.date, days: base.gap,
+    navBase: base.snap.nav, navNow: current.nav, rows: list,
+  };
+}
+
+function positionTag(r) {
+  if (r.splitLike) return "";  // share counts changed unit, not conviction
+  if (r.qtyBase > 1e-9 && r.qtyNow <= 1e-9) return "清仓";
+  if (r.qtyBase <= 1e-9 && r.qtyNow > 1e-9) return "新建";
+  if (r.qtyNow > r.qtyBase + 1e-9) return "加仓";
+  if (r.qtyNow < r.qtyBase - 1e-9) return "减仓";
+  return "";
+}
+
+function renderWeekly(data, accounts, selected) {
+  const panel = $("weekly-panel");
+  const targets = selected === "ALL"
+    ? Object.values(accounts || {})
+    : [data];
+  const anySnapshots = targets.some(a => (a.snapshots || []).length);
+  if (!anySnapshots) { panel.hidden = true; return; }
+  panel.hidden = false;
+
+  const diffs = [];
+  let fresh = 0;
+  for (const a of targets) {
+    const d = weeklyDiff(liveSnapshot(a), a.snapshots || []);
+    if (d) diffs.push(d); else if ((a.snapshots || []).length) fresh++;
+  }
+  const winnersEl = $("weekly-winners"), losersEl = $("weekly-losers");
+  if (!diffs.length) {
+    $("weekly-note").textContent = "";
+    $("weekly-summary").innerHTML =
+      `<span class="muted">快照积累中 —— 最早基线距今不足 ${SNAP_MIN_GAP} 天，`
+      + `下次刷新间隔够一周后这里会出现对比。</span>`;
+    winnersEl.innerHTML = ""; losersEl.innerHTML = "";
+    return;
+  }
+
+  // Amounts are additive across accounts; per-account baselines may differ
+  // by a day or two, which the note reflects with the widest window.
+  const merged = {};
+  for (const d of diffs) {
+    for (const r of d.rows) {
+      const t = merged[r.u] || (merged[r.u] = {
+        u: r.u, pnlU: 0, pnlR: 0, total: 0, pxPct: null, qtyNow: 0, qtyBase: 0,
+      });
+      t.pnlU += r.pnlU; t.pnlR += r.pnlR; t.total += r.total;
+      t.qtyNow += r.qtyNow; t.qtyBase += r.qtyBase;
+      if (t.pxPct == null) t.pxPct = r.pxPct;  // same security, same move
+      t.splitLike = t.splitLike || !!r.splitLike;
+      if (t.splitLike) t.pxPct = null;
+    }
+  }
+  const rows = Object.values(merged).sort((a, b) => b.total - a.total);
+  const winners = rows.filter(r => r.total > 0).slice(0, 5);
+  const losers = rows.filter(r => r.total < 0).reverse().slice(0, 5);
+
+  const baseDates = diffs.map(d => d.baseDate).sort();
+  const curDate = liveSnapshot(targets[0]).date || "";
+  $("weekly-note").textContent =
+    `${baseDates[0]} → ${curDate || "最新"} · ${diffs[0].days} 天`
+    + (fresh ? ` · ${fresh} 个账户快照尚新未计入` : "");
+
+  // Headline: NAV change over the same window. Numerator and denominator
+  // must cover the SAME account set — summing every account's current NAV
+  // against only the baselined accounts' old NAV would book a newly added
+  // account's entire balance as this week's "gain". weeklyDiff carries its
+  // own navNow so both sides come from exactly the accounts being diffed.
+  const navNow = diffs.reduce((s, d) => s + (d.navNow || 0), 0);
+  const navBase = diffs.reduce((s, d) => s + (d.navBase || 0), 0);
+  // Same account-set rule as the NAV delta above, which the delta learned
+  // the hard way: nav_history/cash_flows here cover EVERY loaded account,
+  // while `diffs` covers only the baselined ones. Showing a return built
+  // from the full household beside a delta built from a subset recreates
+  // the same false-household-return the P0 fix removed — one account short
+  // of a baseline is enough. Only publish the statistic when every target
+  // actually produced a diff.
+  const allDiffed = diffs.length === targets.length;
+  const slice = allDiffed
+    ? (data.nav_history || []).filter(p => p.date >= baseDates[0]) : [];
+  const st = allDiffed ? navStats(slice, data.cash_flows || []) : null;
+  const navDelta = navNow - navBase;
+  $("weekly-summary").innerHTML =
+    `<span class="nav-stat"><span class="muted">净值变化</span> <b class="${navDelta >= 0 ? "up" : "down"}">`
+    + `${navDelta >= 0 ? "+" : ""}${fmtMoney(navDelta)}</b></span>`
+    + (st ? `<span class="nav-stat"><span class="muted">期间收益(剔除出入金)</span> `
+      + `<b class="${st.periodReturn >= 0 ? "up" : "down"}">${st.periodReturn >= 0 ? "+" : ""}`
+      + `${fmtPct(st.periodReturn, 2)}</b></span>` : "")
+    + `<span class="nav-stat"><span class="muted">上涨/下跌标的</span> `
+    + `<b>${rows.filter(r => r.total > 0).length} / ${rows.filter(r => r.total < 0).length}</b></span>`;
+
+  const maxAbs = Math.max(...rows.map(r => Math.abs(r.total)), 1);
+  const bar = (r) => {
+    const tag = positionTag(r);
+    const px = r.pxPct != null
+      ? `${r.pxPct >= 0 ? "+" : ""}${fmtPct(r.pxPct, 1)}` : "";
+    const meta = [px, tag].filter(Boolean).join(" · ");
+    return `<div class="wk-row">
+      <span class="wk-sym"><b>${r.u}</b></span>
+      <div class="wk-bar"><div class="wk-fill ${r.total >= 0 ? "pos" : "neg"}"
+        style="width:${Math.max(3, Math.abs(r.total) / maxAbs * 100)}%"></div></div>
+      <span class="wk-val ${r.total >= 0 ? "up" : "down"}">${r.total >= 0 ? "+" : ""}${fmtMoney(r.total, 0)}</span>
+      <span class="wk-meta muted">${meta}</span>
+    </div>`;
+  };
+  winnersEl.innerHTML = winners.map(bar).join("") || '<div class="muted">无</div>';
+  losersEl.innerHTML = losers.map(bar).join("") || '<div class="muted">无</div>';
+}
+
+/* ---------------------------------------------------------------------------
+ * Cluster exposure — names that move together managed as one position.
+ *
+ * The mapping lives in static/clusters.json ({"AI-infra": ["RKLB", ...]}),
+ * hand-maintained. Exposure = stock market value + assigned-if notional of
+ * every short put on the cluster's members: correlated names gap together,
+ * so the question is "if this whole cluster gets put to me, how much of NAV
+ * is it" — not each ticker on its own.
+ * ------------------------------------------------------------------------- */
+
+function computeClusters(data, map) {
+  if (!map || !Object.keys(map).length) return null;
+  // A symbol may legitimately belong to several clusters ("MU" in both
+  // AI-infra and Memory): correlated exposure counts in EVERY cluster that
+  // claims it — a symbol→single-cluster map would silently drop it from
+  // all but the last, shrinking exactly the concentration number this
+  // panel exists to surface. (其他 only catches symbols claimed by none;
+  // per-cluster totals may overlap by design and must not be summed.)
+  const symClusters = {};
+  for (const [name, syms] of Object.entries(map)) {
+    for (const s of syms || []) (symClusters[s] || (symClusters[s] = [])).push(name);
+  }
+  const rows = {};
+  const bucket = (name) => rows[name]
+    || (rows[name] = { name, stockMV: 0, putNotional: 0, members: {} });
+  const member = (b, sym) => b.members[sym]
+    || (b.members[sym] = { mv: 0, notional: 0 });
+  for (const s of data.stocks || []) {
+    if (CASH_EQUIVALENTS.has(s.symbol)) continue;
+    for (const name of symClusters[s.symbol] || ["其他"]) {
+      const b = bucket(name);
+      b.stockMV += s.value || 0;
+      member(b, s.symbol).mv += s.value || 0;
+    }
+  }
+  for (const o of data.options || []) {
+    if (!(o.quantity < 0) || o.right !== "P" || !(o.strike > 0)) continue;
+    const notional = o.strike * Math.abs(o.quantity) * (o.multiplier || CONTRACT_MULTIPLIER);
+    for (const name of symClusters[o.underlying] || ["其他"]) {
+      const b = bucket(name);
+      b.putNotional += notional;
+      member(b, o.underlying).notional += notional;
+    }
+  }
+  const nav = data.nav || {};
+  const totalNav = nav.total || (nav.cash + nav.stock + nav.options) || 0;
+  const list = Object.values(rows).map(r => ({
+    ...r,
+    total: r.stockMV + r.putNotional,
+    pct: totalNav > 0 ? (r.stockMV + r.putNotional) / totalNav : 0,
+  }));
+  // Defined clusters by size, the catch-all 其他 bucket last.
+  list.sort((a, b) =>
+    (a.name === "其他") - (b.name === "其他") || b.total - a.total);
+  return { totalNav, rows: list };
+}
+
+// Cluster panel is built and tested but switched off: with clusters.json
+// holding a single group, the dominant row is the catch-all "其他", whose
+// percentage is a property of how little has been grouped rather than a
+// concentration signal — and it renders red on every load. Flip to true after
+// filling in static/clusters.json.
+const SHOW_CLUSTER_PANEL = false;
+
+function renderClusters(data, map) {
+  const panel = $("cluster-panel");
+  if (!SHOW_CLUSTER_PANEL) { panel.hidden = true; return; }
+  const c = computeClusters(data, map);
+  if (!c || !c.rows.length) { panel.hidden = true; return; }
+  panel.hidden = false;
+
+  const defined = c.rows.filter(r => r.name !== "其他");
+  $("cluster-note").textContent = defined.length
+    ? `${defined.length} 个簇 · 最大簇敞口占净值 ${fmtPct(Math.max(...defined.map(r => r.pct), 0), 1)}`
+    : "clusters.json 里还没有分组，全部标的在「其他」";
+
+  const tbody = $("cluster-body");
+  tbody.innerHTML = "";
+  for (const r of c.rows) {
+    const tone = r.pct >= 1 ? "down" : r.pct >= 0.5 ? "amber" : "";
+    const members = Object.entries(r.members).map(([sym, m]) => {
+      const bits = [];
+      if (m.mv) bits.push(fmtMoney(m.mv, 0));
+      if (m.notional) bits.push(`put ${fmtMoney(m.notional, 0)}`);
+      return `${sym} ${bits.join("+")}`;
+    }).join(" · ");
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td><b>${r.name}</b></td>
+      <td class="muted">${members}</td>
+      <td class="num">${r.stockMV ? fmtMoney(r.stockMV, 0) : "—"}</td>
+      <td class="num">${r.putNotional ? fmtMoney(r.putNotional, 0) : "—"}</td>
+      <td class="num"><b>${fmtMoney(r.total, 0)}</b></td>
+      <td class="num ${tone}"><b>${fmtPct(r.pct, 1)}</b></td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * Expiry calendar — short options grouped by the week they expire.
+ * ------------------------------------------------------------------------- */
+
+const _EXPIRY_MON = { JAN: 1, FEB: 2, MAR: 3, APR: 4, MAY: 5, JUN: 6,
+                      JUL: 7, AUG: 8, SEP: 9, OCT: 10, NOV: 11, DEC: 12 };
+
+// "15JAN27" → UTC ms; null on anything unparseable. Both ingestion paths
+// emit this spelling (Flex via _fmt_expiry, Activity Statements natively).
+function parseExpiryTs(s) {
+  const m = (s || "").trim().match(/^(\d{1,2})([A-Z]{3})(\d{2})$/);
+  if (!m) return null;
+  const mon = _EXPIRY_MON[m[2]];
+  if (!mon) return null;
+  return Date.UTC(2000 + Number(m[3]), mon - 1, Number(m[1]));
+}
+
+const DAY_MS = 86400000;
+
+function groupExpiries(options, priceBook, todayTs) {
+  const buckets = {};
+  for (const o of options || []) {
+    if (!(o.quantity < 0)) continue;
+    const ts = parseExpiryTs(o.expiry);
+    const qty = Math.abs(o.quantity);
+    const mult = o.multiplier || CONTRACT_MULTIPLIER;
+    // Monday of the expiry's week keys the bucket; unparseable expiries get
+    // their own row instead of silently vanishing from a risk view.
+    const key = ts != null
+      ? ts - (((new Date(ts)).getUTCDay() + 6) % 7) * DAY_MS
+      : Infinity;
+    const b = buckets[key] || (buckets[key] = {
+      weekStart: key, firstExpiry: Infinity, contracts: 0,
+      premium: 0, putNotional: 0, itm: 0, likelyItm: 0, unpriced: 0, items: [],
+    });
+    if (ts != null) b.firstExpiry = Math.min(b.firstExpiry, ts);
+    b.contracts += qty;
+    b.premium += Math.abs(o.value || 0);
+    if (o.right === "P" && o.strike > 0) b.putNotional += o.strike * qty * mult;
+    const spot = priceBook[o.underlying];
+    if (spot > 0 && o.strike > 0 && (o.right === "P" || o.right === "C")) {
+      const itm = o.right === "P" ? spot < o.strike : spot > o.strike;
+      if (itm) b.itm += qty;
+    } else {
+      b.unpriced += qty;
+      // No underlying quote (nothing in the portfolio prices this name), so
+      // moneyness can't be settled from spot. The contract's OWN mark still
+      // says something: an option can't be worth much more than its time
+      // value unless it carries intrinsic. A mark above MARK_ITM_RATIO of the
+      // strike is not a far-OTM lottery ticket at any listed IV/DTE — that is
+      // assignment risk, and reporting it as "0 ITM" reads as reassurance the
+      // data does not support. Flagged separately from confirmed ITM because
+      // it is inferred from price, not measured against spot.
+      const markPerShare = Math.abs(o.value || 0) / (qty * mult);
+      if (o.strike > 0 && markPerShare > MARK_ITM_RATIO * o.strike) {
+        b.likelyItm += qty;
+      }
+    }
+    b.items.push(`${o.underlying} ${o.strike || "?"}${o.right || "?"} ×${qty}`);
+  }
+  // DTE counts calendar days, so compare dates, not instants: expiries sit
+  // at UTC midnight while todayTs is a local "now" — in UTC+ timezones
+  // (Brisbane +10) the raw difference rounds a Friday expiry to 0 while it
+  // is still Thursday evening local. Map the local calendar date to UTC
+  // midnight first and the difference is an exact whole number of days.
+  const now = new Date(todayTs);
+  const today0 = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate());
+  return Object.values(buckets)
+    .map(b => ({
+      ...b,
+      dte: b.firstExpiry === Infinity ? null
+        : Math.max(0, Math.round((b.firstExpiry - today0) / DAY_MS)),
+    }))
+    .sort((a, b) => a.weekStart - b.weekStart);
+}
+
+function renderExpiries(data, accounts) {
+  const panel = $("expiry-panel");
+  const book = buildPriceBook(accounts);
+  const weeks = groupExpiries(data.options || [], book, Date.now());
+  if (!weeks.length) { panel.hidden = true; return; }
+  panel.hidden = false;
+
+  const totPrem = weeks.reduce((s, w) => s + w.premium, 0);
+  const totNotional = weeks.reduce((s, w) => s + w.putNotional, 0);
+  $("expiry-note").textContent =
+    `${weeks.reduce((s, w) => s + w.contracts, 0)} 张卖方合约 · `
+    + `权利金负债合计 ${fmtMoney(totPrem)} · 卖put名义合计 ${fmtMoney(totNotional)}`;
+
+  const weekLabel = (w) => {
+    if (w.weekStart === Infinity) return "到期日未识别";
+    const mon = new Date(w.weekStart);
+    const fri = new Date(w.weekStart + 4 * DAY_MS);
+    const f = (d) => `${d.getUTCMonth() + 1}/${d.getUTCDate()}`;
+    return `${f(mon)}–${f(fri)}`;
+  };
+  const tbody = $("expiry-body");
+  tbody.innerHTML = "";
+  for (const w of weeks) {
+    // "0" may only be printed when every contract in the week was actually
+    // measured. With an unpriced contract present, 0 is not a finding — it is
+    // a gap — and the deep-ITM ones are exactly the contracts that matter.
+    const itmCell = w.unpriced
+      ? [
+          w.itm ? `<span class="down"><b>${w.itm}</b></span>` : "",
+          w.likelyItm
+            ? `<span class="down" title="无正股报价，按合约自身市价推断：`
+              + `权利金已超行权价的 ${fmtPct(MARK_ITM_RATIO, 0)}，几乎不可能是纯时间价值">`
+              + `<b>可能 ${w.likelyItm}</b></span>`
+            : "",
+          `<span class="muted" title="组合里没有该标的正股，无法用现价判定价内外">`
+            + `价? ${w.unpriced}</span>`,
+        ].filter(Boolean).join(" · ")
+      : (w.itm ? `<span class="down"><b>${w.itm}</b></span>` : "0");
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td><b>${weekLabel(w)}</b></td>
+      <td class="num">${w.dte == null ? "—" : w.dte}</td>
+      <td class="expiry-items">${w.items.join(" · ")}</td>
+      <td class="num">${w.contracts}</td>
+      <td class="num">${fmtMoney(w.premium, 0)}</td>
+      <td class="num">${w.putNotional ? fmtMoney(w.putNotional, 0) : "—"}</td>
+      <td class="num">${itmCell}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * NAV history — the equity curve the Flex NAV section has carried all along.
+ *
+ * The curve plots raw NAV, but every statistic is computed on a TWR chain
+ * with external flows stripped out: a $50k deposit is not a +50% day, and a
+ * withdrawal is not a drawdown. Flows dated between two NAV points attach to
+ * the later point (weekend deposits land on Monday's return).
+ * ------------------------------------------------------------------------- */
+
+function navStats(series, flows) {
+  const pts = (series || []).filter(p => p.total > 0);
+  if (pts.length < 5) return null;
+  const fl = (flows || [])
+    .map(f => ({ date: f.date, amount: f.amount || 0 }))
+    .sort((a, b) => (a.date < b.date ? -1 : 1));
+  let fi = 0;
+  // Flows on or before the first observation are starting capital, not P&L.
+  while (fi < fl.length && fl[fi].date <= pts[0].date) fi++;
+  let index = 1, peak = 1, peakDate = pts[0].date;
+  let maxDD = 0, ddStart = pts[0].date, ddEnd = pts[0].date;
+  const rets = [];
+  for (let i = 1; i < pts.length; i++) {
+    // Accumulate the two directions SEPARATELY. Netting them first would
+    // cancel a deposit against a withdrawal landing in the same interval
+    // (a $50k transfer in and $50k out over one weekend nets to zero) and
+    // both timing conventions below would then be applied to nothing,
+    // distorting the link exactly when the flows were largest.
+    let dep = 0, wd = 0;
+    while (fi < fl.length && fl[fi].date <= pts[i].date) {
+      const amt = fl[fi].amount;
+      if (amt > 0) dep += amt; else wd += amt;
+      fi++;
+    }
+    // Deposits use the begin-of-day convention (they join the denominator),
+    // withdrawals the end-of-day one (added back to the numerator): both
+    // keep the base large. The naive (end − flow) / begin link divides the
+    // day's P&L by the pre-deposit base — seed a $5k account with $200k on
+    // a red day and it prints a −20% "drawdown", or flips the whole chain
+    // negative. Clamp guards the chain's sign against any residual gap.
+    const denom = pts[i - 1].total + dep;
+    let r = denom > 0 ? (pts[i].total - wd) / denom - 1 : 0;
+    if (r < -0.99) r = -0.99;
+    rets.push(r);
+    index *= 1 + r;
+    // >= so a flat stretch at the peak advances the date: the drawdown
+    // "starts" at the last day you were whole, not the first.
+    if (index >= peak) { peak = index; peakDate = pts[i].date; }
+    const dd = 1 - index / peak;
+    if (dd > maxDD) { maxDD = dd; ddStart = peakDate; ddEnd = pts[i].date; }
+  }
+  const n = rets.length;
+  const mean = rets.reduce((s, r) => s + r, 0) / n;
+  const variance = rets.reduce((s, r) => s + (r - mean) ** 2, 0) / Math.max(n - 1, 1);
+  const annVol = Math.sqrt(variance) * Math.sqrt(252);
+  const annRet = n > 0 ? Math.pow(Math.max(index, 1e-9), 252 / n) - 1 : 0;
+  return {
+    maxDD, ddStart, ddEnd,
+    curDD: 1 - index / peak,
+    annVol, annRet,
+    // Un-annualized chained return over the series — what a short window
+    // (the weekly recap) actually wants; annualizing 5 days is noise.
+    periodReturn: index - 1,
+    // rf=0 return/vol — labelled as such, not passed off as a true Sharpe.
+    retOverVol: annVol > 0 ? annRet / annVol : 0,
+    calmar: maxDD > 0 ? annRet / maxDD : 0,
+    high: Math.max(...pts.map(p => p.total)),
+    low: Math.min(...pts.map(p => p.total)),
+    first: pts[0], last: pts[pts.length - 1],
+  };
+}
+
+function renderNavHistory(data) {
+  const panel = $("nav-history-panel");
+  const series = (data.nav_history || []).filter(p => p.total > 0);
+  const stats = navStats(series, data.cash_flows || []);
+  if (!stats) { panel.hidden = true; return; }
+  panel.hidden = false;
+
+  $("nav-history-note").textContent =
+    `${stats.first.date} → ${stats.last.date} · ${series.length} 个交易日`;
+
+  // Plain SVG polyline — no library, no external anything.
+  const W = 800, H = 200, PAD = 4;
+  const lo = stats.low, hi = stats.high;
+  const spanY = Math.max(hi - lo, 1e-9);
+  const x = (i) => PAD + (W - 2 * PAD) * (series.length > 1 ? i / (series.length - 1) : 0);
+  const y = (v) => H - PAD - (H - 2 * PAD) * ((v - lo) / spanY);
+  const points = series.map((p, i) => `${x(i).toFixed(1)},${y(p.total).toFixed(1)}`).join(" ");
+  const area = `M${x(0).toFixed(1)},${H - PAD} L${points.replaceAll(" ", " L")} L${x(series.length - 1).toFixed(1)},${H - PAD} Z`;
+  $("nav-chart").innerHTML = `
+    <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-label="净值曲线">
+      <path d="${area}" fill="rgba(107,215,255,0.08)"></path>
+      <polyline points="${points}" fill="none" stroke="var(--accent)" stroke-width="1.6"
+        vector-effect="non-scaling-stroke"></polyline>
+    </svg>`;
+
+  const chip = (label, val, cls = "") =>
+    `<span class="nav-stat"><span class="muted">${label}</span> <b class="${cls}">${val}</b></span>`;
+  $("nav-stats").innerHTML = [
+    chip("期末", fmtMoney(stats.last.total)),
+    chip("期间高/低", `${fmtMoney(stats.high)} / ${fmtMoney(stats.low)}`),
+    chip("最大回撤", `−${fmtPct(stats.maxDD, 1)}（${stats.ddStart.slice(5)} → ${stats.ddEnd.slice(5)}）`,
+      stats.maxDD >= 0.2 ? "down" : ""),
+    chip("当前回撤", stats.curDD > 0.001 ? `−${fmtPct(stats.curDD, 1)}` : "在高点",
+      stats.curDD >= 0.1 ? "down" : ""),
+    chip("年化收益 TWR", fmtPct(stats.annRet, 1), stats.annRet >= 0 ? "up" : "down"),
+    chip("年化波动", fmtPct(stats.annVol, 1)),
+    chip("收益/波动 (rf=0)", stats.retOverVol.toFixed(2)),
+    chip("Calmar", stats.calmar ? stats.calmar.toFixed(2) : "—"),
+  ].join("");
 }
 
 function renderTreemap(stocks) {
@@ -1325,8 +2017,11 @@ function attachSorters(currentDataRef) {
 let rankMode = "underlying";
 
 function optionUnderlying(sym) {
-  // "NVDA 17JUL26 155 P" -> "NVDA"
-  const m = sym.match(/^([A-Z\.]+)\s/);
+  // "NVDA 17JUL26 155 P" -> "NVDA". Corporate-action-adjusted contracts are
+  // spelled with a numeric suffix ("COHR1 16OCT26 320 C") — strip it so the
+  // adjusted legs merge back onto the same underlying as the stock; US
+  // tickers themselves never contain digits.
+  const m = sym.match(/^([A-Z\.]+)\d*\s/);
   return m ? m[1] : sym;
 }
 
@@ -1464,6 +2159,16 @@ async function refreshFromIBKR() {
 
 document.addEventListener("DOMContentLoaded", () => {
   $("refresh-btn").addEventListener("click", refreshFromIBKR);
+
+  // Cluster mapping — a static file the user edits by hand. 404/parse
+  // failure just leaves the panel hidden; nothing else depends on it.
+  fetch("/static/clusters.json")
+    .then(r => (r.ok ? r.json() : null))
+    .catch(() => null)
+    .then(map => {
+      currentDataRef.clusters = map;
+      if (currentDataRef.data) renderClusters(currentDataRef.data, map);
+    });
 
   $("file").addEventListener("change", async (e) => {
     const f = e.target.files[0];

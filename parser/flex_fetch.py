@@ -1,12 +1,11 @@
-"""Pure-Python equivalent of scripts/ibkr_sync.sh for the web "refresh now"
-button. Shells out to IBKR Flex Web Service, polls until ready, returns the
-CSV body — no temp files, no subprocess, no env file gymnastics from inside
-the Docker container.
+"""IBKR Flex Web Service fetcher: SendRequest, poll, return the CSV body.
 
-The two scripts live side by side on purpose: bash + cron remains the
-unattended weekly path, this module is the on-demand UI path. They read
-the same credentials format (TOKEN:QUERY_ID space-separated) so a single
-env var keeps both in sync.
+This is now the ONLY fetch path — both the dashboard's "refresh now"
+button and the in-app AUTO_SYNC scheduler (app.py) go through here, so
+throttling, token redaction and error-code policy live in exactly one
+place. scripts/ibkr_sync.sh (the old bash + cron path) is retired: its
+independent retry ladder could walk a transient 1001 into IBKR's 1025
+lockout with nothing visible on the dashboard.
 """
 from __future__ import annotations
 
@@ -19,10 +18,13 @@ from typing import Iterator, Optional
 
 API_BASE = "https://gdcdyn.interactivebrokers.com/Universal/servlet/FlexStatementService"
 
-# Error codes that the bash script also treats as terminal — no point retrying
-# from the UI either. Everything else (1001, 1019, network blips) is a slow
-# / temporarily-unavailable hint and the caller can suggest "try again later".
-PERMANENT_CODES = {"1011", "1014", "1015", "1018", "1020"}
+# Error codes that are terminal — no point retrying. Everything else
+# (1001, 1019, network blips) is a slow / temporarily-unavailable hint and
+# the caller can suggest "try again later".
+# 1025 ("Too many failed attempts") is IBKR escalating repeated 1001s into a
+# lockout — retrying against it digs the hole deeper (lesson 11: the old
+# bash cron walked its whole retry ladder into exactly this).
+PERMANENT_CODES = {"1011", "1014", "1015", "1018", "1020", "1025"}
 
 
 class FlexFetchError(Exception):
