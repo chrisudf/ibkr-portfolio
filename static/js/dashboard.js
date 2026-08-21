@@ -1219,7 +1219,7 @@ function renderExpiries(data, accounts) {
     tr.innerHTML = `
       <td><b>${weekLabel(w)}</b></td>
       <td class="num">${w.dte == null ? "—" : w.dte}</td>
-      <td class="muted">${w.items.join(" · ")}</td>
+      <td class="expiry-items">${w.items.join(" · ")}</td>
       <td class="num">${w.contracts}</td>
       <td class="num">${fmtMoney(w.premium, 0)}</td>
       <td class="num">${w.putNotional ? fmtMoney(w.putNotional, 0) : "—"}</td>

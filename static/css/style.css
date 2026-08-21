@@ -212,6 +212,10 @@ table.holdings tr:hover td { background: rgba(255,255,255,0.02); }
 .up { color: var(--green); }
 .down { color: var(--red); }
 .muted { color: var(--text-faint); }
+/* The expiry calendar's contract list is the row's actual content — which
+   strikes are short and in what size — not a secondary annotation, so it
+   gets full-contrast text rather than the .muted treatment. */
+.expiry-items { color: var(--text); }
 .tag {
   display: inline-block; padding: 2px 8px; border-radius: 6px;
   font-size: 10px; font-weight: 600; letter-spacing: 0.5px;
