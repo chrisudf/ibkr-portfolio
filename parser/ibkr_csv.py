@@ -17,8 +17,11 @@ def _to_float(value: str) -> float:
         return 0.0
 
 
+# Underlying accepts digits and one internal space: corporate-action-adjusted
+# contracts are spelled "COHR1 17OCT25 85 P" and class shares "BRK B ...".
+# Non-greedy so the expiry token, not the regex, decides where the ticker ends.
 _OPTION_RE = re.compile(
-    r"^(?P<underlying>[A-Z\.]+)\s+(?P<expiry>\d{1,2}[A-Z]{3}\d{2})\s+(?P<strike>[\d\.]+)\s+(?P<right>[CP])$"
+    r"^(?P<underlying>[A-Z][A-Z0-9\. ]*?)\s+(?P<expiry>\d{1,2}[A-Z]{3}\d{2})\s+(?P<strike>[\d\.]+)\s+(?P<right>[CP])$"
 )
 
 
@@ -36,8 +39,12 @@ def _parse_option_symbol(symbol: str) -> dict[str, Any] | None:
 
 # "MSFT(US5949181045) Cash Dividend USD 0.83 per Share" → MSFT. The Activity
 # Statement's Dividends / Withholding Tax sections have no Symbol column, so
-# the ticker has to come out of the description.
-_DIV_SYMBOL_RE = re.compile(r"^([A-Z][A-Z0-9\.]{0,9})\s*\(")
+# the ticker has to come out of the description. Class shares are spelled with
+# a space ("BRK B(US0846707026) ..."), hence the optional trailing letter, and
+# the first character may be a digit — HK tickers are numeric ("0005(...)").
+# Rejecting those buckets their gross under "—" and then the unattributed-tax
+# guard drops the matching withholding, overstating net.
+_DIV_SYMBOL_RE = re.compile(r"^([A-Z0-9][A-Z0-9\.]{0,9}(?: [A-Z])?)\s*\(")
 
 # The Activity Statement carries the rate and the income class in the same
 # description string the Flex export splits into columns:
@@ -93,6 +100,10 @@ def _parse_dividends(sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
             # overstate the tax drag. See parser/ibkr_flex_csv.py.
             if kind == "tax" and not sym:
                 continue
+            # Sign the description-parsed rate by the cash direction — a
+            # reversal row still prints the positive rate text. See the same
+            # handling in ibkr_flex_csv._ingest_dividend_row.
+            rate = _dividend_rate(desc) if kind == "gross" else 0.0
             rows.append({
                 "date": date,
                 "symbol": sym or "—",
@@ -101,17 +112,50 @@ def _parse_dividends(sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
                 # This statement has no DividendType column, but the same
                 # facts are in the description tail: the per-share rate and a
                 # "(Ordinary Dividend)" / "(Short Term Capital Gain)" suffix.
-                "per_share": _dividend_rate(desc) if kind == "gross" else 0.0,
+                "per_share": rate if amount >= 0 else -rate,
                 "income_class": _income_class_from_desc(desc) if kind == "gross" else "",
+                "currency": (r.get("Currency") or "").strip().upper(),
                 "description": desc,
             })
     if not rows:
         return {}
 
+    # Same no-FX segregation as the Flex path: rows outside the dominant
+    # currency are reported separately, never summed at 1:1 into the totals.
+    # Dominance by payment count (amount breaks ties) — nominal amounts
+    # aren't comparable across currencies.
+    ccy_weight: dict[str, list[float]] = {}
+    for r in rows:
+        # NET payment count (reversal votes -1) — correction churn on one
+        # foreign payout must not out-vote the real base currency. Amount is
+        # a deterministic tie-break only.
+        if r["kind"] == "gross" and r.get("currency"):
+            w = ccy_weight.setdefault(r["currency"], [0.0, 0.0])
+            w[0] += 1 if r["amount"] > 0 else -1
+            if r["amount"] > 0:
+                w[1] += r["amount"]
+    # Currency code is the final tie-break: without it an exact tie in both
+    # net count and amount falls through to dict insertion order, so merely
+    # reordering otherwise identical rows would move totals between the main
+    # and foreign buckets. Row-order invariance is a promise this parser keeps.
+    base_ccy = max(ccy_weight, key=lambda c: (*ccy_weight[c], c)) if ccy_weight else ""
+    foreign: dict[str, dict[str, float]] = {}
+    main_rows: list[dict[str, Any]] = []
+    for r in rows:
+        c = r.get("currency", "")
+        if c and base_ccy and c != base_ccy:
+            f = foreign.setdefault(c, {"gross": 0.0, "tax": 0.0, "net": 0.0, "count": 0})
+            f[r["kind"]] += r["amount"]
+            f["net"] = f["gross"] + f["tax"]
+            if r["kind"] == "gross" and r["amount"] > 0:
+                f["count"] += 1
+        else:
+            main_rows.append(r)
+
     by_symbol: dict[str, dict[str, Any]] = {}
     by_month: dict[str, dict[str, Any]] = {}
     gross = tax = non_dividend_total = 0.0
-    for r in rows:
+    for r in main_rows:
         if r["kind"] == "gross":
             gross += r["amount"]
         else:
@@ -124,14 +168,16 @@ def _parse_dividends(sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
         s[r["kind"]] += r["amount"]
         s["net"] = s["gross"] + s["tax"]
         if r["kind"] == "gross":
-            s["count"] += 1
+            # Reversals (negative cash) net the sums out but aren't payments.
+            if r["amount"] > 0:
+                s["count"] += 1
             s["per_share"] += r["per_share"]
             if r["income_class"] == "ordinary":
                 s["per_share_ordinary"] += r["per_share"]
             else:
                 s["non_dividend"] += r["amount"]
                 non_dividend_total += r["amount"]
-            if not r["per_share"]:
+            if not r["per_share"] and r["amount"] > 0:
                 s["rate_missing"] += 1
         s["last_date"] = max(s["last_date"], r["date"])
         m = by_month.setdefault(r["date"][:7], {"month": r["date"][:7], "gross": 0.0, "tax": 0.0, "net": 0.0})
@@ -144,6 +190,8 @@ def _parse_dividends(sections: dict[str, dict[str, Any]]) -> dict[str, Any]:
         "tax": tax,
         "net": gross + tax,
         "non_dividend": non_dividend_total,
+        "base_currency": base_ccy,
+        "foreign": foreign,
         "by_symbol": sorted(by_symbol.values(), key=lambda x: x["net"], reverse=True),
         "by_month": sorted(by_month.values(), key=lambda x: x["month"]),
         "events": sorted(rows, key=lambda r: (r["date"], r["symbol"]), reverse=True),
@@ -240,6 +288,8 @@ def parse_ibkr_csv(content: str) -> dict[str, Any]:
                 "expiry": parsed.get("expiry", ""),
                 "strike": parsed.get("strike", 0.0),
                 "right": parsed.get("right", ""),
+                # Activity Statement spells the contract multiplier "Mult".
+                "multiplier": _to_float(r.get("Mult", "")) or 100.0,
                 "quantity": qty,
                 "cost_price": cost_price,
                 "close_price": close_price,

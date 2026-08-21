@@ -25,7 +25,11 @@ put  → max(20% × 正股价 − 价外幅度, 10% × 行权价,  $2.50) + 当�
 call → max(20% × 正股价 − 价外幅度, 10% × 正股价,  $2.50) + 当前权利金市值
 ```
 
-有正股覆盖的 covered call 不占保证金；买入期权已付全额权利金，也不占。
+有正股覆盖的 covered call 不占保证金。**按整张判定**：一张 call 要有满一份
+交割量的正股才算 covered，凑不满就是整张裸卖，不按股摊薄。交割量取自报表的
+`Multiplier` / `Mult` 列 —— 标准美股期权是 100 股（80 股 + 1 张 call 在
+Reg-T 下是整张裸卖），但拆股/并股调整后的合约可能是别的数（乘数 10 的合约
+10 股就足以覆盖）。买入期权已付全额权利金，也不占。
 
 **没建模的**：垂直价差（同标的同到期的多空组合）按裸卖计算，会明显高估 ——
 Reg-T 下价差的风险以最大价差损失封顶。当前持仓里没有价差（多头都是不同
@@ -67,6 +71,11 @@ python3 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\ac
 pip install -r requirements.txt
 ```
 
+跑测试还需要 pytest（`requirements-dev.txt` = 上面那份 + pytest）：
+```bash
+pip install -r requirements-dev.txt
+```
+
 ## 启动
 
 **刷新按钮依赖环境变量，直接 `python app.py` 起不会加载它们。** `/api/refresh`
@@ -92,6 +101,22 @@ set -a && . scripts/sync.env && set +a && python app.py
 
 > 只想上传文件、不用刷新按钮的话，`python app.py` 依然可用 —— 只是刷新按钮会报上面那个错。
 
+## 测试
+
+解析器的回归测试用内置的 CSV 夹具，不连 IBKR、不碰 `uploads/`：
+```bash
+python -m pytest tests/ -q
+```
+
+注意用**虚拟环境里**的解释器 —— Windows 上直接敲 `python` 很可能打到系统
+Python，那边没装依赖：
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/ -q
+```
+
+`tests/test_parsers.py` 锁的是保证金口径、分红去重 / 多币种、成本股息率的
+时间基准这些容易悄悄回退的地方 —— 改 `parser/` 或 `app.py` 之前先跑一遍。
+
 ## 文件结构
 ```
 ibkr-portfolio/
@@ -102,6 +127,7 @@ ibkr-portfolio/
 │   ├── ibkr_pdf.py         # PDF 解析（基于 pdfplumber）
 │   ├── flex_fetch.py       # 刷新按钮走的 Flex API 拉取
 │   └── returns.py          # IRR / 年化回报率计算
+├── tests/test_parsers.py   # 解析器回归测试（pytest，CSV 夹具）
 ├── scripts/
 │   ├── run-local.ps1       # 本地启动（加载 sync.env）
 │   ├── ibkr_sync.sh        # cron 无人值守同步

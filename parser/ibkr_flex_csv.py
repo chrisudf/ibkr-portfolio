@@ -102,6 +102,8 @@ def _empty_account() -> dict[str, Any]:
         "_div_cash": [],    # from Cash Transactions
         "_div_sof": [],     # from Statement of Funds
         "_div_ids": set(),
+        "_div_synth_seq": {},  # synth-key occurrence counter, like _cf_synth_seq
+        "_sof_seen": False,  # any Statement of Funds row ingested; stripped
         "_nav_date": "",   # latest ReportDate seen in the NAV series; stripped
         "_starting_cash": 0.0,
         "_from_date": "",
@@ -202,6 +204,10 @@ def _ingest_position(account: dict[str, Any], row: dict[str, str]) -> None:
             "expiry": _fmt_expiry(row.get("Expiry", "")),
             "strike": _to_float(row.get("Strike")),
             "right": row.get("Put/Call", ""),
+            # Deliverable per contract. 100 for standard US equity options,
+            # something else after corporate-action adjustments — the margin
+            # math scales by it, so don't let the frontend hard-code 100.
+            "multiplier": _to_float(row.get("Multiplier")) or 100.0,
             "quantity": qty,
             "cost_price": _to_float(row.get("CostBasisPrice")),
             "close_price": _to_float(row.get("MarkPrice")),
@@ -338,8 +344,12 @@ _DIV_CASH_TYPES = {
 }
 
 # "MSFT(US5949181045) Cash Dividend USD 0.83 per Share" → MSFT. Used only when
-# the row itself has no Symbol column filled in.
-_DIV_SYMBOL_RE = re.compile(r"^([A-Z][A-Z0-9\.]{0,9})\s*\(")
+# the row itself has no Symbol column filled in. Class shares are spelled with
+# a space ("BRK B(US0846707026) ..."), so allow one trailing class letter, and
+# the leading character may be a digit — HK tickers are numeric ("0005(...)").
+# Without either the match fails outright and the withholding row behind it
+# gets discarded by the unattributed-tax guard.
+_DIV_SYMBOL_RE = re.compile(r"^([A-Z0-9][A-Z0-9\.]{0,9}(?: [A-Z])?)\s*\(")
 
 # ...and the rate out of the same string: "USD 0.346643 PER SHARE" → 0.346643.
 # Case-insensitive because live Flex output shouts it while the docs don't.
@@ -406,14 +416,26 @@ def _skip_unattributed_tax(kind: str, sym: str) -> bool:
 
 def _dividend_id(account: dict[str, Any], prefix: str, d: date, sym: str,
                  kind: str, amount: float, row: dict[str, str]) -> str | None:
-    """Dedupe key for one payout row; None means "already seen, skip"."""
+    """Dedupe key for one payout row; None means "already seen, skip".
+
+    The synthetic fallback mirrors _cash_flow_id: the raw Type/ActivityCode
+    goes into the composite so a Dividend and a Payment-In-Lieu of the same
+    amount on the same day never collide, and an occurrence ordinal keeps two
+    genuinely identical rows apart — without it, a cancel + re-book at the
+    identical amount silently drops the re-booked payout and the symbol nets
+    to zero for the month.
+    """
     for col in _TXN_ID_COLUMNS:
         txn = (row.get(col) or "").strip()
         if txn:
             key = f"{prefix}:txn:{txn}"
             break
     else:
-        key = f"{prefix}:{d.isoformat()}|{sym}|{kind}|{amount:.4f}"
+        src = (row.get("Type") or row.get("ActivityCode") or "").strip().lower()
+        base = f"{prefix}:{d.isoformat()}|{sym}|{kind}|{src}|{amount:.4f}"
+        seq = account["_div_synth_seq"].get(base, 0) + 1
+        account["_div_synth_seq"][base] = seq
+        key = f"{base}|{seq}"
     if key in account["_div_ids"]:
         return None
     account["_div_ids"].add(key)
@@ -424,14 +446,27 @@ def _ingest_dividend_row(account: dict[str, Any], bucket: str, d: date, sym: str
                          kind: str, amount: float, row: dict[str, str]) -> None:
     if _dividend_id(account, bucket, d, sym, kind, amount, row) is None:
         return
+    # A correction arrives as a negative-amount row whose description still
+    # reads "USD 0.25 PER SHARE" — the rate text never flips sign. Sign it by
+    # the cash direction so a cancel + re-book nets the per-share sum out to
+    # the corrected rate instead of adding every rate it ever printed.
+    rate = _dividend_rate(row) if kind == "gross" else 0.0
+    desc = (row.get("Description") or row.get("ActivityDescription") or "").strip()
+    # DividendType is a Cash Transactions column; Statement of Funds rows
+    # never carry it, and classifying every SoF payout as "ordinary" would
+    # resurrect the leveraged-ETF bug on any query that enables SoF without
+    # Cash Transactions. The description tail states the same fact
+    # ("... (Short Term Capital Gain)"), and _income_class only does
+    # substring matching — so fall back to the description text.
     account[bucket].append({
         "date": d.isoformat(),
         "symbol": sym,
         "kind": kind,  # "gross" (dividend / payment in lieu) or "tax" (withheld)
         "amount": amount,
-        "per_share": _dividend_rate(row) if kind == "gross" else 0.0,
-        "income_class": _income_class(row.get("DividendType", "")) if kind == "gross" else "",
-        "description": (row.get("Description") or row.get("ActivityDescription") or "").strip(),
+        "per_share": rate if amount >= 0 else -rate,
+        "income_class": _income_class(row.get("DividendType") or desc) if kind == "gross" else "",
+        "currency": (row.get("CurrencyPrimary") or row.get("Currency") or "").strip().upper(),
+        "description": desc,
     })
 
 
@@ -464,10 +499,48 @@ def _finalize_dividends(account: dict[str, Any]) -> None:
         account["dividends"] = {}
         return
 
+    # Payouts arrive in the payment currency and nothing here converts FX —
+    # a HKD 780 row summed into USD totals at 1:1 would inflate everything
+    # ~8x. Rows outside the dominant currency are reported separately rather
+    # than silently added; empty currency (query without the column) is
+    # treated as base so old exports keep behaving exactly as before.
+    # Dominance is by NUMBER of payments, amount only breaks ties: nominal
+    # amounts aren't comparable across currencies, and one large foreign
+    # payout must not flip which currency the whole panel is denominated in.
+    ccy_weight: dict[str, list[float]] = {}
+    for r in rows:
+        # NET payment count: a reversal cancels one earlier payment, so it
+        # votes -1 rather than +1 (or 0). Counting rows would let one
+        # corrected foreign payout (original + reversal + re-book = 3 rows,
+        # 2 of them positive) tie or out-vote the real base currency and
+        # flip the whole panel's denomination on correction churn.
+        if r["kind"] == "gross" and r.get("currency"):
+            w = ccy_weight.setdefault(r["currency"], [0.0, 0.0])
+            w[0] += 1 if r["amount"] > 0 else -1
+            if r["amount"] > 0:
+                w[1] += r["amount"]  # deterministic tie-break only
+    # Currency code is the final tie-break: without it an exact tie in both
+    # net count and amount falls through to dict insertion order, so merely
+    # reordering otherwise identical rows would move totals between the main
+    # and foreign buckets. Row-order invariance is a promise this parser keeps.
+    base_ccy = max(ccy_weight, key=lambda c: (*ccy_weight[c], c)) if ccy_weight else ""
+    foreign: dict[str, dict[str, float]] = {}
+    main_rows: list[dict[str, Any]] = []
+    for r in rows:
+        c = r.get("currency", "")
+        if c and base_ccy and c != base_ccy:
+            f = foreign.setdefault(c, {"gross": 0.0, "tax": 0.0, "net": 0.0, "count": 0})
+            f[r["kind"]] += r["amount"]
+            f["net"] = f["gross"] + f["tax"]
+            if r["kind"] == "gross" and r["amount"] > 0:
+                f["count"] += 1
+        else:
+            main_rows.append(r)
+
     by_symbol: dict[str, dict[str, Any]] = {}
     by_month: dict[str, dict[str, Any]] = {}
     gross = tax = non_dividend_total = 0.0
-    for r in rows:
+    for r in main_rows:
         # Withholding arrives as a negative amount; keep IBKR's sign so
         # gross + tax = net falls out without special-casing.
         if r["kind"] == "gross":
@@ -482,7 +555,12 @@ def _finalize_dividends(account: dict[str, Any]) -> None:
         s[r["kind"]] += r["amount"]
         s["net"] = s["gross"] + s["tax"]
         if r["kind"] == "gross":
-            s["count"] += 1
+            # Reversal rows (negative cash) still flow through the per-share
+            # and non-dividend sums so a cancel + re-book nets out, but they
+            # are not payments: they don't bump the count, and a rate-less
+            # reversal isn't a missing PIL rate.
+            if r["amount"] > 0:
+                s["count"] += 1
             # Per-share rates add up across payments regardless of how the
             # position was sized between them — that's the whole point.
             s["per_share"] += r["per_share"]
@@ -492,7 +570,7 @@ def _finalize_dividends(account: dict[str, Any]) -> None:
                 # Kept in gross (the cash did arrive) but excluded from yield.
                 s["non_dividend"] += r["amount"]
                 non_dividend_total += r["amount"]
-            if not r["per_share"]:
+            if not r["per_share"] and r["amount"] > 0:
                 s["rate_missing"] += 1
         s["last_date"] = max(s["last_date"], r["date"])
         m = by_month.setdefault(r["date"][:7], {"month": r["date"][:7], "gross": 0.0, "tax": 0.0, "net": 0.0})
@@ -507,8 +585,12 @@ def _finalize_dividends(account: dict[str, Any]) -> None:
         # Portion of gross that is a capital-gain / return-of-capital payout
         # rather than dividend income.
         "non_dividend": non_dividend_total,
+        # Which currency the totals are in, and what was left out of them.
+        "base_currency": base_ccy,
+        "foreign": foreign,
         "by_symbol": sorted(by_symbol.values(), key=lambda x: x["net"], reverse=True),
         "by_month": sorted(by_month.values(), key=lambda x: x["month"]),
+        # All rows, foreign included — each carries its currency.
         "events": sorted(rows, key=lambda r: (r["date"], r["symbol"]), reverse=True),
     }
 
@@ -567,6 +649,7 @@ def _finalize_cost_history(account: dict[str, Any]) -> None:
     from_d = _parse_date(account.get("_from_date", ""))
     to_d = _parse_date(account.get("_to_date", ""))
     open_qty = {s["symbol"]: s["quantity"] for s in account["stocks"]}
+    cost_basis_now = {s["symbol"]: s.get("cost_basis", 0.0) for s in account["stocks"]}
     out: dict[str, Any] = {}
     for sym, h in account["cost_history"].items():
         bq = h["bought_qty"]
@@ -585,6 +668,22 @@ def _finalize_cost_history(account: dict[str, Any]) -> None:
             end = to_d
         else:
             end = moves[-1][0]  # fully closed: capital came out on the last sell
+        # pre_existing infers "shares predate the window" from counts alone,
+        # but a forward split mid-window mints shares without a trade row and
+        # trips the same test — the integration then seeds phantom shares from
+        # the window start and stretches days to the full window. IBKR's own
+        # cost basis arbitrates: if the whole open position's CostBasisMoney
+        # matches what the window's buys cost, nothing predates the window —
+        # the extra shares came from a split, and share counts before/after
+        # the event are in different units. Suppress the time stats (days=0
+        # hides the annualized yield and disarms the ex-date gap check)
+        # rather than integrate across a unit change. Only attempted when
+        # nothing was sold — FIFO makes the comparison ambiguous otherwise.
+        split_suspect = False
+        if pre_existing and held_now > 1e-9 and h["sold_qty"] <= 1e-9:
+            cb = cost_basis_now.get(sym, 0.0)
+            if cb > 0 and abs(cb - h["bought_cost"]) <= max(1.0, 0.01 * cb):
+                split_suspect = True
         entry = {
             "avg_price": h["bought_cost"] / bq,
             "bought_qty": bq,
@@ -596,7 +695,10 @@ def _finalize_cost_history(account: dict[str, Any]) -> None:
             "days": (end - start).days if (start and end and end > start) else 0,
             "avg_shares": 0.0,
         }
-        if start and end and end > start:
+        if split_suspect:
+            entry["days"] = 0
+            entry["split_suspect"] = True
+        if start and end and end > start and not split_suspect:
             # Shares already held when the statement opens never appear as a
             # trade, so the integration has to be seeded with them or it starts
             # from zero on a position that was there all along. Back it out of
@@ -618,10 +720,42 @@ def _finalize_cost_history(account: dict[str, Any]) -> None:
             area += max(pos, 0.0) * (end - prev).days
             entry["avg_shares"] = area / entry["days"]
         out[sym] = entry
+
+    # A position opened before the window and untouched since never shows up
+    # above — it has no trade rows — so it would get no entry at all, days=0
+    # downstream, and the annualized yield goes missing for exactly the
+    # steadiest dividend holdings. For an open position with zero period
+    # trades both facts are certain: capital was deployed the whole statement
+    # window and the average size is the held quantity. Seed those.
+    # avg_price stays 0 — the dashboard prefers IBKR's own CostBasisPrice for
+    # anything still open, and the covered=False guard keeps the zero from
+    # ever being used as a rebuilt cost.
+    #
+    # Only when Statement of Funds was actually ingested: "no trade rows for
+    # this symbol" is evidence of buy-and-hold only if trade rows were being
+    # collected at all. On a query without SoF every symbol has no rows, and
+    # seeding would stamp a mid-window purchase as deployed the whole year.
+    if from_d and to_d and to_d > from_d and account.get("_sof_seen"):
+        window_days = (to_d - from_d).days
+        for sym, qty in open_qty.items():
+            if qty <= 1e-9 or sym in account["cost_history"]:
+                continue
+            out[sym] = {
+                "avg_price": 0.0,
+                "bought_qty": 0.0,
+                "sold_qty": 0.0,
+                "covered": False,
+                "pre_existing": True,
+                "start": from_d.isoformat(),
+                "end": to_d.isoformat(),
+                "days": window_days,
+                "avg_shares": qty,
+            }
     account["cost_history"] = out
 
 
 def _ingest_statement_of_funds(account: dict[str, Any], row: dict[str, str]) -> None:
+    account["_sof_seen"] = True
     _ingest_trade_cost(account, row)
     code = row.get("ActivityCode", "")
     if code in _DIV_GROSS_CODES or code in _DIV_TAX_CODES:
@@ -755,8 +889,9 @@ def parse_ibkr_flex_csv(content: str) -> dict[str, Any]:
         # Strip internal scratch state before serialising. _cf_ids is a set
         # and would blow up json.dump if it ever survived to the writer.
         for k in ("_cash_flows", "_cf_ids", "_cf_synth_seq",
-                  "_div_cash", "_div_sof", "_div_ids", "_nav_date",
-                  "_starting_cash", "_from_date", "_to_date"):
+                  "_div_cash", "_div_sof", "_div_ids", "_div_synth_seq",
+                  "_sof_seen", "_nav_date", "_starting_cash",
+                  "_from_date", "_to_date"):
             acct.pop(k, None)
 
     return {"accounts": dict(accounts)}

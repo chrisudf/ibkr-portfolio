@@ -9,8 +9,47 @@ const fmtMoney = (v, digits = 0) => {
   const abs = Math.abs(v);
   return sign + "$" + abs.toLocaleString("en-US", { maximumFractionDigits: digits, minimumFractionDigits: digits });
 };
+// fmtMoney hard-codes "$". The dividend panel is denominated in whatever
+// currency the parser elected as that account's base, which is USD for most
+// books but need not be — printing HKD 780 as "$780" is exactly the 1:1
+// conflation the currency segregation exists to prevent, just moved into the
+// label. Empty / USD keeps the bare "$" so nothing changes for the common case.
+const fmtCcy = (v, digits = 0, ccy = "") => {
+  if (!ccy || ccy === "USD") return fmtMoney(v, digits);
+  const sign = v < 0 ? "-" : "";
+  return sign + ccy + " " + Math.abs(v).toLocaleString("en-US",
+    { maximumFractionDigits: digits, minimumFractionDigits: digits });
+};
 const fmtPct = (v, digits = 1) => (v * 100).toFixed(digits) + "%";
 const fmtNum = (v, digits = 2) => Number(v).toLocaleString("en-US", { maximumFractionDigits: digits, minimumFractionDigits: digits });
+
+// Statement periods come in two spellings and both must parse: the Flex path
+// synthesizes "2025-08-20 → 2026-08-19", while the Activity Statement path
+// passes IBKR's own wording through verbatim — "January 1, 2026 - June 30,
+// 2026". Matching only the ISO form silently disabled every window-derived
+// number (period days, chart bounds, 月均) on Activity uploads.
+// Kept as plain {y,m,d} — no Date round-trips, so no UTC/local off-by-one.
+const MONTH_NUM = {
+  january: 1, february: 2, march: 3, april: 4, may: 5, june: 6,
+  july: 7, august: 8, september: 9, october: 10, november: 11, december: 12,
+};
+const parsePeriodBounds = (period) => {
+  const p = period || "";
+  const iso = p.match(/(\d{4})-(\d{2})-(\d{2})\D+(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) {
+    return [{ y: +iso[1], m: +iso[2], d: +iso[3] },
+            { y: +iso[4], m: +iso[5], d: +iso[6] }];
+  }
+  const named = p.match(/([A-Za-z]+) (\d{1,2}), (\d{4})\s*[-–—]\s*([A-Za-z]+) (\d{1,2}), (\d{4})/);
+  if (named) {
+    const m1 = MONTH_NUM[named[1].toLowerCase()], m2 = MONTH_NUM[named[4].toLowerCase()];
+    if (m1 && m2) {
+      return [{ y: +named[3], m: m1, d: +named[2] },
+              { y: +named[6], m: m2, d: +named[5] }];
+    }
+  }
+  return null;
+};
 
 // The return KPI is computed over the Flex query's period, NOT since account
 // inception — a "Last 365 Calendar Days" query on an account opened earlier
@@ -19,20 +58,26 @@ const fmtNum = (v, digits = 2) => Number(v).toLocaleString("en-US", { maximumFra
 // "2025-07-10 → 2026-07-09" → 364. Returns 0 for the "截至 YYYY-MM-DD"
 // fallback period and anything else we can't read two dates out of.
 const periodDays = (period) => {
-  const m = (period || "").match(/(\d{4}-\d{2}-\d{2})\D+(\d{4}-\d{2}-\d{2})/);
-  if (!m) return 0;
-  const days = Math.round((Date.parse(m[2]) - Date.parse(m[1])) / 86400000);
+  const b = parsePeriodBounds(period);
+  if (!b) return 0;
+  const days = Math.round((Date.UTC(b[1].y, b[1].m - 1, b[1].d)
+    - Date.UTC(b[0].y, b[0].m - 1, b[0].d)) / 86400000);
   return days > 0 ? days : 0;
 };
 
-const fmtSpan = (days) => {
+// "近 N" (= the last N) is only true for trailing windows — Flex "Last 365
+// Calendar Days" queries. An Activity Statement covers a FIXED calendar
+// range that may have ended months ago; calling CY2025 "近 12 个月" in
+// August 2026 mislabels which year the return belongs to.
+const fmtSpan = (days, trailing = true) => {
   if (!days || days <= 0) return "";
+  const p = trailing ? "近 " : "";
   if (days >= 350) {
     const yrs = days / 365;
-    return yrs >= 1.9 ? `近 ${yrs.toFixed(1)} 年` : "近 12 个月";
+    return yrs >= 1.9 ? `${p}${yrs.toFixed(1)} 年` : `${p}12 个月`;
   }
   const months = Math.round(days / 30.44);
-  return months >= 2 ? `近 ${months} 个月` : `近 ${days} 天`;
+  return months >= 2 ? `${p}${months} 个月` : `${p}${days} 天`;
 };
 
 const $ = (id) => document.getElementById(id);
@@ -113,12 +158,110 @@ function mergeAccounts(accounts) {
   }
 
   // Dividends — sum across accounts, keyed by symbol and by month.
-  const divSym = {}, divMonth = {};
+  //
+  // Accounts can disagree on base currency (each parser run elects its own
+  // dominant one). Adding a HKD-based account's totals into a USD-based
+  // account's at 1:1 would be the exact mixing the per-account segregation
+  // exists to prevent — so first elect a merged base (net payment count,
+  // gross breaks ties), then treat every other-base account the way one
+  // account treats its own foreign rows: totals into the foreign buckets,
+  // nothing into by_symbol / by_month / the per-share union.
+  const ccyVotes = {};
+  for (const a of list) {
+    const d = a.dividends;
+    if (!d || !d.by_symbol || !d.base_currency) continue;
+    const v = ccyVotes[d.base_currency] || (ccyVotes[d.base_currency] = [0, 0]);
+    // NET payment count, matching the parser's own election. by_symbol.count
+    // only tallies positive bookings, so a corrected payout (+780/−780/+780)
+    // would cast two votes here for what the parser counts as one — enough to
+    // elect the wrong merged base and push the real base's totals into the
+    // foreign bucket. Signed gross events give the same −1 for a reversal the
+    // parser applies; count stays as the fallback for legacy payloads that
+    // predate the per-event currency field.
+    // Only the account's OWN base-currency payouts vote for it — `events`
+    // carries its foreign rows too, and those belong to their own currency,
+    // not to this account's base. (by_symbol, the fallback, already holds
+    // main rows only, which is why the count version needed no such filter.)
+    const evs = (d.events || []).filter(
+      e => e.kind === "gross" && e.currency === d.base_currency);
+    if (evs.length) {
+      for (const e of evs) v[0] += e.amount > 0 ? 1 : -1;
+    } else {
+      for (const s of d.by_symbol) v[0] += s.count || 0;
+    }
+    v[1] += Math.abs(d.gross || 0);
+  }
+  // Currency code breaks an exact count+amount tie so the election can't turn
+  // on object key order — same determinism the parsers guarantee.
+  const divBase = Object.keys(ccyVotes).reduce((best, c) => {
+    if (!best) return c;
+    const [a, b] = [ccyVotes[best], ccyVotes[c]];
+    return (b[0] > a[0] || (b[0] === a[0] && b[1] > a[1])
+      || (b[0] === a[0] && b[1] === a[1] && c > best)) ? c : best;
+  }, "");
+  const otherBase = (d) =>
+    !!(d.base_currency && divBase && d.base_currency !== divBase);
+
+  const divSym = {}, divMonth = {}, divForeign = {};
   let divGross = 0, divTax = 0, divNonDiv = 0, divSource = "";
+
+  // Ingest one raw event into the merged aggregates. Only needed for accounts
+  // whose own elected base differs from the merged one: their by_symbol /
+  // by_month sums are denominated in the wrong currency and can't be added,
+  // but individual payouts they made IN the merged base are ordinary
+  // merged-base cash. Mirrors _finalize_dividends' per-row logic so the two
+  // paths can't drift.
+  const ingestEvent = (e) => {
+    const t = divSym[e.symbol] || (divSym[e.symbol] = {
+      symbol: e.symbol, gross: 0, tax: 0, net: 0, count: 0,
+      per_share: 0, per_share_ordinary: 0, non_dividend: 0,
+      rate_missing: 0, last_date: "",
+    });
+    if (e.kind === "gross") {
+      divGross += e.amount; t.gross += e.amount;
+      if (e.amount > 0) t.count += 1;                       // reversals aren't payments
+      if (e.income_class !== "ordinary") { t.non_dividend += e.amount; divNonDiv += e.amount; }
+      if (!e.per_share && e.amount > 0) t.rate_missing += 1;
+    } else {
+      divTax += e.amount; t.tax += e.amount;
+    }
+    t.net = t.gross + t.tax;
+    if (e.date > t.last_date) t.last_date = e.date;
+    const mk = (e.date || "").slice(0, 7);
+    const m = divMonth[mk] || (divMonth[mk] = { month: mk, gross: 0, tax: 0, net: 0 });
+    if (e.kind === "gross") m.gross += e.amount; else m.tax += e.amount;
+    m.net = m.gross + m.tax;
+  };
+
   for (const a of list) {
     const d = a.dividends;
     if (!d || !d.by_symbol) continue;
-    divSource = divSource || d.source;
+    divSource = !divSource ? d.source
+      : (d.source && d.source !== divSource ? "mixed" : divSource);
+    // Foreign-currency payouts are excluded from every total, so summing the
+    // per-currency buckets across accounts is safe — they're plain cash.
+    // One exception: a bucket denominated in the MERGED base isn't foreign
+    // here at all. An HKD-dominant account files its USD payouts under
+    // foreign.USD; if another account makes USD the merged base, that cash is
+    // ordinary merged-base income and gets re-ingested from events below.
+    for (const [c, f] of Object.entries(d.foreign || {})) {
+      if (c === divBase) continue;
+      const t = divForeign[c] || (divForeign[c] = { gross: 0, tax: 0, net: 0, count: 0 });
+      t.gross += f.gross; t.tax += f.tax; t.net += f.net; t.count += f.count || 0;
+    }
+    if (otherBase(d)) {
+      // Whole account denominated in another currency: report, don't add.
+      const t = divForeign[d.base_currency]
+        || (divForeign[d.base_currency] = { gross: 0, tax: 0, net: 0, count: 0 });
+      t.gross += d.gross || 0; t.tax += d.tax || 0; t.net += d.net || 0;
+      for (const s of d.by_symbol) t.count += s.count || 0;
+      // ...except whatever it paid in the merged base, which does belong in
+      // the totals, by_symbol and by_month like any other account's income.
+      for (const e of d.events || []) {
+        if (e.currency && e.currency === divBase) ingestEvent(e);
+      }
+      continue;
+    }
     divGross += d.gross || 0;
     divTax += d.tax || 0;
     divNonDiv += d.non_dividend || 0;
@@ -134,7 +277,10 @@ function mergeAccounts(accounts) {
       // double it. Take the widest coverage instead: the account that held
       // through the most ex-dates saw the most of the year's rate.
       t.non_dividend += s.non_dividend || 0;   // cash, so this one does add
-      t.rate_missing = Math.max(t.rate_missing, s.rate_missing || 0);
+      // A count of rate-less PIL cash events; events in different accounts
+      // are distinct payments, so counts add (same as `count` above) — max
+      // undercounts whenever both accounts had them.
+      t.rate_missing += s.rate_missing || 0;
       t.last_date = t.last_date > s.last_date ? t.last_date : s.last_date;
     }
     for (const m of d.by_month || []) {
@@ -150,11 +296,27 @@ function mergeAccounts(accounts) {
   // the other gets credit for every ex-date either of them was present for.
   const seenPay = {};
   for (const a of list) {
-    for (const e of a.dividends?.events || []) {
+    const d = a.dividends || {};
+    // Occurrence ordinal per account: a cancel + re-book at the same
+    // date/rate is (+r, -r, +r) — without the ordinal the re-book collides
+    // with the original's key and the union nets to zero, re-dropping in
+    // the merged view the exact payout the parser's own seq keeps. Counting
+    // per account, then unioning on (payment, n), still collapses the same
+    // payment seen from two accounts while keeping within-account repeats.
+    const occ = {};
+    for (const e of d.events || []) {
       if (e.kind !== "gross" || !e.per_share) continue;
+      // Rates outside the MERGED base never joined the merged by_symbol sums,
+      // so they must not join the union either — an AUD rate divided by a USD
+      // cost is not a yield. Testing against divBase rather than the account's
+      // own base is what lets an other-base account still contribute the rates
+      // of the payouts it made in the merged base (those did join, above).
+      if (e.currency && divBase && e.currency !== divBase) continue;
       const t = divSym[e.symbol];
       if (!t) continue;
-      const key = `${e.symbol}|${e.date}|${e.per_share}`;
+      const pay = `${e.symbol}|${e.date}|${e.per_share}`;
+      const n = (occ[pay] = (occ[pay] || 0) + 1);
+      const key = `${pay}|${n}`;
       if (seenPay[key]) continue;
       seenPay[key] = true;
       t.per_share += e.per_share;
@@ -168,6 +330,8 @@ function mergeAccounts(accounts) {
     tax: divTax,
     net: divGross + divTax,
     non_dividend: divNonDiv,
+    base_currency: divBase,
+    foreign: divForeign,
     by_symbol: Object.values(divSym).sort((a, b) => b.net - a.net),
     by_month: Object.values(divMonth).sort((a, b) => a.month.localeCompare(b.month)),
     events: list.flatMap(a => a.dividends?.events || [])
@@ -178,10 +342,39 @@ function mergeAccounts(accounts) {
   // averaging averages, which would ignore how many shares each account held.
   const histAcc = {};
   for (const a of list) {
+    // Each account's own per-share rates, for the ex-date benchmark below.
+    // Other-base accounts contribute nothing: their rates are denominated in
+    // a currency whose cash never enters the merged gross either.
+    const rateBySym = {};
+    if (otherBase(a.dividends || {})) {
+      // by_symbol is denominated in this account's own base, which isn't the
+      // merged one — but the payouts it made in the merged base do count, and
+      // their rates are exactly the ones that joined the merged sums above.
+      for (const e of a.dividends?.events || []) {
+        if (e.kind === "gross" && e.currency === divBase && e.per_share) {
+          rateBySym[e.symbol] = (rateBySym[e.symbol] || 0) + e.per_share;
+        }
+      }
+    } else {
+      for (const s of a.dividends?.by_symbol || []) rateBySym[s.symbol] = s.per_share || 0;
+    }
     for (const [sym, h] of Object.entries(a.cost_history || {})) {
       const t = histAcc[sym] || (histAcc[sym] = {
         qty: 0, cost: 0, sold: 0, covered: true, start: "", end: "", shares: 0, pre: false,
+        should: 0, split: false,
       });
+      // A forward split is a corporate action — it hits the name in every
+      // account. One flagged entry poisons the merged one: its start/end
+      // still span the window, so recomputing days below would resurrect
+      // the exact phantom annualization the parser just suppressed.
+      t.split = t.split || !!h.split_suspect;
+      // The "what a steady holder would have collected" benchmark must be
+      // built per account and summed — each avg_shares is a time-average over
+      // that account's OWN window, so multiplying the summed shares by the
+      // union-of-windows rate would claim every account attended every
+      // ex-date either of them saw, firing a phantom 除息日缺口 exactly when
+      // the accounts held the name over different stretches.
+      t.should += (h.avg_shares || 0) * (rateBySym[sym] || 0);
       t.qty += h.bought_qty;
       t.cost += h.avg_price * h.bought_qty;
       t.sold += h.sold_qty;
@@ -196,14 +389,26 @@ function mergeAccounts(accounts) {
   }
   const cost_history = {};
   for (const [sym, t] of Object.entries(histAcc)) {
-    if (t.qty > 0) {
-      cost_history[sym] = {
-        avg_price: t.cost / t.qty, bought_qty: t.qty, sold_qty: t.sold, covered: t.covered,
-        days: (t.start && t.end)
-          ? Math.max(0, Math.round((Date.parse(t.end) - Date.parse(t.start)) / 86400000))
-          : 0,
-        avg_shares: t.shares, pre_existing: t.pre,
-      };
+    // qty > 0 = at least one account traded it; shares > 0 = at least one
+    // account carries a seeded buy-and-hold entry (zero trades, whole-window
+    // deployment). Both deserve a merged entry — dropping the seeded-only
+    // case would lose days/avg_shares in the 总账户 view that every
+    // per-account view still shows.
+    if (t.qty > 0 || t.shares > 0 || t.split) {
+      cost_history[sym] = t.split
+        // Split-poisoned: keep the entry (so the row renders) but with every
+        // time-derived stat suppressed, matching the per-account views.
+        ? { avg_price: 0, bought_qty: t.qty, sold_qty: t.sold, covered: false,
+            days: 0, avg_shares: 0, pre_existing: t.pre, should_gross: 0,
+            split_suspect: true }
+        : { avg_price: t.qty > 0 ? t.cost / t.qty : 0, bought_qty: t.qty, sold_qty: t.sold,
+            covered: t.covered && t.qty > 0,
+            days: (t.start && t.end)
+              ? Math.max(0, Math.round((Date.parse(t.end) - Date.parse(t.start)) / 86400000))
+              : 0,
+            avg_shares: t.shares, pre_existing: t.pre,
+            should_gross: t.should,
+          };
     }
   }
 
@@ -311,7 +516,10 @@ function render(data) {
   // parsing that string would label the number with the wrong window —
   // it'd pick up whichever range happens to be listed first.
   const spanDays = (acct === "ALL" ? 0 : periodDays(period)) || (mm && mm.days) || 0;
-  const span = fmtSpan(spanDays);
+  // Month-name periods (Activity Statements) are fixed calendar ranges, not
+  // trailing windows — label them by length only, without "近".
+  const fixedWindow = /[A-Za-z]+ \d{1,2}, \d{4}/.test(period);
+  const span = fmtSpan(spanDays, !fixedWindow);
   const suffix = span ? `（${span}）` : "";
   const scopeHint = `${span ? span + "，" : ""}按报表期间计算，非开户至今`;
   if (nav.twr) {
@@ -409,6 +617,8 @@ const CAPTURE_FLAG_DOLLARS = 10;
 
 // Reg-T floor for an uncovered contract: $250, i.e. $2.50/share.
 const MARGIN_FLOOR_PER_SHARE = 2.5;
+// Fallback deliverable for JSONs saved before the parser exported the
+// contract's own Multiplier column; standard US equity options are 100.
 const CONTRACT_MULTIPLIER = 100;
 
 // Underlying mark prices, pooled across every loaded account — a price is a
@@ -455,9 +665,23 @@ function computeMargin(data, priceBook) {
   const shorts = options.filter(o => o.quantity < 0)
     .sort((a, b) => (a.right === "C" ? 0 : 1) - (b.right === "C" ? 0 : 1));
 
+  // Contracts whose strike/right didn't parse (adjusted symbols the Activity
+  // Statement path couldn't read) must NOT fall through the formula: with
+  // strike 0 and no right, regTPerShare degenerates to the $2.50 floor and a
+  // multi-thousand-dollar requirement quietly prints as ~$250. Exclude their
+  // Reg-T leg and say so — but their market value is parsed independently of
+  // the symbol, and it is a hard lower bound on the liability, so it still
+  // belongs in the premium total and comes off the excess.
+  let unparsedContracts = 0, unparsedMv = 0;
   for (const o of shorts) {
+    if (!(o.strike > 0) || (o.right !== "P" && o.right !== "C")) {
+      unparsedContracts += Math.abs(o.quantity);
+      unparsedMv += Math.abs(o.value || 0);
+      continue;
+    }
     const qty = Math.abs(o.quantity);
-    const shares = qty * CONTRACT_MULTIPLIER;
+    const mult = o.multiplier || CONTRACT_MULTIPLIER;
+    const shares = qty * mult;
     const mv = Math.abs(o.value);
     const known = priceBook[o.underlying];
     // No price anywhere in the portfolio → assume the contract sits at the
@@ -468,7 +692,14 @@ function computeMargin(data, priceBook) {
 
     let covered = 0;
     if (o.right === "C") {
-      covered = Math.min(shares, Math.max(sharesLeft[o.underlying] || 0, 0));
+      // Reg-T covers by whole 100-share lots: a call is either backed by its
+      // full deliverable or it is naked. 80 shares against one short call earn
+      // no per-share credit — IBKR charges the full uncovered requirement.
+      // Prorating per share would understate exactly the odd-lot cases
+      // (fractional ETF positions) where the panel matters most.
+      const lots = Math.floor(Math.max(sharesLeft[o.underlying] || 0, 0) / mult);
+      const coveredContracts = Math.min(qty, lots);
+      covered = coveredContracts * mult;
       sharesLeft[o.underlying] = (sharesLeft[o.underlying] || 0) - covered;
     }
     const nakedShares = shares - covered;
@@ -491,25 +722,46 @@ function computeMargin(data, priceBook) {
     });
     b.contracts += qty;
     b[o.right === "P" ? "puts" : "calls"] += qty;
-    b.covered += covered / CONTRACT_MULTIPLIER;
+    b.covered += covered / mult;
     b.requirement += req;
     b.notional += notionalHere;
     b.premium += mv;
   }
 
+  // Excess liquidity the way IBKR actually computes it under Reg-T, not
+  // NAV − requirement. Two things NAV counts are not collateral: long US
+  // equity options have no loan value (a LEAP book cannot back new short
+  // puts), and long stock carries ~25% maintenance. NAV − requirement would
+  // overstate "can I sell another put" headroom by the whole LEAP sleeve
+  // plus a quarter of the stock — the dangerous direction for this panel.
+  //   excess ≈ cash + 75% × long stock − 130% × |short stock| − requirement
+  // Short stock gets a charge, not a credit: its sale proceeds already sit
+  // in cash at 100%, and Reg-T maintenance adds ~30% on top — folding it
+  // into a single 75% haircut would turn the maintenance into a credit.
+  // Unparsed short options also come off: their Reg-T leg is unknown (see
+  // above) but their market value is a known lower bound on the liability.
+  const stockValue = nav.stock || 0;
+  const longStock = Math.max(stockValue, 0);
+  const shortStock = Math.min(stockValue, 0);
   return {
     requirement,
     notional,
-    premium,
+    premium: premium + unparsedMv,
     totalNav,
     pctOfNav: totalNav > 0 ? requirement / totalNav : 0,
-    excess: totalNav - requirement,
+    excess: (nav.cash || 0) + longStock * 0.75 + shortStock * 1.3
+      - requirement - unparsedMv,
     // Negative cash is a real margin loan — that part accrues interest, unlike
     // collateral tied up behind short options.
     borrowed: Math.max(0, -(nav.cash || 0)),
     assumedContracts,
     assumedRequirement,
     assumedShare: requirement > 0 ? assumedRequirement / requirement : 0,
+    unparsedContracts,
+    unparsedMv,
+    // Magnitude of the short-stock deduction, so the panel can name the term
+    // only when it actually applies.
+    shortStockCharge: -shortStock * 1.3,
     rows: Object.values(byUnderlying).sort((a, b) => b.requirement - a.requirement),
   };
 }
@@ -521,21 +773,29 @@ function computeMargin(data, priceBook) {
 function mergeMargin(parts) {
   const out = {
     requirement: 0, notional: 0, premium: 0, totalNav: 0, excess: 0, borrowed: 0,
-    assumedContracts: 0, assumedRequirement: 0, rows: [],
+    assumedContracts: 0, assumedRequirement: 0, unparsedContracts: 0,
+    unparsedMv: 0, shortStockCharge: 0, rows: [],
   };
   const byU = {};
   for (const m of parts) {
     for (const k of ["requirement", "notional", "premium", "totalNav", "excess",
-                     "borrowed", "assumedContracts", "assumedRequirement"]) {
-      out[k] += m[k];
+                     "borrowed", "assumedContracts", "assumedRequirement",
+                     "unparsedContracts", "unparsedMv", "shortStockCharge"]) {
+      out[k] += m[k] || 0;
     }
     for (const r of m.rows) {
-      const b = byU[r.underlying] || (byU[r.underlying] = { ...r });
-      if (b !== r) {
-        for (const k of ["contracts", "puts", "calls", "covered", "requirement",
-                         "notional", "premium"]) b[k] += r[k];
-        b.priceKnown = b.priceKnown && r.priceKnown;
+      // First sight of an underlying seeds the bucket with a copy of the row;
+      // that copy already carries the row's values, so it must NOT be added
+      // into again. (Comparing `b !== r` doesn't express that — the spread
+      // copy is never === the source row, so it re-added the first account.)
+      const b = byU[r.underlying];
+      if (!b) {
+        byU[r.underlying] = { ...r };
+        continue;
       }
+      for (const k of ["contracts", "puts", "calls", "covered", "requirement",
+                       "notional", "premium"]) b[k] += r[k];
+      b.priceKnown = b.priceKnown && r.priceKnown;
     }
   }
   out.pctOfNav = out.totalNav > 0 ? out.requirement / out.totalNav : 0;
@@ -551,7 +811,7 @@ function renderMargin(data, accounts) {
   const m = merged
     ? mergeMargin(Object.values(accounts || {}).map(a => computeMargin(a, book)))
     : computeMargin(data, book);
-  if (!m.rows.length) { panel.hidden = true; return; }
+  if (!m.rows.length && !m.unparsedContracts) { panel.hidden = true; return; }
   panel.hidden = false;
 
   $("margin-amount").textContent = fmtMoney(m.requirement);
@@ -567,14 +827,34 @@ function renderMargin(data, accounts) {
   // room, past 60% a gap-down starts eating into excess liquidity fast.
   const tone = pct >= 60 ? "var(--red)" : pct >= 30 ? "var(--amber)" : "var(--green)";
   gauge.innerHTML = `<div class="margin-gauge-fill" style="width:${pct}%;background:${tone}"></div>`;
-  $("margin-gauge-note").textContent =
-    `账户总值 ${fmtMoney(m.totalNav)} · 估算剩余可用 ${fmtMoney(m.excess)}`;
+  const gaugeNote = $("margin-gauge-note");
+  // The printed formula has to list every term actually deducted, or an
+  // account carrying short stock / unparsed contracts sees a number that
+  // can't be reconciled with the text sitting next to it. Both extra terms
+  // are conditional, so they only show when they're non-zero.
+  const excessTerms = "现金 + 75% 正股"
+    + (m.shortStockCharge > 0 ? " − 130% 做空正股" : "")
+    + (m.unparsedMv > 0 ? " − 未解析合约权利金" : "")
+    + " − 占用";
+  gaugeNote.textContent =
+    `账户总值 ${fmtMoney(m.totalNav)} · 估算剩余流动性 ${fmtMoney(m.excess)}`
+    + `（${excessTerms}）`;
+  gaugeNote.title =
+    "近似 IBKR 的 Excess Liquidity：Reg-T 下长期权（含 LEAP）没有抵押价值、"
+    + "正股按 25% 维持保证金扣减，所以不是「净值 − 占用」。"
+    + "做空正股不是抵押品 —— 卖出所得已 100% 记在现金里，Reg-T 再加约 30% "
+    + "维持保证金，故按 130% 扣减。";
 
   const note = $("margin-note");
-  note.textContent = m.assumedContracts > 0
+  note.textContent = (m.assumedContracts > 0
     ? `Reg-T 估算 · ${m.assumedContracts} 张合约无正股报价，按平值估算`
       + `（占估算额 ${fmtPct(m.assumedShare, 0)}）`
-    : "Reg-T 估算 · 正股价格取自当前持仓";
+    : "Reg-T 估算 · 正股价格取自当前持仓")
+    + (m.unparsedContracts > 0
+      ? ` · ${m.unparsedContracts} 张合约读不出行权价/方向，其权利金负债`
+        + `（${fmtMoney(m.unparsedMv)}）已计入并从剩余流动性扣除，`
+        + `Reg-T 腿未计 —— 实际占用高于显示`
+      : "");
   note.title = m.assumedContracts > 0
     ? "平值假设对价外的卖put偏保守 —— 实际保证金通常低于此。"
       + "买入这些标的的正股后，价格会自动接入，数字随之收紧。"
@@ -825,12 +1105,14 @@ function monthRange(months, period) {
   // quarterly payer inside a 12-month window otherwise renders ~10 bars and
   // the monthly average divides by the wrong number of months — and the empty
   // months at the edges are exactly where a missed ex-date would show.
-  const bounds = (period || "").match(/(\d{4}-\d{2})-\d{2}\D+(\d{4}-\d{2})-\d{2}/);
+  const bounds = parsePeriodBounds(period);
   let cur = months[0].month;
   let last = months[months.length - 1].month;
   if (bounds) {
-    if (bounds[1] < cur) cur = bounds[1];
-    if (bounds[2] > last) last = bounds[2];
+    const ym = (b) => `${b.y}-${String(b.m).padStart(2, "0")}`;
+    const b1 = ym(bounds[0]), b2 = ym(bounds[1]);
+    if (b1 < cur) cur = b1;
+    if (b2 > last) last = b2;
   }
   const out = [];
   for (let i = 0; i < 240 && cur <= last; i++) {
@@ -858,8 +1140,16 @@ function renderDividends(data) {
   empty.hidden = true;
   body.hidden = false;
 
-  $("div-net").textContent = fmtMoney(div.net, 2);
-  $("div-gross").textContent = `税前 ${fmtMoney(div.gross, 2)} · 预扣税 ${fmtMoney(div.tax, 2)}`;
+  // Every money value below is dividend cash in the elected base currency.
+  const fm = (v, d) => fmtCcy(v, d, div.base_currency);
+
+  $("div-net").textContent = fm(div.net, 2);
+  const foreignCcys = Object.keys(div.foreign || {});
+  $("div-gross").textContent = `税前 ${fm(div.gross, 2)} · 预扣税 ${fm(div.tax, 2)}`
+    + (foreignCcys.length
+      ? ` · 另有 ${foreignCcys.map(c => `${c} ${fmtNum(div.foreign[c].net, 2)}`).join(" / ")}`
+        + ` 未计入（多币种不换汇）`
+      : "");
 
   // Yield is against the stock sleeve, not total NAV: cash and short options
   // pay no dividends, so dividing by NAV would understate what the equity
@@ -875,9 +1165,10 @@ function renderDividends(data) {
     cash_transactions: "Cash Transactions",
     statement_of_funds: "Statement of Funds",
     activity_statement: "Activity Statement",
+    mixed: "多来源（各账户报表类型不同）",
   }[div.source] || "报表";
   $("div-note").textContent = `${data.statement?.Period || ""} · 数据来自 ${sourceLabel}`
-    + (accrued ? ` · 另有应计未付 ${fmtMoney(accrued, 2)}` : "");
+    + (accrued ? ` · 另有应计未付 ${fm(accrued, 2)}` : "");
 
   // Monthly bars
   const months = monthRange(div.by_month || [], data.statement?.Period);
@@ -886,15 +1177,15 @@ function renderDividends(data) {
   chart.innerHTML = months.map(m => {
     const h = Math.max(2, Math.abs(m.net) / maxNet * 100);
     const label = m.month.slice(2).replace("-", "/");
-    return `<div class="div-bar" title="${m.month} 净分红 ${fmtMoney(m.net, 2)}">
+    return `<div class="div-bar" title="${m.month} 净分红 ${fm(m.net, 2)}">
         <div class="div-bar-fill" style="height:${h}%"></div>
         <div class="div-bar-label">${label}</div>
       </div>`;
   }).join("");
   const best = months.reduce((a, b) => (b.net > (a?.net ?? -Infinity) ? b : a), null);
   $("div-chart-note").textContent = months.length
-    ? `${months.length} 个月 · 月均 ${fmtMoney(div.net / months.length, 2)}`
-      + (best && best.net > 0 ? ` · 最高 ${best.month} ${fmtMoney(best.net, 2)}` : "")
+    ? `${months.length} 个月 · 月均 ${fm(div.net / months.length, 2)}`
+      + (best && best.net > 0 ? ` · 最高 ${best.month} ${fm(best.net, 2)}` : "")
     : "";
 
   const tbody = $("div-body");
@@ -939,9 +1230,12 @@ function renderDividends(data) {
     const nonDiv = s.non_dividend || 0;
     // Worth flagging only when it moves the number, not on a rounding tail.
     const nonDivShare = s.gross > 0 ? nonDiv / s.gross : 0;
-    // Did the shares actually exist on the ex-dates?
+    // Did the shares actually exist on the ex-dates? The merged view ships a
+    // pre-summed benchmark (each account's avg_shares × its own rates) —
+    // summed avg_shares times the unioned rate would overstate it whenever
+    // the accounts held the name over different stretches.
     const avgShares = h && h.avg_shares ? h.avg_shares : 0;
-    const should = avgShares * dps;
+    const should = h && h.should_gross != null ? h.should_gross : avgShares * dps;
     const shortfall = should - s.gross;
     const missed = should > 0 && s.gross / should < CAPTURE_FLAG_RATIO
       && shortfall >= CAPTURE_FLAG_DOLLARS;
@@ -955,31 +1249,42 @@ function renderDividends(data) {
           + `<div class="yield-days">${days ? days + " 天，太短" : ""}</div>`
         : `<span class="muted">—</span>`;
     const yieldTitle = (cp && dps)
-      ? `每股股息 ${fmtMoney(dpsIncome, 4)}`
-        + (nonDiv ? `（已扣除每股 ${fmtMoney(dps - dpsIncome, 4)} 的资本利得分配）` : "")
-        + ` ÷ ${rebuilt ? "重建" : "平均"}成本 ${fmtMoney(cp, 2)}`
+      ? `每股股息 ${fm(dpsIncome, 4)}`
+        + (nonDiv ? `（已扣除每股 ${fm(dps - dpsIncome, 4)} 的资本利得分配）` : "")
+        + ` ÷ ${rebuilt ? "重建" : "平均"}成本 ${fm(cp, 2)}`
         + ` = 实收 ${fmtPct(realized, 2)}`
         + (days ? `（${days} 天）` : "")
         + (annual ? ` · 年化 ${fmtPct(annual, 2)}` : days ? " · 不足 30 天，不做年化" : "")
         + (h && h.pre_existing ? "（建仓早于报表期间，只算期内）" : "")
         + (rebuilt ? ` · 已清仓，成本由本期 ${fmtNum(h.bought_qty, 2)} 股买入记录重建` : "")
         + (s.rate_missing ? ` · ${s.rate_missing} 笔代付股息(PIL)不含每股报价，实际略高于此` : "")
-      : "建仓在报表期间之前，本期数据里没有买入记录，无法重建成本";
+      // The Activity Statement path builds no cost_history at all (no
+      // Statement of Funds trade rows), so "opened before the window" would
+      // be a fabricated explanation there — the machinery is simply absent.
+      // In a merged view with heterogeneous sources one flag can't say which
+      // pipeline this symbol came through, so the wording stays neutral.
+      : div.source === "activity_statement"
+        ? "Activity Statement 不含逐笔资金记录，无法重建成本与持有天数 ——"
+          + " 用 Flex 刷新（含 Statement of Funds）可得成本股息率"
+        : div.source === "mixed"
+          ? "该标的所在账户的报表不含逐笔资金记录（Activity Statement），"
+            + "或建仓早于报表期间 —— 两种情况都无法重建成本"
+          : "建仓在报表期间之前，本期数据里没有买入记录，无法重建成本";
     tr.innerHTML = `
       <td><b>${s.symbol}</b>${soldTag}${nonDivShare >= 0.05 ? ` <span class="tag tag-capgain" title="${
-        `其中 ${fmtMoney(nonDiv, 2)}（占税前 ${fmtPct(nonDivShare, 0)}）是资本利得/资本返还分配，`
+        `其中 ${fm(nonDiv, 2)}（占税前 ${fmtPct(nonDivShare, 0)}）是资本利得/资本返还分配，`
         + `不是股息收入。已计入税前与净额，但不计入成本股息率。`
       }">含资本利得</span>` : ""}${missed ? ` <span class="tag tag-miss" title="${
-        `期间平均持仓 ${fmtNum(avgShares, 2)} 股，若整段持有本可收 ${fmtMoney(should, 2)}，`
-        + `实收 ${fmtMoney(s.gross, 2)}，差 ${fmtMoney(shortfall, 2)}。`
+        `期间平均持仓 ${fmtNum(avgShares, 2)} 股，若整段持有本可收 ${fm(should, 2)}，`
+        + `实收 ${fm(s.gross, 2)}，差 ${fm(shortfall, 2)}。`
         + `常见原因：除息日前清仓（当期分红作废），或期间才建仓（错过前几次）。`
-      }">除息日缺口 ${fmtMoney(shortfall, 0)}</span>` : ""}</td>
+      }">除息日缺口 ${fm(shortfall, 0)}</span>` : ""}</td>
       <td class="num">${s.count}</td>
-      <td class="num muted">${fmtMoney(s.gross, 2)}</td>
-      <td class="num ${s.tax < 0 ? "down" : "muted"}">${s.tax ? fmtMoney(s.tax, 2) : "—"}</td>
-      <td class="num"><b>${fmtMoney(s.net, 2)}</b></td>
+      <td class="num muted">${fm(s.gross, 2)}</td>
+      <td class="num ${s.tax < 0 ? "down" : "muted"}">${s.tax ? fm(s.tax, 2) : "—"}</td>
+      <td class="num"><b>${fm(s.net, 2)}</b></td>
       <td class="num">${fmtPct(div.net ? s.net / div.net : 0, 1)}</td>
-      <td class="num muted">${dps ? fmtMoney(dps, 4) : "—"}</td>
+      <td class="num muted">${dps ? fm(dps, 4) : "—"}</td>
       <td class="num" title="${yieldTitle}">${yieldCell}</td>
       <td class="muted">${s.last_date || "—"}</td>
     `;

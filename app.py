@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import time
 from pathlib import Path
 from threading import Lock
@@ -62,8 +63,14 @@ _ACCT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 def _save_accounts(payload: dict) -> tuple[list[str], list[str]]:
     """Write per-account JSON files; returns (saved, skipped) account ids.
 
-    Writes to a temp file then os.replace so a concurrent reader never
-    sees a half-written JSON.
+    Writes to a temp file then os.replace so a concurrent reader never sees
+    a half-written JSON. The temp file must be unique per writer, not a
+    fixed "<acct>.json.tmp": upload and refresh run on different threads
+    (and the weekly cron delivers through /api/upload), so two writers of
+    the same account can overlap — sharing one temp path would interleave
+    their json.dump output and publish a corrupt file. With mkstemp each
+    writer replaces from its own file and the outcome is a clean
+    last-writer-wins.
     """
     saved: list[str] = []
     skipped: list[str] = []
@@ -73,10 +80,18 @@ def _save_accounts(payload: dict) -> tuple[list[str], list[str]]:
             skipped.append(str(acct_id))
             continue
         out_path = UPLOAD_DIR / f"{acct_id}.json"
-        tmp_path = out_path.with_name(out_path.name + ".tmp")
-        with open(tmp_path, "w", encoding="utf-8") as out:
-            json.dump(data, out, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, out_path)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(UPLOAD_DIR), prefix=out_path.name + ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as out:
+                json.dump(data, out, ensure_ascii=False, indent=2)
+            os.replace(tmp_name, out_path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
         saved.append(acct_id)
     return saved, skipped
 
@@ -143,8 +158,15 @@ def upload():
         return jsonify({"error": f"parse failed: {exc}"}), 400
 
     saved, skipped = _save_accounts(payload)
-    if skipped and not saved:
-        return jsonify({"error": "statement contains no valid account ids"}), 400
+    # Nothing saved is a failure regardless of *why* — the old guard
+    # (`skipped and not saved`) let a statement that parsed to zero accounts
+    # (every section unrecognized, or blank ClientAccountIDs) return
+    # ok:true, and the UI printed 已更新 ✓ while uploads/ was never touched.
+    if not saved:
+        msg = ("statement contains no valid account ids" if skipped
+               else "statement parsed but contained no account data "
+                    "(no recognizable sections or account ids)")
+        return jsonify({"error": msg}), 400
 
     resp = {"ok": True, "accounts": saved}
     if skipped:
