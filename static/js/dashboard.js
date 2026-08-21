@@ -508,6 +508,7 @@ async function loadPortfolio() {
   // switcher doesn't label it as a masked "default".
   const accounts = payload.accounts || { [payload.account?.Account || "default"]: payload };
   currentDataRef.allAccounts = accounts;
+  currentDataRef.sync = payload.sync || null;
   // Default to the alphabetically-first account (puts U17xxxx ahead of U22xxxx)
   // rather than the merged view — most viewing happens per-account.
   if (!currentDataRef.selected || (currentDataRef.selected !== "ALL" && !accounts[currentDataRef.selected])) {
@@ -533,7 +534,19 @@ function render(data) {
   const acct = account.Account || "";
   const masked = acct === "ALL" ? "总账户" : maskAccountId(acct);
   const period = statement.Period || "";
-  $("account-line").textContent = [masked, period].filter(Boolean).join(" · ") || "已导入";
+  // Auto-sync heartbeat next to the account id — "is the unattended sync
+  // alive" should be answerable at a glance, not by ssh-ing into the box.
+  const sync = currentDataRef.sync;
+  let syncLabel = "";
+  if (sync && sync.mode && sync.mode !== "off") {
+    const cadence = sync.mode === "daily" ? "每日" : "每周";
+    syncLabel = sync.last_attempt
+      ? `自动同步(${cadence}) ${sync.last_attempt.slice(5, 16).replace("T", " ")}Z ${sync.ok ? "✓" : "✗"}`
+      : `自动同步(${cadence}) 待首跑`;
+  }
+  const line = $("account-line");
+  line.textContent = [masked, period, syncLabel].filter(Boolean).join(" · ") || "已导入";
+  line.title = sync && sync.detail ? sync.detail : "";
 
   // KPIs
   $("kpi-nav").textContent = fmtMoney(totalNav);
