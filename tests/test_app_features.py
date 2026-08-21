@@ -76,6 +76,37 @@ def test_load_limit_returns_newest(tmp_path):
     assert [s["date"] for s in snaps] == ["2026-08-08", "2026-08-09", "2026-08-10"]
 
 
+def test_as_of_date_from_activity_statement_period():
+    acct = _acct()
+    del acct["nav_history"]
+    acct["statement"] = {"Period": "January 1, 2026 - June 30, 2026"}
+    record_snapshot_dir = None  # noqa: F841
+    from parser.snapshots import _as_of_date
+    assert _as_of_date(acct) == "2026-06-30"      # statement end, never "today"
+    acct["statement"] = {"Period": "截至 2026-08-19"}
+    assert _as_of_date(acct) == "2026-08-19"
+    acct["statement"] = {"Period": "gibberish"}
+    assert _as_of_date(acct) == ""
+
+
+def test_undateable_payload_not_recorded(tmp_path):
+    acct = _acct()
+    del acct["nav_history"]
+    acct["statement"] = {}
+    record_snapshot(tmp_path, "U1", acct)          # must be a silent no-op
+    assert load_snapshots(tmp_path, "U1") == []
+
+
+def test_sync_env_parsing_never_crashes():
+    from app import _parse_sync_day, _parse_sync_hour
+    assert _parse_sync_hour("9am") == 9            # typo degrades, not crashes
+    assert _parse_sync_hour("24") == 9             # out of range
+    assert _parse_sync_hour('"14"') == 14          # quoted env survives
+    assert _parse_sync_hour("") == 9
+    assert _parse_sync_day("monday") == "mon"
+    assert _parse_sync_day("noday") == "sat"
+
+
 def test_auto_sync_due_logic():
     from app import _auto_sync_due
     dt = lambda s: datetime.fromisoformat(s).replace(tzinfo=timezone.utc)  # noqa: E731

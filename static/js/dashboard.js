@@ -1034,6 +1034,14 @@ const SNAP_MIN_GAP = 5, SNAP_TARGET_GAP = 7, SNAP_MAX_GAP = 16;
 // The live payload reduced to the exact shape the server snapshots.
 function liveSnapshot(data) {
   const hist = data.nav_history || [];
+  // As-of date: the NAV series tail (Flex), else the statement period's end
+  // (Activity Statement) — mirroring the server's _as_of_date, so AS-only
+  // accounts can diff too instead of forever showing "快照积累中".
+  let date = hist.length ? hist[hist.length - 1].date : "";
+  if (!date) {
+    const b = parsePeriodBounds(data.statement?.Period);
+    if (b) date = `${b[1].y}-${String(b[1].m).padStart(2, "0")}-${String(b[1].d).padStart(2, "0")}`;
+  }
   const stocks = {};
   for (const s of data.stocks || []) {
     stocks[s.symbol] = [s.quantity, s.close_price, s.value, s.unrealized_pl];
@@ -1043,11 +1051,7 @@ function liveSnapshot(data) {
     perf[sym] = [p.realized_total || 0, p.unrealized_total || 0,
                  p.asset_category === "Stocks" ? "S" : "O"];
   }
-  return {
-    date: hist.length ? hist[hist.length - 1].date : "",
-    nav: data.nav?.total || 0,
-    stocks, perf,
-  };
+  return { date, nav: data.nav?.total || 0, stocks, perf };
 }
 
 function pickBaseline(snapshots, curDate) {
@@ -1084,7 +1088,13 @@ function weeklyDiff(current, snapshots) {
     if (CASH_EQUIVALENTS.has(u)) continue;  // SGOV drift is not a "mover"
     const r = R(u);
     r.pnlR += now[0] - was[0];
-    r.pnlU += now[1] - was[1];
+    // Stocks take ΔU from the position maps below, NOT from perf: a stock
+    // held at the baseline but absent from that statement's MTM section
+    // would otherwise default to 0 and book its entire LIFETIME unrealized
+    // as this week's move (a $2k phantom "winner" in live testing).
+    // Options have no stocks-map entry, so perf is their only source; a
+    // one-sided option row is a genuine open/close, not a data gap.
+    if (kind !== "S") r.pnlU += now[1] - was[1];
   }
   const syms = new Set([
     ...Object.keys(current.stocks || {}), ...Object.keys(base.snap.stocks || {}),
@@ -1094,18 +1104,35 @@ function weeklyDiff(current, snapshots) {
     const now = (current.stocks || {})[sym];
     const was = (base.snap.stocks || {})[sym];
     const r = R(sym);
+    r.pnlU += (now ? now[3] : 0) - (was ? was[3] : 0);
     r.qtyNow = now ? now[0] : 0;
     r.qtyBase = was ? was[0] : 0;
-    if (now && was && now[1] > 0 && was[1] > 0) r.pxPct = now[1] / was[1] - 1;
+    if (now && was && now[1] > 0 && was[1] > 0) {
+      r.pxPct = now[1] / was[1] - 1;
+      // A split between the two snapshots changes the share-count unit:
+      // qty and price move in reciprocal proportion while the value stays
+      // continuous. "-75% · 加仓" would be doubly wrong, so suppress both.
+      if (r.qtyBase > 0 && r.qtyNow > 0) {
+        const qr = r.qtyNow / r.qtyBase, pr = was[1] / now[1];
+        if (Math.abs(qr - 1) > 0.05 && Math.abs(qr / pr - 1) < 0.02) {
+          r.pxPct = null;
+          r.splitLike = true;
+        }
+      }
+    }
   }
   const list = Object.values(rows)
     .map(r => ({ ...r, total: r.pnlU + r.pnlR }))
     .filter(r => Math.abs(r.total) >= 1 || r.pxPct != null)
     .sort((a, b) => b.total - a.total);
-  return { baseDate: base.snap.date, days: base.gap, navBase: base.snap.nav, rows: list };
+  return {
+    baseDate: base.snap.date, days: base.gap,
+    navBase: base.snap.nav, navNow: current.nav, rows: list,
+  };
 }
 
 function positionTag(r) {
+  if (r.splitLike) return "";  // share counts changed unit, not conviction
   if (r.qtyBase > 1e-9 && r.qtyNow <= 1e-9) return "清仓";
   if (r.qtyBase <= 1e-9 && r.qtyNow > 1e-9) return "新建";
   if (r.qtyNow > r.qtyBase + 1e-9) return "加仓";
@@ -1149,6 +1176,8 @@ function renderWeekly(data, accounts, selected) {
       t.pnlU += r.pnlU; t.pnlR += r.pnlR; t.total += r.total;
       t.qtyNow += r.qtyNow; t.qtyBase += r.qtyBase;
       if (t.pxPct == null) t.pxPct = r.pxPct;  // same security, same move
+      t.splitLike = t.splitLike || !!r.splitLike;
+      if (t.splitLike) t.pxPct = null;
     }
   }
   const rows = Object.values(merged).sort((a, b) => b.total - a.total);
@@ -1161,9 +1190,12 @@ function renderWeekly(data, accounts, selected) {
     `${baseDates[0]} → ${curDate || "最新"} · ${diffs[0].days} 天`
     + (fresh ? ` · ${fresh} 个账户快照尚新未计入` : "");
 
-  // Headline: NAV change over the same window, plus the flow-stripped TWR
-  // from the (merged) nav_history slice.
-  const navNow = targets.reduce((s, a) => s + (a.nav?.total || 0), 0);
+  // Headline: NAV change over the same window. Numerator and denominator
+  // must cover the SAME account set — summing every account's current NAV
+  // against only the baselined accounts' old NAV would book a newly added
+  // account's entire balance as this week's "gain". weeklyDiff carries its
+  // own navNow so both sides come from exactly the accounts being diffed.
+  const navNow = diffs.reduce((s, d) => s + (d.navNow || 0), 0);
   const navBase = diffs.reduce((s, d) => s + (d.navBase || 0), 0);
   const slice = (data.nav_history || []).filter(p => p.date >= baseDates[0]);
   const st = navStats(slice, data.cash_flows || []);
@@ -1968,8 +2000,11 @@ function attachSorters(currentDataRef) {
 let rankMode = "underlying";
 
 function optionUnderlying(sym) {
-  // "NVDA 17JUL26 155 P" -> "NVDA"
-  const m = sym.match(/^([A-Z\.]+)\s/);
+  // "NVDA 17JUL26 155 P" -> "NVDA". Corporate-action-adjusted contracts are
+  // spelled with a numeric suffix ("COHR1 16OCT26 320 C") — strip it so the
+  // adjusted legs merge back onto the same underlying as the stock; US
+  // tickers themselves never contain digits.
+  const m = sym.match(/^([A-Z\.]+)\d*\s/);
   return m ? m[1] : sym;
 }
 
