@@ -1594,15 +1594,18 @@ function renderNavHistory(data) {
  *
  * Exposure, per underlying:
  *
- *   正股市值 + 期权多头市值 + 卖出 put 全部被行权的名义
+ *   正股市值 + 期权多头市值
  *
- * The put leg is the whole point: a cash-secured put you have not been
- * assigned on yet is a position you have already committed to, and a cap that
- * ignores it is a cap you can blow through without a single share changing
- * hands. Long options enter at market value — the same number the 资产配置 bar
- * counts — rather than at notional, because a LEAPS call's strike × 100 would
- * print a position several times the capital actually at risk. Short calls are
- * left out: they cap the upside on stock that is already counted above.
+ * — capital actually deployed into the name. Long options enter at MARKET
+ * VALUE, the same number the 资产配置 bar counts, rather than at notional: a
+ * LEAPS call's strike × 100 would print a position several times the capital
+ * actually at risk. Short legs are excluded on both sides — a short put has no
+ * capital in it (its collateral is already counted as cash) and a short call
+ * only caps the upside on stock counted above.
+ *
+ * So an underlying you are only short puts on reads as 0% here. That is the
+ * definition working as intended, not a gap: assignment risk is a different
+ * question, and 保证金占用 + 卖方到期日历 are the panels that answer it.
  * ------------------------------------------------------------------------- */
 
 // The caps the modal offers, as fractions of total NAV. null ("不限") is the
@@ -1626,7 +1629,7 @@ function computeExposures(data) {
   const totalNav = nav.total || ((nav.cash || 0) + (nav.stock || 0) + (nav.options || 0)) || 0;
   const rows = {};
   const bucket = (sym) => rows[sym] || (rows[sym] = {
-    symbol: sym, stockMV: 0, longOptMV: 0, putNotional: 0, optionLegs: 0,
+    symbol: sym, stockMV: 0, longOptMV: 0, optionLegs: 0,
   });
   for (const s of data.stocks || []) {
     if (CASH_EQUIVALENTS.has(s.symbol)) continue;
@@ -1636,15 +1639,13 @@ function computeExposures(data) {
     const sym = o.underlying;
     if (!sym || CASH_EQUIVALENTS.has(sym)) continue;
     const b = bucket(sym);
+    // Short legs still create the bucket — an underlying held only through
+    // sold puts must stay listed (and configurable) even at 0 exposure.
     b.optionLegs += 1;
-    if (o.quantity > 0) {
-      b.longOptMV += Math.max(o.value || 0, 0);
-    } else if (o.quantity < 0 && o.right === "P" && o.strike > 0) {
-      b.putNotional += o.strike * Math.abs(o.quantity) * (o.multiplier || CONTRACT_MULTIPLIER);
-    }
+    if (o.quantity > 0) b.longOptMV += Math.max(o.value || 0, 0);
   }
   for (const b of Object.values(rows)) {
-    b.exposure = b.stockMV + b.longOptMV + b.putNotional;
+    b.exposure = b.stockMV + b.longOptMV;
     b.weight = totalNav > 0 ? b.exposure / totalNav : 0;
   }
   return { totalNav, bySymbol: rows };
@@ -1681,8 +1682,7 @@ function exposureTip(r) {
   const bits = [];
   if (r.stockMV) bits.push(`正股 ${fmtMoney(r.stockMV, 0)}`);
   if (r.longOptMV) bits.push(`期权多头 ${fmtMoney(r.longOptMV, 0)}`);
-  if (r.putNotional) bits.push(`卖put名义 ${fmtMoney(r.putNotional, 0)}`);
-  return bits.join(" + ") || "无持仓";
+  return bits.join(" + ") || "无投入资本";
 }
 
 // One row per CONFIGURED symbol. Symbols that are configured but no longer
@@ -1692,7 +1692,7 @@ function exposureTip(r) {
 function positionRows() {
   const cfg = positionSettings();
   const { totalNav, bySymbol } = portfolioExposures();
-  const empty = { stockMV: 0, longOptMV: 0, putNotional: 0, exposure: 0, weight: 0, optionLegs: 0 };
+  const empty = { stockMV: 0, longOptMV: 0, exposure: 0, weight: 0, optionLegs: 0 };
   const rows = Object.keys(cfg).map(sym => {
     const ex = bySymbol[sym] || empty;
     const c = cfg[sym];
@@ -1751,10 +1751,15 @@ function renderCorePositions() {
     } else if (r.status === "ok") {
       verdict = '<span class="tag tag-inband">区间内</span>';
     }
+    // Zero exposure has two very different causes and a core holding sitting
+    // at 0% deserves to say which: nothing left, or only sold premium (which
+    // this definition deliberately does not count as capital deployed).
+    const stateTag = !r.held ? ' <span class="tag tag-gone">已清仓</span>'
+      : r.exposure > 0 ? ""
+      : ' <span class="tag tag-gone">仅卖方期权</span>';
     const tr = document.createElement("tr");
     tr.innerHTML = `
-      <td><b>${r.symbol}</b>${r.core ? ' <span class="tag tag-core">核心</span>' : ""}${
-        r.held ? "" : ' <span class="tag tag-gone">已清仓</span>'}</td>
+      <td><b>${r.symbol}</b>${r.core ? ' <span class="tag tag-core">核心</span>' : ""}${stateTag}</td>
       <td class="num" title="${exposureTip(r)}">${fmtMoney(r.exposure, 0)}</td>
       <td class="num ${tone}"><b>${fmtPct(r.weight, 1)}</b></td>
       <td class="num muted">${target}</td>
@@ -1822,7 +1827,9 @@ function openPositionModal() {
     const ex = bySymbol[sym];
     const tr = document.createElement("tr");
     tr.dataset.sym = sym;
-    const held = ex ? `${fmtPct(ex.weight, 1)} · ${fmtMoney(ex.exposure, 0)}` : "已清仓";
+    const held = !ex ? "已清仓"
+      : ex.exposure > 0 ? `${fmtPct(ex.weight, 1)} · ${fmtMoney(ex.exposure, 0)}`
+      : "0% · 仅卖方期权";
     tr.innerHTML = `
       <td>
         <b>${sym}</b>
