@@ -393,6 +393,14 @@
         <b>核心持仓</b>只是个标记（热力图上的白圈 + 排序），不影响判定 —— 下限填了多少就是多少。
         <br>标的列出的是<b>所有账号</b>持有的（规则全局共享），后面的百分比是<b>当前账号</b>的。
       </div>
+      <div class="modal-tools">
+        <span class="modal-tools-label">排序</span>
+        <div class="seg-toggle" id="pos-sort">
+          <button type="button" data-sort="weight" class="active">按占比</button>
+          <button type="button" data-sort="symbol">按标的 A–Z</button>
+          <button type="button" data-sort="core">核心持仓优先</button>
+        </div>
+      </div>
       <div class="modal-body">
         <table class="holdings pos-table">
           <thead>

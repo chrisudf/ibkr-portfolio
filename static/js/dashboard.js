@@ -1840,7 +1840,7 @@ let posDraft = null;
 // Fraction → the string that goes in the input box, and back. The toFixed
 // round-trip is not decoration: 0.05 * 100 is 5.000000000000001 in binary
 // floating point, and that is what the user would see in the box.
-const boundToInput = (v) => (v == null ? "" : String(+(v * 100).toFixed(4)));
+const boundToInput = (v) => (v == null || Number.isNaN(v) ? "" : String(+(v * 100).toFixed(4)));
 const inputToBound = (raw) => {
   const t = String(raw).trim();
   if (t === "") return null;
@@ -1848,25 +1848,54 @@ const inputToBound = (raw) => {
   return Number.isFinite(n) ? +(n / 100).toFixed(6) : NaN;
 };
 
+// Row order in the modal. Kept in module scope, not reset on open — the order
+// you last picked is the one you get next time.
+const POS_SORTS = {
+  // Ties broken by ticker in every mode, so the list never reshuffles between
+  // two renders that agree on the primary key.
+  weight: (a, b) => b.w - a.w || a.sym.localeCompare(b.sym),
+  symbol: (a, b) => a.sym.localeCompare(b.sym),
+  core: (a, b) => b.core - a.core || b.w - a.w || a.sym.localeCompare(b.sym),
+};
+let posSort = "weight";
+
 function openPositionModal() {
   const cfg = positionSettings();
-  const { bySymbol } = currentExposures();
   // Rows: every underlying held in ANY account (the rules are global), plus
   // anything already configured — so a rule on a since-exited symbol stays
   // editable and removable. The percentages beside them are the CURRENT
   // view's, which the modal note says out loud.
-  const syms = [...new Set([...allUnderlyings(), ...Object.keys(cfg)])];
-  syms.sort((a, b) => (bySymbol[b]?.weight || 0) - (bySymbol[a]?.weight || 0)
-    || a.localeCompare(b));
   posDraft = {};
-  for (const s of syms) {
-    const c = cfg[s] || {};
-    posDraft[s] = { core: !!c.core, min: c.min ?? null, max: c.max ?? null };
+  for (const sym of new Set([...allUnderlyings(), ...Object.keys(cfg)])) {
+    const c = cfg[sym] || {};
+    posDraft[sym] = { core: !!c.core, min: c.min ?? null, max: c.max ?? null };
   }
+  renderPositionRows();
+  $("pos-status").textContent = "";
+  $("pos-modal").hidden = false;
+  document.body.classList.add("modal-open");
+  $("pos-modal-close").focus();
+}
+
+// Rebuilt from posDraft, never from the stored config — so re-sorting in the
+// middle of an edit keeps every box exactly as typed.
+function renderPositionRows() {
+  const { bySymbol } = currentExposures();
+  const rows = Object.keys(posDraft || {}).map(sym => ({
+    sym,
+    core: posDraft[sym].core,
+    // Not held in THIS view sorts below a held-but-zero position (short
+    // premium only), which is a real difference, not a tie.
+    w: bySymbol[sym] ? bySymbol[sym].weight : -1,
+  }));
+  rows.sort(POS_SORTS[posSort] || POS_SORTS.weight);
+
+  $("pos-sort").querySelectorAll("button").forEach(b =>
+    b.classList.toggle("active", b.dataset.sort === posSort));
 
   const tbody = $("pos-body");
   tbody.innerHTML = "";
-  for (const sym of syms) {
+  for (const { sym } of rows) {
     const ex = bySymbol[sym];
     const tr = document.createElement("tr");
     tr.dataset.sym = sym;
@@ -1900,10 +1929,6 @@ function openPositionModal() {
     `;
     tbody.appendChild(tr);
   }
-  $("pos-status").textContent = "";
-  $("pos-modal").hidden = false;
-  document.body.classList.add("modal-open");
-  $("pos-modal-close").focus();
 }
 
 function closePositionModal() {
@@ -1971,6 +1996,13 @@ function wirePositionModal() {
   $("pos-modal-close").addEventListener("click", closePositionModal);
   $("pos-cancel").addEventListener("click", closePositionModal);
   $("pos-save").addEventListener("click", savePositionSettings);
+  // Re-sorting rebuilds the rows from posDraft, so anything typed survives it.
+  $("pos-sort").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-sort]");
+    if (!btn || btn.dataset.sort === posSort) return;
+    posSort = btn.dataset.sort;
+    renderPositionRows();
+  });
   // Backdrop click closes; a click inside the dialog must not reach it.
   $("pos-modal").addEventListener("click", (e) => {
     if (e.target === $("pos-modal")) closePositionModal();
