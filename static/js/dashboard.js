@@ -509,7 +509,7 @@ async function loadPortfolio() {
   const accounts = payload.accounts || { [payload.account?.Account || "default"]: payload };
   currentDataRef.allAccounts = accounts;
   currentDataRef.sync = payload.sync || null;
-  currentDataRef._exposures = null;   // memoized merge is now stale
+  currentDataRef._universe = null;    // memoized symbol list is now stale
   // Default to the alphabetically-first account (puts U17xxxx ahead of U22xxxx)
   // rather than the merged view — most viewing happens per-account.
   if (!currentDataRef.selected || (currentDataRef.selected !== "ALL" && !accounts[currentDataRef.selected])) {
@@ -612,12 +612,16 @@ function render(data) {
   // Weekly recap (per-underlying movers vs the ~7-day-old snapshot)
   renderWeekly(data, currentDataRef.allAccounts, currentDataRef.selected);
 
+  // Position rules are judged against THIS view — recompute before the
+  // treemap reads it per tile.
+  currentDataRef._exposures = computeExposures(data);
+
   // Treemap (tiles carry the core-holding ring / over-under badge)
   renderTreemap(stocks);
 
-  // Core holdings vs their caps — the badge legend, and the only place a
-  // flagged underlying with no stock leg (short puts only) can show up.
-  renderCorePositions();
+  // Core holdings vs their bands — the badge legend, and the only place an
+  // underlying with no stock leg (long options only) can show up.
+  renderCorePositions(masked);
 
   // Allocation bar — position view: cash, stock, long options (MV)
   // Short options excluded (their premium is already in cash); shown as a footnote.
@@ -1588,10 +1592,11 @@ function renderNavHistory(data) {
  *   仓位区间 — the share of total assets it should sit between, both ends
  *              typed as free percentages and either one optional
  *
- * Both are judged against the MERGED portfolio (every loaded account), never
- * whichever account tab is selected: "占总资产 10%" is a statement about the
- * whole book, and a symbol split across two accounts would otherwise read as
- * two comfortable half-positions instead of one oversized one.
+ * The RULES are global — one set of numbers, shared by every account — but the
+ * NUMBERS THEY JUDGE follow the account tab you are on: switch to U228 and the
+ * weights, badges and verdicts are all that account's. So the same 5–10% band
+ * is applied separately to each book, and the 总账户 tab applies it to the
+ * combined one.
  *
  * Exposure, per underlying:
  *
@@ -1650,18 +1655,32 @@ function computeExposures(data) {
   return { totalNav, bySymbol: rows };
 }
 
-// Memoized per data load — mergeAccounts() walks every position of every
-// account, and the treemap would otherwise re-run it once per tile.
-// loadPortfolio() clears the cache.
-function portfolioExposures() {
-  if (!currentDataRef._exposures) {
-    const accounts = currentDataRef.allAccounts || {};
-    const whole = Object.keys(accounts).length ? mergeAccounts(accounts) : null;
-    currentDataRef._exposures = whole
-      ? computeExposures(whole)
-      : { totalNav: 0, bySymbol: {} };
+// Exposure for the account currently on screen (the 总账户 tab passes the
+// merged book, so that case falls out for free). render() recomputes this
+// once per pass before anything reads it — the treemap calls it per tile, and
+// re-walking every position 22 times would be silly.
+function currentExposures() {
+  return currentDataRef._exposures || { totalNav: 0, bySymbol: {} };
+}
+
+// Every underlying held in ANY loaded account. The rules are global, so the
+// modal has to offer every symbol — otherwise a name held only in the account
+// you are not looking at would be unconfigurable until you switched tabs.
+// Memoized per data load; loadPortfolio() clears it.
+function allUnderlyings() {
+  if (!currentDataRef._universe) {
+    const set = new Set();
+    for (const acct of Object.values(currentDataRef.allAccounts || {})) {
+      for (const st of acct.stocks || []) {
+        if (!CASH_EQUIVALENTS.has(st.symbol)) set.add(st.symbol);
+      }
+      for (const o of acct.options || []) {
+        if (o.underlying && !CASH_EQUIVALENTS.has(o.underlying)) set.add(o.underlying);
+      }
+    }
+    currentDataRef._universe = set;
   }
-  return currentDataRef._exposures;
+  return currentDataRef._universe;
 }
 
 // null when there is nothing to judge (both boxes blank); else ok/over/under.
@@ -1686,13 +1705,16 @@ function exposureTip(r) {
   return bits.join(" + ") || "无投入资本";
 }
 
-// One row per CONFIGURED symbol. Symbols that are configured but no longer
-// held keep their row: a core holding you have fully exited is the most
-// extreme under-weight there is, and dropping the row would hide exactly the
-// case the panel exists to catch.
+// One row per CONFIGURED symbol, scored against the account on screen.
+// Symbols with no position in this view keep their row: a core holding at 0%
+// here is the most extreme under-weight there is, and dropping the row would
+// hide exactly the case the panel exists to catch. Whether it is 0% because
+// you exited or because it lives in the other account is a real distinction
+// though, so carry it.
 function positionRows() {
   const cfg = positionSettings();
-  const { totalNav, bySymbol } = portfolioExposures();
+  const { totalNav, bySymbol } = currentExposures();
+  const universe = allUnderlyings();
   const empty = { stockMV: 0, longOptMV: 0, exposure: 0, weight: 0, optionLegs: 0 };
   const rows = Object.keys(cfg).map(sym => {
     const ex = bySymbol[sym] || empty;
@@ -1703,6 +1725,7 @@ function positionRows() {
       min: c.min, max: c.max,
       status: positionStatus(ex.weight, c),
       held: !!bySymbol[sym],
+      elsewhere: !bySymbol[sym] && universe.has(sym),
     };
   });
   const rank = { over: 0, under: 1, ok: 2 };
@@ -1713,7 +1736,7 @@ function positionRows() {
   return { totalNav, rows };
 }
 
-function renderCorePositions() {
+function renderCorePositions(scopeLabel) {
   const panel = $("core-panel");
   const { totalNav, rows } = positionRows();
   if (!rows.length) { panel.hidden = true; return; }
@@ -1724,7 +1747,7 @@ function renderCorePositions() {
   $("core-note").textContent =
     `${coreCount} 个核心持仓 · ${rows.length} 条规则 · `
     + (alerts.length ? `${alerts.length} 项需要调整` : "全部在区间内")
-    + ` · 按全部账户合并（总净值 ${fmtMoney(totalNav)}）`;
+    + ` · 口径 ${scopeLabel || "当前账号"}（总净值 ${fmtMoney(totalNav)}）`;
 
   const tbody = $("core-body");
   tbody.innerHTML = "";
@@ -1755,10 +1778,12 @@ function renderCorePositions() {
     } else if (r.status === "ok") {
       verdict = '<span class="tag tag-inband">区间内</span>';
     }
-    // Zero exposure has two very different causes and a core holding sitting
-    // at 0% deserves to say which: nothing left, or only sold premium (which
-    // this definition deliberately does not count as capital deployed).
-    const stateTag = !r.held ? ' <span class="tag tag-gone">已清仓</span>'
+    // Zero exposure has three very different causes and a core holding sitting
+    // at 0% deserves to say which: it is in the other account, you are out of
+    // it entirely, or you only sold premium on it (which this definition
+    // deliberately does not count as capital deployed).
+    const stateTag = r.elsewhere ? ' <span class="tag tag-gone">本账号无持仓</span>'
+      : !r.held ? ' <span class="tag tag-gone">已清仓</span>'
       : r.exposure > 0 ? ""
       : ' <span class="tag tag-gone">仅卖方期权</span>';
     const tr = document.createElement("tr");
@@ -1778,17 +1803,19 @@ function renderCorePositions() {
   }
 }
 
-// Treemap decoration for one stock tile. The ring and badge describe the
-// symbol's exposure across ALL accounts, while the tile's AREA is this
-// account's stock market value alone — the tooltip spells that out, because a
-// small tile wearing a 超上限 badge is otherwise just confusing.
+// Treemap decoration for one stock tile. Tile and badge now describe the same
+// book — whichever account is on screen. They are still not the same NUMBER:
+// the tile's AREA is stock market value, the badge weighs stock + long option
+// market value against NAV, so a name held mostly through calls can wear a
+// 超上限 badge on a modest tile. The tooltip prints both.
 function tileFlag(symbol) {
   const cfg = positionSettings()[symbol];
   if (!cfg) return { core: false, status: null };
-  const row = portfolioExposures().bySymbol[symbol];
+  const row = currentExposures().bySymbol[symbol];
   const weight = row ? row.weight : 0;
   const status = positionStatus(weight, cfg);
-  const parts = [cfg.core ? "核心持仓" : "已设区间", `全账户敞口占比 ${fmtPct(weight, 1)}`];
+  const scope = currentDataRef.selected === "ALL" ? "全账户合并" : "本账号";
+  const parts = [cfg.core ? "核心持仓" : "已设区间", `${scope}敞口占比 ${fmtPct(weight, 1)}`];
   if (cfg.min != null || cfg.max != null) {
     parts.push(cfg.min == null ? `上限 ${fmtPct(cfg.max, 1)}`
       : cfg.max == null ? `下限 ${fmtPct(cfg.min, 1)}`
@@ -1823,10 +1850,12 @@ const inputToBound = (raw) => {
 
 function openPositionModal() {
   const cfg = positionSettings();
-  const { bySymbol } = portfolioExposures();
-  // Every underlying held in any form, plus anything already configured (so a
-  // rule on a since-exited symbol stays editable and removable).
-  const syms = [...new Set([...Object.keys(bySymbol), ...Object.keys(cfg)])];
+  const { bySymbol } = currentExposures();
+  // Rows: every underlying held in ANY account (the rules are global), plus
+  // anything already configured — so a rule on a since-exited symbol stays
+  // editable and removable. The percentages beside them are the CURRENT
+  // view's, which the modal note says out loud.
+  const syms = [...new Set([...allUnderlyings(), ...Object.keys(cfg)])];
   syms.sort((a, b) => (bySymbol[b]?.weight || 0) - (bySymbol[a]?.weight || 0)
     || a.localeCompare(b));
   posDraft = {};
@@ -1841,9 +1870,11 @@ function openPositionModal() {
     const ex = bySymbol[sym];
     const tr = document.createElement("tr");
     tr.dataset.sym = sym;
-    const held = !ex ? "已清仓"
-      : ex.exposure > 0 ? `${fmtPct(ex.weight, 1)} · ${fmtMoney(ex.exposure, 0)}`
-      : "0% · 仅卖方期权";
+    const held = ex && ex.exposure > 0
+      ? `${fmtPct(ex.weight, 1)} · ${fmtMoney(ex.exposure, 0)}`
+      : ex ? "0% · 仅卖方期权"
+      : allUnderlyings().has(sym) ? "本账号无持仓"
+      : "已清仓";
     tr.innerHTML = `
       <td>
         <b>${sym}</b>
