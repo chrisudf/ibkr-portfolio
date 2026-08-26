@@ -18,6 +18,9 @@
       </div>
     </div>
     <div class="actions">
+      <button id="pos-btn" class="ghost-btn" type="button" title="标记核心持仓、设置每个标的的仓位上限">
+        <span>◎</span><span>核心持仓</span>
+      </button>
       <button id="refresh-btn" class="refresh" type="button" title="从 IBKR 自动同步最新数据">
         <span class="refresh-icon">⟳</span>
         <span class="refresh-label">刷新 IBKR</span>
@@ -113,6 +116,41 @@
           <span class="panel-note">方块面积 = 持仓市值 · 颜色 = 浮动盈亏</span>
         </div>
         <div id="treemap" class="treemap"></div>
+        <div class="margin-foot">白圈 = 核心持仓 · <b class="down">▲</b> 超上限 · <b class="amber">▼</b> 欠配。
+          方块面积是<b>当前账户的正股市值</b>，而角标判定的是该标的在<b>全部账户</b>的敞口（含期权腿），
+          所以小方块也可能挂超上限角标；hover 看两个数。只卖 put、没有正股的标的不在地图上，看下面那张表。</div>
+      </section>
+
+      <!-- Core holdings vs caps -->
+      <section class="panel" id="core-panel" hidden>
+        <div class="panel-head">
+          <h2>核心持仓与仓位上限</h2>
+          <span class="panel-note" id="core-note"></span>
+        </div>
+        <div class="table-wrap">
+          <table class="holdings">
+            <thead>
+              <tr>
+                <th>标的</th>
+                <th class="num">敞口</th>
+                <th class="num">占总资产</th>
+                <th class="num">目标区间</th>
+                <th>位置</th>
+                <th>状态</th>
+              </tr>
+            </thead>
+            <tbody id="core-body"></tbody>
+          </table>
+        </div>
+        <div class="margin-foot">敞口 = <b>正股市值 + 期权多头市值 + 卖出 put 全部被行权的名义</b>
+          —— 还没被行权的卖 put 也是已经承诺出去的仓位，不算进去的上限是拦不住人的；
+          期权多头按<b>市值</b>而不是名义计入（LEAPS call 按 strike×100 会虚报成几倍的仓位），
+          卖出 call 不计（它压的是上面已经算过的正股的上涨空间）。
+          分母是<b>全部账户合并</b>的总净值 —— 「占总资产 5%」说的是整本账，
+          一个标的分散在两个账号里不该读成两个安逸的半仓。
+          核心持仓的目标区间 = <b>[上限 ÷ 2, 上限]</b>；非核心只判上限、没有下限
+          （正在减的仓本来就该缩，报警只会让人学会无视这张表）。
+          规则在右上角「核心持仓」里改，存在服务器上（<code>uploads/.position_settings.json</code>）。</div>
       </section>
 
       <!-- Allocation bar -->
@@ -337,5 +375,31 @@
       </section>
     </section>
   </main>
+
+  <div id="pos-modal" class="modal-backdrop" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="pos-modal-title">
+      <div class="modal-head">
+        <h2 id="pos-modal-title">核心持仓与仓位上限</h2>
+        <button id="pos-modal-close" class="modal-close" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-note">
+        列出所有正股 + 期权持仓的标的。<b>核心持仓</b>=打算长期留着的仓位，所以仓位<b>太小</b>也会提醒；
+        <b>仓位上限</b>=该标的敞口占全部账户总净值的上限。「不限」= 不参与提醒。
+      </div>
+      <div class="modal-body">
+        <table class="holdings pos-table">
+          <thead>
+            <tr><th>标的<span class="th-sub">当前敞口占比</span></th><th>核心持仓</th><th>仓位上限（占总资产）</th></tr>
+          </thead>
+          <tbody id="pos-body"></tbody>
+        </table>
+      </div>
+      <div class="modal-foot">
+        <span class="modal-status" id="pos-status"></span>
+        <button id="pos-cancel" class="ghost-btn" type="button">取消</button>
+        <button id="pos-save" class="primary-btn" type="button">保存</button>
+      </div>
+    </div>
+  </div>
 </body>
 </html>

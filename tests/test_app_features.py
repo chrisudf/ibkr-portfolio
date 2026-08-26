@@ -124,3 +124,92 @@ def test_auto_sync_due_logic():
     assert not _auto_sync_due(sat, "weekly", 9, "sat", "2026-08-22")
 
     assert not _auto_sync_due(dt("2026-08-21T12:00:00"), "off", 9, "sat", "")
+
+
+# --- Position settings: core holdings + per-symbol caps --------------------
+
+
+def test_position_settings_normalization():
+    from app import _normalize_position_settings as norm
+
+    got = norm({"symbols": {
+        "nvda": {"core": True, "cap": 0.2},        # lowercased input
+        "BRK.B": {"core": False, "cap": 0.05},     # dotted ticker, capped only
+        "AAPL": {"core": True},                    # core, cap left open
+        "TSLA": {"core": False, "cap": None},      # says nothing — dropped
+        "MSFT": {},                                # says nothing — dropped
+    }})
+    assert got == {
+        "NVDA": {"core": True, "cap": 0.2},
+        "BRK.B": {"core": False, "cap": 0.05},
+        "AAPL": {"core": True, "cap": None},
+    }
+
+
+def test_position_settings_rejects_bad_input():
+    import pytest
+
+    from app import _normalize_position_settings as norm
+
+    with pytest.raises(ValueError):
+        norm({})                                          # no symbols map
+    with pytest.raises(ValueError):
+        norm({"symbols": {"../etc": {"core": True}}})     # not a ticker
+    with pytest.raises(ValueError):
+        norm({"symbols": {"NVDA": {"core": "yes"}}})      # core not a bool
+    with pytest.raises(ValueError):
+        norm({"symbols": {"NVDA": {"cap": 0.15}}})        # not an offered cap
+    # The mistake worth catching: percent where a fraction is expected. 10
+    # would otherwise mean "1000% of NAV" and silently never fire.
+    with pytest.raises(ValueError):
+        norm({"symbols": {"NVDA": {"cap": 10}}})
+
+
+def test_position_settings_roundtrip(tmp_path, monkeypatch):
+    import app as app_mod
+
+    monkeypatch.setattr(app_mod, "POSITION_SETTINGS_FILE",
+                        tmp_path / ".position_settings.json")
+    client = app_mod.app.test_client()
+
+    assert client.get("/api/settings/positions").get_json()["symbols"] == {}
+
+    res = client.put("/api/settings/positions", json={"symbols": {
+        "NVDA": {"core": True, "cap": 0.10},
+        "SOFI": {"core": False, "cap": None},          # dropped on write
+    }})
+    assert res.status_code == 200
+    assert res.get_json()["symbols"] == {"NVDA": {"core": True, "cap": 0.10}}
+
+    stored = client.get("/api/settings/positions").get_json()
+    assert stored["symbols"] == {"NVDA": {"core": True, "cap": 0.10}}
+    assert stored["updated_at"]
+
+    assert client.put("/api/settings/positions",
+                      json={"symbols": {"NVDA": {"cap": 0.33}}}).status_code == 400
+    # A rejected write must leave the previous config intact.
+    assert client.get("/api/settings/positions").get_json()["symbols"] == {
+        "NVDA": {"core": True, "cap": 0.10}}
+
+
+def test_corrupt_position_settings_degrade_to_empty(tmp_path, monkeypatch):
+    import app as app_mod
+
+    path = tmp_path / ".position_settings.json"
+    monkeypatch.setattr(app_mod, "POSITION_SETTINGS_FILE", path)
+    path.write_text('{"symbols": {"NVDA": {"cap": 999}}}', encoding="utf-8")
+    # A hand-edited file that no longer validates must not 500 the dashboard.
+    res = app_mod.app.test_client().get("/api/settings/positions")
+    assert res.status_code == 200
+    assert res.get_json()["symbols"] == {}
+
+
+def test_settings_file_is_not_mistaken_for_an_account(tmp_path, monkeypatch):
+    """The leading dot is load-bearing: uploads/*.json is the account sweep."""
+    import app as app_mod
+
+    monkeypatch.setattr(app_mod, "UPLOAD_DIR", tmp_path)
+    (tmp_path / ".position_settings.json").write_text(
+        '{"version": 1, "symbols": {}}', encoding="utf-8")
+    (tmp_path / "U17456181.json").write_text('{"nav": {"total": 1}}', encoding="utf-8")
+    assert list(app_mod._load_all_accounts()) == ["U17456181"]

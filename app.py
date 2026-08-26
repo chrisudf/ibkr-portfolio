@@ -63,17 +63,35 @@ _refresh_lock = Lock()
 _ACCT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
 
+def _atomic_write_json(path: Path, data, indent: int | None = None) -> None:
+    """Write JSON through a unique temp file + os.replace.
+
+    The temp name must be unique per writer, not a fixed "<name>.tmp":
+    upload, refresh and the auto-sync thread all write into UPLOAD_DIR
+    concurrently, and two writers sharing one temp path would interleave
+    their json.dump output and publish a corrupt file. With mkstemp each
+    writer replaces from its own file and the outcome is last-writer-wins.
+    """
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            json.dump(data, out, ensure_ascii=False, indent=indent)
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 def _save_accounts(payload: dict) -> tuple[list[str], list[str]]:
     """Write per-account JSON files; returns (saved, skipped) account ids.
 
-    Writes to a temp file then os.replace so a concurrent reader never sees
-    a half-written JSON. The temp file must be unique per writer, not a
-    fixed "<acct>.json.tmp": upload and refresh run on different threads
-    (and the weekly cron delivers through /api/upload), so two writers of
-    the same account can overlap — sharing one temp path would interleave
-    their json.dump output and publish a corrupt file. With mkstemp each
-    writer replaces from its own file and the outcome is a clean
-    last-writer-wins.
+    Writes go through _atomic_write_json so a concurrent reader never sees
+    a half-written JSON (upload, refresh and the auto-sync thread all write
+    into UPLOAD_DIR from different threads).
     """
     saved: list[str] = []
     skipped: list[str] = []
@@ -82,19 +100,7 @@ def _save_accounts(payload: dict) -> tuple[list[str], list[str]]:
             app.logger.warning("refusing to save account with unsafe id %r", acct_id)
             skipped.append(str(acct_id))
             continue
-        out_path = UPLOAD_DIR / f"{acct_id}.json"
-        fd, tmp_name = tempfile.mkstemp(
-            dir=str(UPLOAD_DIR), prefix=out_path.name + ".", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as out:
-                json.dump(data, out, ensure_ascii=False, indent=2)
-            os.replace(tmp_name, out_path)
-        except BaseException:
-            try:
-                os.unlink(tmp_name)
-            except OSError:
-                pass
-            raise
+        _atomic_write_json(UPLOAD_DIR / f"{acct_id}.json", data, indent=2)
         # Weekly-recap raw material. A snapshot failure must never fail the
         # upload that produced perfectly good account data.
         try:
@@ -193,6 +199,121 @@ def upload():
     if skipped:
         resp["skipped"] = skipped
     return jsonify(resp)
+
+
+# --- Position settings: core holdings + per-symbol weight caps -------------
+#
+# Which underlyings are "core" (a position you intend to keep, so being
+# UNDER-weight is itself a signal) and how large each is allowed to get.
+# Stored server-side rather than in localStorage: the dashboard is reached
+# from more than one browser/device against the same droplet, and a config
+# that silently differs per browser would make the treemap badges say
+# different things depending on where you opened it.
+#
+# The leading dot keeps the file out of _load_all_accounts' uploads/*.json
+# sweep — without it the config would show up as a phantom account in the
+# switcher. .gitignore's `uploads/*.json` still matches it (gitignore globs,
+# unlike the shell, do match a leading dot).
+POSITION_SETTINGS_FILE = UPLOAD_DIR / ".position_settings.json"
+
+# The caps the UI offers, as fractions of total NAV. Kept server-side too so
+# a hand-edited config file can't smuggle in a cap the UI can't render.
+#
+# null ("no cap") is the default and it is NOT a formality: it is what makes
+# "configured" distinguishable from "never touched". With a numeric default,
+# a fresh install would have an implicit cap on every symbol and would light
+# up the treemap with warnings about limits the user never set.
+ALLOWED_CAPS = (0.05, 0.10, 0.20)
+DEFAULT_CAP = None
+
+# Symbols are underlyings (equity tickers), uppercased before matching.
+# Deliberately narrow: these strings are echoed back into the dashboard.
+_SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,15}$")
+
+
+def _normalize_position_settings(raw: dict) -> dict[str, dict]:
+    """Validate a {symbol: {core, cap}} map; raise ValueError on bad input.
+
+    Entries that carry no information (not core, cap at the default) are
+    dropped so the stored file only holds real decisions — a symbol absent
+    from the map and a symbol explicitly set to the defaults behave
+    identically, so there is nothing to lose by not writing it.
+    """
+    symbols = raw.get("symbols")
+    if not isinstance(symbols, dict):
+        raise ValueError("body must be an object with a 'symbols' map")
+    if len(symbols) > 500:
+        raise ValueError("too many symbols")
+    out: dict[str, dict] = {}
+    for sym, cfg in symbols.items():
+        key = str(sym or "").strip().upper()
+        if not _SYMBOL_RE.match(key):
+            raise ValueError(f"invalid symbol {sym!r}")
+        if not isinstance(cfg, dict):
+            raise ValueError(f"{key}: entry must be an object")
+        core = cfg.get("core", False)
+        if not isinstance(core, bool):
+            raise ValueError(f"{key}: 'core' must be a boolean")
+        cap_raw = cfg.get("cap", DEFAULT_CAP)
+        if cap_raw is None:
+            cap = None
+        else:
+            try:
+                cap = round(float(cap_raw), 4)
+            except (TypeError, ValueError):
+                raise ValueError(f"{key}: 'cap' must be a number or null") from None
+            if cap not in ALLOWED_CAPS:
+                # 5 instead of 0.05 is the mistake worth naming — the UI
+                # speaks in percent and the wire format is a fraction.
+                raise ValueError(
+                    f"{key}: 'cap' must be null or one of {ALLOWED_CAPS} "
+                    f"(a fraction of NAV, not a percentage); got {cap_raw!r}")
+        if not core and cap is None:
+            continue
+        out[key] = {"core": core, "cap": cap}
+    return out
+
+
+def _read_position_settings() -> dict:
+    try:
+        with open(POSITION_SETTINGS_FILE, "r", encoding="utf-8") as f:
+            stored = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {"version": 1, "symbols": {}}
+    if not isinstance(stored, dict):
+        return {"version": 1, "symbols": {}}
+    try:
+        symbols = _normalize_position_settings(stored)
+    except ValueError:
+        # A hand-edited file that no longer validates must not take the
+        # dashboard down — fall back to "nothing configured" and say so.
+        app.logger.warning("position settings file is invalid; ignoring it")
+        return {"version": 1, "symbols": {}}
+    return {"version": 1, "symbols": symbols,
+            "updated_at": stored.get("updated_at", "")}
+
+
+@app.get("/api/settings/positions")
+def get_position_settings():
+    return jsonify(_read_position_settings())
+
+
+@app.put("/api/settings/positions")
+def put_position_settings():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "expected a JSON object"}), 400
+    try:
+        symbols = _normalize_position_settings(body)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    payload = {
+        "version": 1,
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "symbols": symbols,
+    }
+    _atomic_write_json(POSITION_SETTINGS_FILE, payload, indent=2)
+    return jsonify(payload)
 
 
 def _run_refresh(trigger: str) -> tuple[dict, int]:
@@ -359,18 +480,7 @@ def _read_sync_state() -> dict:
 
 
 def _write_sync_state(state: dict) -> None:
-    fd, tmp_name = tempfile.mkstemp(
-        dir=str(UPLOAD_DIR), prefix=SYNC_STATE_FILE.name + ".", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as out:
-            json.dump(state, out, ensure_ascii=False)
-        os.replace(tmp_name, SYNC_STATE_FILE)
-    except BaseException:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
+    _atomic_write_json(SYNC_STATE_FILE, state)
 
 
 def _auto_sync_loop() -> None:

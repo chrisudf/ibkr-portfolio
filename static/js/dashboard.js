@@ -509,6 +509,7 @@ async function loadPortfolio() {
   const accounts = payload.accounts || { [payload.account?.Account || "default"]: payload };
   currentDataRef.allAccounts = accounts;
   currentDataRef.sync = payload.sync || null;
+  currentDataRef._exposures = null;   // memoized merge is now stale
   // Default to the alphabetically-first account (puts U17xxxx ahead of U22xxxx)
   // rather than the merged view — most viewing happens per-account.
   if (!currentDataRef.selected || (currentDataRef.selected !== "ALL" && !accounts[currentDataRef.selected])) {
@@ -611,8 +612,12 @@ function render(data) {
   // Weekly recap (per-underlying movers vs the ~7-day-old snapshot)
   renderWeekly(data, currentDataRef.allAccounts, currentDataRef.selected);
 
-  // Treemap
+  // Treemap (tiles carry the core-holding ring / over-under badge)
   renderTreemap(stocks);
+
+  // Core holdings vs their caps — the badge legend, and the only place a
+  // flagged underlying with no stock leg (short puts only) can show up.
+  renderCorePositions();
 
   // Allocation bar — position view: cash, stock, long options (MV)
   // Short options excluded (their premium is already in cash); shown as a footnote.
@@ -1575,6 +1580,344 @@ function renderNavHistory(data) {
   ].join("");
 }
 
+/* ---------------------------------------------------------------------------
+ * Core holdings & position caps
+ *
+ * Two decisions per underlying, set in the modal behind the topbar button:
+ *   核心持仓 — a position meant to be kept, so being UNDER-weight is a signal
+ *   仓位上限 — the largest share of total assets it is allowed to occupy
+ *
+ * Both are judged against the MERGED portfolio (every loaded account), never
+ * whichever account tab is selected: "占总资产 10%" is a statement about the
+ * whole book, and a symbol split across two accounts would otherwise read as
+ * two comfortable half-positions instead of one oversized one.
+ *
+ * Exposure, per underlying:
+ *
+ *   正股市值 + 期权多头市值 + 卖出 put 全部被行权的名义
+ *
+ * The put leg is the whole point: a cash-secured put you have not been
+ * assigned on yet is a position you have already committed to, and a cap that
+ * ignores it is a cap you can blow through without a single share changing
+ * hands. Long options enter at market value — the same number the 资产配置 bar
+ * counts — rather than at notional, because a LEAPS call's strike × 100 would
+ * print a position several times the capital actually at risk. Short calls are
+ * left out: they cap the upside on stock that is already counted above.
+ * ------------------------------------------------------------------------- */
+
+// The caps the modal offers, as fractions of total NAV. null ("不限") is the
+// default and is what separates "configured" from "never touched" — with a
+// numeric default a fresh install would warn about limits nobody set.
+const POSITION_CAPS = [0.05, 0.10, 0.20];
+
+// A core holding's target band is [cap × this, cap]. The cap is the only
+// number the UI asks for, so the floor is derived from it instead of doubling
+// the questions. Half is deliberate: it fires once a position has drifted to
+// less than half its intended size, which is about when "I meant to own this"
+// stops being true in practice.
+const CORE_FLOOR_RATIO = 0.5;
+
+function positionSettings() {
+  return (currentDataRef.positionSettings && currentDataRef.positionSettings.symbols) || {};
+}
+
+function computeExposures(data) {
+  const nav = data.nav || {};
+  const totalNav = nav.total || ((nav.cash || 0) + (nav.stock || 0) + (nav.options || 0)) || 0;
+  const rows = {};
+  const bucket = (sym) => rows[sym] || (rows[sym] = {
+    symbol: sym, stockMV: 0, longOptMV: 0, putNotional: 0, optionLegs: 0,
+  });
+  for (const s of data.stocks || []) {
+    if (CASH_EQUIVALENTS.has(s.symbol)) continue;
+    bucket(s.symbol).stockMV += s.value || 0;
+  }
+  for (const o of data.options || []) {
+    const sym = o.underlying;
+    if (!sym || CASH_EQUIVALENTS.has(sym)) continue;
+    const b = bucket(sym);
+    b.optionLegs += 1;
+    if (o.quantity > 0) {
+      b.longOptMV += Math.max(o.value || 0, 0);
+    } else if (o.quantity < 0 && o.right === "P" && o.strike > 0) {
+      b.putNotional += o.strike * Math.abs(o.quantity) * (o.multiplier || CONTRACT_MULTIPLIER);
+    }
+  }
+  for (const b of Object.values(rows)) {
+    b.exposure = b.stockMV + b.longOptMV + b.putNotional;
+    b.weight = totalNav > 0 ? b.exposure / totalNav : 0;
+  }
+  return { totalNav, bySymbol: rows };
+}
+
+// Memoized per data load — mergeAccounts() walks every position of every
+// account, and the treemap would otherwise re-run it once per tile.
+// loadPortfolio() clears the cache.
+function portfolioExposures() {
+  if (!currentDataRef._exposures) {
+    const accounts = currentDataRef.allAccounts || {};
+    const whole = Object.keys(accounts).length ? mergeAccounts(accounts) : null;
+    currentDataRef._exposures = whole
+      ? computeExposures(whole)
+      : { totalNav: 0, bySymbol: {} };
+  }
+  return currentDataRef._exposures;
+}
+
+// null when there is nothing to judge (no cap set); otherwise ok/over/under.
+// An over-cap position is flagged whether or not it is core — a cap is a cap.
+// The floor only applies to core holdings: a trade being wound down is
+// *supposed* to shrink, and flagging that would train you to ignore the panel.
+function positionStatus(weight, cfg) {
+  if (!cfg || cfg.cap == null) return null;
+  if (weight > cfg.cap) return "over";
+  if (cfg.core && weight < cfg.cap * CORE_FLOOR_RATIO) return "under";
+  return "ok";
+}
+
+const POS_STATUS_LABEL = { over: "超上限", under: "欠配", ok: "区间内" };
+
+function exposureTip(r) {
+  const bits = [];
+  if (r.stockMV) bits.push(`正股 ${fmtMoney(r.stockMV, 0)}`);
+  if (r.longOptMV) bits.push(`期权多头 ${fmtMoney(r.longOptMV, 0)}`);
+  if (r.putNotional) bits.push(`卖put名义 ${fmtMoney(r.putNotional, 0)}`);
+  return bits.join(" + ") || "无持仓";
+}
+
+// One row per CONFIGURED symbol. Symbols that are configured but no longer
+// held keep their row: a core holding you have fully exited is the most
+// extreme under-weight there is, and dropping the row would hide exactly the
+// case the panel exists to catch.
+function positionRows() {
+  const cfg = positionSettings();
+  const { totalNav, bySymbol } = portfolioExposures();
+  const empty = { stockMV: 0, longOptMV: 0, putNotional: 0, exposure: 0, weight: 0, optionLegs: 0 };
+  const rows = Object.keys(cfg).map(sym => {
+    const ex = bySymbol[sym] || empty;
+    const c = cfg[sym];
+    return {
+      symbol: sym, ...ex,
+      core: !!c.core,
+      cap: c.cap,
+      floor: c.cap == null ? null : c.cap * CORE_FLOOR_RATIO,
+      status: positionStatus(ex.weight, c),
+      held: !!bySymbol[sym],
+    };
+  });
+  const rank = { over: 0, under: 1, ok: 2 };
+  rows.sort((a, b) =>
+    (rank[a.status] ?? 3) - (rank[b.status] ?? 3)
+    || (b.core - a.core)
+    || b.weight - a.weight);
+  return { totalNav, rows };
+}
+
+function renderCorePositions() {
+  const panel = $("core-panel");
+  const { totalNav, rows } = positionRows();
+  if (!rows.length) { panel.hidden = true; return; }
+  panel.hidden = false;
+
+  const alerts = rows.filter(r => r.status === "over" || r.status === "under");
+  const coreCount = rows.filter(r => r.core).length;
+  $("core-note").textContent =
+    `${coreCount} 个核心持仓 · ${rows.length} 条规则 · `
+    + (alerts.length ? `${alerts.length} 项需要调整` : "全部在区间内")
+    + ` · 按全部账户合并（总净值 ${fmtMoney(totalNav)}）`;
+
+  const tbody = $("core-body");
+  tbody.innerHTML = "";
+  for (const r of rows) {
+    // Bar scale leaves room above the cap so an over-weight marker lands
+    // inside the track instead of pinning to the right edge.
+    const scale = Math.max((r.cap || 0) * 1.6, r.weight * 1.15, 0.02);
+    const pct = (v) => Math.min(100, Math.max(0, v / scale * 100));
+    let band = "";
+    if (r.cap != null) {
+      const lo = r.core ? r.floor : 0;
+      band = `<div class="band-zone" style="left:${pct(lo)}%;width:${pct(r.cap) - pct(lo)}%"></div>`
+        + `<div class="band-cap" style="left:${pct(r.cap)}%"></div>`;
+    }
+    const tone = r.status === "over" ? "down" : r.status === "under" ? "amber" : "";
+    const target = r.cap == null ? "—"
+      : r.core ? `${fmtPct(r.floor, 1)} – ${fmtPct(r.cap, 1)}`
+      : `≤ ${fmtPct(r.cap, 1)}`;
+    let verdict = '<span class="muted">未设上限</span>';
+    if (r.status === "over") {
+      verdict = `<span class="tag tag-over">超上限 +${((r.weight - r.cap) * 100).toFixed(1)}pp</span>`;
+    } else if (r.status === "under") {
+      verdict = `<span class="tag tag-under">欠配 −${((r.floor - r.weight) * 100).toFixed(1)}pp</span>`;
+    } else if (r.status === "ok") {
+      verdict = '<span class="tag tag-inband">区间内</span>';
+    }
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td><b>${r.symbol}</b>${r.core ? ' <span class="tag tag-core">核心</span>' : ""}${
+        r.held ? "" : ' <span class="tag tag-gone">已清仓</span>'}</td>
+      <td class="num" title="${exposureTip(r)}">${fmtMoney(r.exposure, 0)}</td>
+      <td class="num ${tone}"><b>${fmtPct(r.weight, 1)}</b></td>
+      <td class="num muted">${target}</td>
+      <td class="band-cell">
+        <div class="band-bar" title="标尺 0 – ${fmtPct(scale, 1)}">
+          ${band}<div class="band-mark ${r.status || ""}" style="left:${pct(r.weight)}%"></div>
+        </div>
+      </td>
+      <td>${verdict}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+
+// Treemap decoration for one stock tile. The ring and badge describe the
+// symbol's exposure across ALL accounts, while the tile's AREA is this
+// account's stock market value alone — the tooltip spells that out, because a
+// small tile wearing a 超上限 badge is otherwise just confusing.
+function tileFlag(symbol) {
+  const cfg = positionSettings()[symbol];
+  if (!cfg) return { core: false, status: null };
+  const row = portfolioExposures().bySymbol[symbol];
+  const weight = row ? row.weight : 0;
+  const status = positionStatus(weight, cfg);
+  const parts = [cfg.core ? "核心持仓" : "已设上限", `全账户敞口占比 ${fmtPct(weight, 1)}`];
+  if (cfg.cap != null) {
+    parts.push(cfg.core
+      ? `目标区间 ${fmtPct(cfg.cap * CORE_FLOOR_RATIO, 1)} – ${fmtPct(cfg.cap, 1)}`
+      : `上限 ${fmtPct(cfg.cap, 1)}`);
+  }
+  if (status === "over" || status === "under") parts.push(POS_STATUS_LABEL[status]);
+  return {
+    core: !!cfg.core,
+    status,
+    icon: status === "over" ? "▲" : status === "under" ? "▼" : "",
+    badge: status === "over" ? "▲ 超上限" : status === "under" ? "▼ 欠配" : "",
+    tip: parts.join(" · "),
+  };
+}
+
+/* --- The settings modal --------------------------------------------------- */
+
+// Draft state lives here while the modal is open; nothing is written until
+// 保存, so 取消 / Esc really do discard.
+let posDraft = null;
+
+const capLabel = (cap) => (cap == null ? "不限" : `${Math.round(cap * 100)}%`);
+
+function openPositionModal() {
+  const cfg = positionSettings();
+  const { bySymbol } = portfolioExposures();
+  // Every underlying held in any form, plus anything already configured (so a
+  // rule on a since-exited symbol stays editable and removable).
+  const syms = [...new Set([...Object.keys(bySymbol), ...Object.keys(cfg)])];
+  syms.sort((a, b) => (bySymbol[b]?.weight || 0) - (bySymbol[a]?.weight || 0)
+    || a.localeCompare(b));
+  posDraft = {};
+  for (const s of syms) {
+    posDraft[s] = { core: !!(cfg[s] && cfg[s].core), cap: cfg[s] ? cfg[s].cap : null };
+  }
+
+  const tbody = $("pos-body");
+  tbody.innerHTML = "";
+  for (const sym of syms) {
+    const ex = bySymbol[sym];
+    const tr = document.createElement("tr");
+    tr.dataset.sym = sym;
+    const held = ex ? `${fmtPct(ex.weight, 1)} · ${fmtMoney(ex.exposure, 0)}` : "已清仓";
+    tr.innerHTML = `
+      <td>
+        <b>${sym}</b>
+        <div class="pos-sub" title="${ex ? exposureTip(ex) : "无持仓"}">${held}</div>
+      </td>
+      <td>
+        <label class="pos-check">
+          <input type="checkbox" data-role="core" ${posDraft[sym].core ? "checked" : ""} />
+          <span>核心持仓</span>
+        </label>
+      </td>
+      <td>
+        <div class="seg-toggle pos-caps">
+          ${[null, ...POSITION_CAPS].map(c =>
+            `<button type="button" data-cap="${c == null ? "" : c}"${
+              posDraft[sym].cap === c ? ' class="active"' : ""}>${capLabel(c)}</button>`).join("")}
+        </div>
+      </td>
+    `;
+    tbody.appendChild(tr);
+  }
+  $("pos-status").textContent = "";
+  $("pos-modal").hidden = false;
+  document.body.classList.add("modal-open");
+  $("pos-modal-close").focus();
+}
+
+function closePositionModal() {
+  $("pos-modal").hidden = true;
+  document.body.classList.remove("modal-open");
+  posDraft = null;
+}
+
+async function savePositionSettings() {
+  const btn = $("pos-save");
+  btn.disabled = true;
+  $("pos-status").textContent = "保存中…";
+  // Only real decisions travel. The server drops no-op entries anyway, but
+  // sending them would grow the file with every symbol ever held.
+  const symbols = {};
+  for (const [sym, d] of Object.entries(posDraft || {})) {
+    if (d.core || d.cap != null) symbols[sym] = { core: d.core, cap: d.cap };
+  }
+  try {
+    const res = await fetch("/api/settings/positions", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ symbols }),
+    });
+    const j = await res.json();
+    if (!res.ok) {
+      $("pos-status").textContent = "";
+      showToast("error", "保存失败", j.error || `HTTP ${res.status}`);
+      return;
+    }
+    currentDataRef.positionSettings = j;
+    closePositionModal();
+    showToast("success", "已保存", `${Object.keys(j.symbols || {}).length} 条持仓规则`);
+    if (currentDataRef.data) render(currentDataRef.data);
+  } catch (exc) {
+    $("pos-status").textContent = "";
+    showToast("error", "保存失败", String(exc));
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function wirePositionModal() {
+  $("pos-btn").addEventListener("click", openPositionModal);
+  $("pos-modal-close").addEventListener("click", closePositionModal);
+  $("pos-cancel").addEventListener("click", closePositionModal);
+  $("pos-save").addEventListener("click", savePositionSettings);
+  // Backdrop click closes; a click inside the dialog must not reach it.
+  $("pos-modal").addEventListener("click", (e) => {
+    if (e.target === $("pos-modal")) closePositionModal();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("pos-modal").hidden) closePositionModal();
+  });
+  // Delegated: the table is rebuilt on every open, and per-row listeners
+  // would be re-attached (and leak) with it.
+  $("pos-body").addEventListener("click", (e) => {
+    const capBtn = e.target.closest("button[data-cap]");
+    if (!capBtn) return;
+    const raw = capBtn.dataset.cap;
+    posDraft[capBtn.closest("tr").dataset.sym].cap = raw === "" ? null : Number(raw);
+    capBtn.parentElement.querySelectorAll("button").forEach(b => b.classList.remove("active"));
+    capBtn.classList.add("active");
+  });
+  $("pos-body").addEventListener("change", (e) => {
+    if (e.target.dataset.role !== "core") return;
+    posDraft[e.target.closest("tr").dataset.sym].core = e.target.checked;
+  });
+}
+
 function renderTreemap(stocks) {
   const el = $("treemap");
   el.innerHTML = "";
@@ -1609,6 +1952,15 @@ function renderTreemap(stocks) {
     div.style.height = h + "px";
     div.style.background = color(d.unrealized_pl);
 
+    // Core / cap markers. NOTE the mixed frame of reference: the tile's AREA
+    // is this account's stock market value, while the ring and badge describe
+    // the symbol across every account and include its option legs. That is on
+    // purpose — a cap is a portfolio-wide rule — but it means a modest tile
+    // can legitimately wear a 超上限 badge, so the tooltip prints both numbers.
+    const flag = tileFlag(d.symbol);
+    if (flag.core) div.classList.add("tile-core");
+    if (flag.status === "over" || flag.status === "under") div.classList.add("tile-" + flag.status);
+
     // Scale font sizes proportionally to tile size, with a floor
     const symSize = Math.max(8, Math.min(16, Math.min(w / 5, h / 4)));
     const metaSize = Math.max(8, symSize * 0.7);
@@ -1625,7 +1977,17 @@ function renderTreemap(stocks) {
         <div class="meta" style="font-size:${metaSize}px">${fmtMoney(d.value)}</div>
         <div class="pnl" style="font-size:${metaSize}px">${d.unrealized_pl >= 0 ? "+" : ""}${fmtMoney(d.unrealized_pl)}</div>`;
     }
-    div.title = `${d.symbol}\n市值 ${fmtMoney(d.value, 2)}\n成本 ${fmtMoney(d.cost_basis, 2)}\n浮盈 ${fmtMoney(d.unrealized_pl, 2)}`;
+    // Badge goes on after innerHTML — the text branches above overwrite it.
+    // Below ~48px it would sit on top of the ticker, and the coloured
+    // outline (red over / amber under) already carries the same signal.
+    if (flag.badge && w >= 48 && h >= 28) {
+      const badge = document.createElement("div");
+      badge.className = `tile-badge ${flag.status}`;
+      badge.textContent = w < 90 ? flag.icon : flag.badge;
+      div.appendChild(badge);
+    }
+    div.title = `${d.symbol}\n市值 ${fmtMoney(d.value, 2)}\n成本 ${fmtMoney(d.cost_basis, 2)}\n浮盈 ${fmtMoney(d.unrealized_pl, 2)}`
+      + (flag.tip ? `\n\n${flag.tip}` : "");
     el.appendChild(div);
   }
 }
@@ -2159,6 +2521,19 @@ async function refreshFromIBKR() {
 
 document.addEventListener("DOMContentLoaded", () => {
   $("refresh-btn").addEventListener("click", refreshFromIBKR);
+  wirePositionModal();
+
+  // Core-holding rules. Same shape as the cluster fetch below: the first
+  // render may land before this resolves, so re-render once it arrives.
+  // A failure leaves the panel hidden and the treemap unmarked — the rest
+  // of the dashboard does not depend on it.
+  fetch("/api/settings/positions")
+    .then(r => (r.ok ? r.json() : null))
+    .catch(() => null)
+    .then(cfg => {
+      currentDataRef.positionSettings = cfg;
+      if (currentDataRef.data) render(currentDataRef.data);
+    });
 
   // Cluster mapping — a static file the user edits by hand. 404/parse
   // failure just leaves the panel hidden; nothing else depends on it.
