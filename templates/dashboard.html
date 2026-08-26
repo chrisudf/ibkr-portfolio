@@ -18,7 +18,7 @@
       </div>
     </div>
     <div class="actions">
-      <button id="pos-btn" class="ghost-btn" type="button" title="标记核心持仓、设置每个标的的仓位上限">
+      <button id="pos-btn" class="ghost-btn" type="button" title="标记核心持仓、设置每个标的的仓位区间">
         <span>◎</span><span>核心持仓</span>
       </button>
       <button id="refresh-btn" class="refresh" type="button" title="从 IBKR 自动同步最新数据">
@@ -124,7 +124,7 @@
       <!-- Core holdings vs caps -->
       <section class="panel" id="core-panel" hidden>
         <div class="panel-head">
-          <h2>核心持仓与仓位上限</h2>
+          <h2>核心持仓与仓位区间</h2>
           <span class="panel-note" id="core-note"></span>
         </div>
         <div class="table-wrap">
@@ -149,8 +149,9 @@
           那是定义本身，不是漏算：被行权风险是另一个问题，「保证金占用」和「卖方到期日历」两张表管它。
           分母是<b>全部账户合并</b>的总净值 —— 「占总资产 5%」说的是整本账，
           一个标的分散在两个账号里不该读成两个安逸的半仓。
-          核心持仓的目标区间 = <b>[上限 ÷ 2, 上限]</b>；非核心只判上限、没有下限
-          （正在减的仓本来就该缩，报警只会让人学会无视这张表）。
+          目标区间的两端都是你自己填的百分比：下限留空按 0% 算（不报欠配），上限留空按 100% 算
+          （不报超上限）。<b>核心持仓</b>不参与判定，只是热力图上的白圈和这张表的排序优先级 ——
+          下限既然是填出来的，再拿一个勾选框把它关掉只会让人填了数字却等不到提醒。
           规则在右上角「核心持仓」里改，存在服务器上（<code>uploads/.position_settings.json</code>）。</div>
       </section>
 
@@ -380,18 +381,19 @@
   <div id="pos-modal" class="modal-backdrop" hidden>
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="pos-modal-title">
       <div class="modal-head">
-        <h2 id="pos-modal-title">核心持仓与仓位上限</h2>
+        <h2 id="pos-modal-title">核心持仓与仓位区间</h2>
         <button id="pos-modal-close" class="modal-close" type="button" aria-label="关闭">×</button>
       </div>
       <div class="modal-note">
-        列出所有正股 + 期权持仓的标的。<b>核心持仓</b>=打算长期留着的仓位，所以仓位<b>太小</b>也会提醒；
-        <b>仓位上限</b>=该标的<b>投入资本</b>（正股市值 + 期权多头市值）占全部账户总净值的上限。
-        「不限」= 不参与提醒。
+        列出所有正股 + 期权持仓的标的。<b>仓位区间</b>=该标的<b>投入资本</b>（正股市值 + 期权多头市值）
+        占全部账户总净值的目标区间，两个框都能随便填数字（支持小数）。
+        <b>下限留空 = 0%</b>（不报欠配）、<b>上限留空 = 100%</b>（不报超上限），两个都空 = 不参与提醒。
+        <b>核心持仓</b>只是个标记（热力图上的白圈 + 排序），不影响判定 —— 下限填了多少就是多少。
       </div>
       <div class="modal-body">
         <table class="holdings pos-table">
           <thead>
-            <tr><th>标的<span class="th-sub">当前敞口占比</span></th><th>核心持仓</th><th>仓位上限（占总资产）</th></tr>
+            <tr><th>标的<span class="th-sub">当前敞口占比</span></th><th>核心持仓</th><th>仓位区间（占总资产）<span class="th-sub">下限 – 上限，留空=0 / 100</span></th></tr>
           </thead>
           <tbody id="pos-body"></tbody>
         </table>

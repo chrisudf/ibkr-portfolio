@@ -1584,8 +1584,9 @@ function renderNavHistory(data) {
  * Core holdings & position caps
  *
  * Two decisions per underlying, set in the modal behind the topbar button:
- *   核心持仓 — a position meant to be kept, so being UNDER-weight is a signal
- *   仓位上限 — the largest share of total assets it is allowed to occupy
+ *   核心持仓 — a label: the treemap ring, the tag, sort priority. Not a rule.
+ *   仓位区间 — the share of total assets it should sit between, both ends
+ *              typed as free percentages and either one optional
  *
  * Both are judged against the MERGED portfolio (every loaded account), never
  * whichever account tab is selected: "占总资产 10%" is a statement about the
@@ -1608,17 +1609,15 @@ function renderNavHistory(data) {
  * question, and 保证金占用 + 卖方到期日历 are the panels that answer it.
  * ------------------------------------------------------------------------- */
 
-// The caps the modal offers, as fractions of total NAV. null ("不限") is the
-// default and is what separates "configured" from "never touched" — with a
-// numeric default a fresh install would warn about limits nobody set.
-const POSITION_CAPS = [0.05, 0.10, 0.20];
-
-// A core holding's target band is [cap × this, cap]. The cap is the only
-// number the UI asks for, so the floor is derived from it instead of doubling
-// the questions. Half is deliberate: it fires once a position has drifted to
-// less than half its intended size, which is about when "I meant to own this"
-// stops being true in practice.
-const CORE_FLOOR_RATIO = 0.5;
+// Both ends of the band are free numbers typed as percentages of total NAV
+// and stored as fractions. Either may be left blank, which resolves to a
+// bound no position can breach — so a blank side simply never fires, and a
+// symbol with both blank is "not configured" and warns about nothing.
+const BOUND_FLOOR = 0, BOUND_CEIL = 1;
+const resolveBounds = (cfg) => [
+  cfg && cfg.min != null ? cfg.min : BOUND_FLOOR,
+  cfg && cfg.max != null ? cfg.max : BOUND_CEIL,
+];
 
 function positionSettings() {
   return (currentDataRef.positionSettings && currentDataRef.positionSettings.symbols) || {};
@@ -1665,14 +1664,16 @@ function portfolioExposures() {
   return currentDataRef._exposures;
 }
 
-// null when there is nothing to judge (no cap set); otherwise ok/over/under.
-// An over-cap position is flagged whether or not it is core — a cap is a cap.
-// The floor only applies to core holdings: a trade being wound down is
-// *supposed* to shrink, and flagging that would train you to ignore the panel.
+// null when there is nothing to judge (both boxes blank); else ok/over/under.
+// 核心持仓 does NOT gate this. Once the floor is a number you type, gating the
+// under-alert on a separate checkbox would mean typing 5% and getting silence
+// — the number you entered IS the intent. The flag stays a label: the treemap
+// ring, the 核心 tag, and sort priority in the panel.
 function positionStatus(weight, cfg) {
-  if (!cfg || cfg.cap == null) return null;
-  if (weight > cfg.cap) return "over";
-  if (cfg.core && weight < cfg.cap * CORE_FLOOR_RATIO) return "under";
+  if (!cfg || (cfg.min == null && cfg.max == null)) return null;
+  const [lo, hi] = resolveBounds(cfg);
+  if (weight > hi) return "over";
+  if (weight < lo) return "under";
   return "ok";
 }
 
@@ -1699,8 +1700,7 @@ function positionRows() {
     return {
       symbol: sym, ...ex,
       core: !!c.core,
-      cap: c.cap,
-      floor: c.cap == null ? null : c.cap * CORE_FLOOR_RATIO,
+      min: c.min, max: c.max,
       status: positionStatus(ex.weight, c),
       held: !!bySymbol[sym],
     };
@@ -1729,25 +1729,29 @@ function renderCorePositions() {
   const tbody = $("core-body");
   tbody.innerHTML = "";
   for (const r of rows) {
-    // Bar scale leaves room above the cap so an over-weight marker lands
-    // inside the track instead of pinning to the right edge.
-    const scale = Math.max((r.cap || 0) * 1.6, r.weight * 1.15, 0.02);
+    const [lo, hi] = resolveBounds(r);
+    // Bar scale leaves room above the upper bound so an over-weight marker
+    // lands inside the track instead of pinning to the right edge. A blank
+    // 上限 resolves to 100%, which must NOT set the scale — it would squash
+    // every real number into the leftmost few pixels — so only a typed one
+    // counts, and the open-ended zone just runs off the right edge.
+    const scale = Math.max((r.max || 0) * 1.6, lo * 1.6, r.weight * 1.15, 0.02);
     const pct = (v) => Math.min(100, Math.max(0, v / scale * 100));
     let band = "";
-    if (r.cap != null) {
-      const lo = r.core ? r.floor : 0;
-      band = `<div class="band-zone" style="left:${pct(lo)}%;width:${pct(r.cap) - pct(lo)}%"></div>`
-        + `<div class="band-cap" style="left:${pct(r.cap)}%"></div>`;
+    if (r.status) {
+      band = `<div class="band-zone" style="left:${pct(lo)}%;width:${pct(hi) - pct(lo)}%"></div>`;
+      if (r.max != null) band += `<div class="band-cap" style="left:${pct(hi)}%"></div>`;
     }
     const tone = r.status === "over" ? "down" : r.status === "under" ? "amber" : "";
-    const target = r.cap == null ? "—"
-      : r.core ? `${fmtPct(r.floor, 1)} – ${fmtPct(r.cap, 1)}`
-      : `≤ ${fmtPct(r.cap, 1)}`;
-    let verdict = '<span class="muted">未设上限</span>';
+    const target = !r.status ? "—"
+      : r.min == null ? `≤ ${fmtPct(r.max, 1)}`
+      : r.max == null ? `≥ ${fmtPct(r.min, 1)}`
+      : `${fmtPct(r.min, 1)} – ${fmtPct(r.max, 1)}`;
+    let verdict = '<span class="muted">未设区间</span>';
     if (r.status === "over") {
-      verdict = `<span class="tag tag-over">超上限 +${((r.weight - r.cap) * 100).toFixed(1)}pp</span>`;
+      verdict = `<span class="tag tag-over">超上限 +${((r.weight - hi) * 100).toFixed(1)}pp</span>`;
     } else if (r.status === "under") {
-      verdict = `<span class="tag tag-under">欠配 −${((r.floor - r.weight) * 100).toFixed(1)}pp</span>`;
+      verdict = `<span class="tag tag-under">欠配 −${((lo - r.weight) * 100).toFixed(1)}pp</span>`;
     } else if (r.status === "ok") {
       verdict = '<span class="tag tag-inband">区间内</span>';
     }
@@ -1784,11 +1788,11 @@ function tileFlag(symbol) {
   const row = portfolioExposures().bySymbol[symbol];
   const weight = row ? row.weight : 0;
   const status = positionStatus(weight, cfg);
-  const parts = [cfg.core ? "核心持仓" : "已设上限", `全账户敞口占比 ${fmtPct(weight, 1)}`];
-  if (cfg.cap != null) {
-    parts.push(cfg.core
-      ? `目标区间 ${fmtPct(cfg.cap * CORE_FLOOR_RATIO, 1)} – ${fmtPct(cfg.cap, 1)}`
-      : `上限 ${fmtPct(cfg.cap, 1)}`);
+  const parts = [cfg.core ? "核心持仓" : "已设区间", `全账户敞口占比 ${fmtPct(weight, 1)}`];
+  if (cfg.min != null || cfg.max != null) {
+    parts.push(cfg.min == null ? `上限 ${fmtPct(cfg.max, 1)}`
+      : cfg.max == null ? `下限 ${fmtPct(cfg.min, 1)}`
+      : `目标区间 ${fmtPct(cfg.min, 1)} – ${fmtPct(cfg.max, 1)}`);
   }
   if (status === "over" || status === "under") parts.push(POS_STATUS_LABEL[status]);
   return {
@@ -1806,7 +1810,16 @@ function tileFlag(symbol) {
 // 保存, so 取消 / Esc really do discard.
 let posDraft = null;
 
-const capLabel = (cap) => (cap == null ? "不限" : `${Math.round(cap * 100)}%`);
+// Fraction → the string that goes in the input box, and back. The toFixed
+// round-trip is not decoration: 0.05 * 100 is 5.000000000000001 in binary
+// floating point, and that is what the user would see in the box.
+const boundToInput = (v) => (v == null ? "" : String(+(v * 100).toFixed(4)));
+const inputToBound = (raw) => {
+  const t = String(raw).trim();
+  if (t === "") return null;
+  const n = Number(t);
+  return Number.isFinite(n) ? +(n / 100).toFixed(6) : NaN;
+};
 
 function openPositionModal() {
   const cfg = positionSettings();
@@ -1818,7 +1831,8 @@ function openPositionModal() {
     || a.localeCompare(b));
   posDraft = {};
   for (const s of syms) {
-    posDraft[s] = { core: !!(cfg[s] && cfg[s].core), cap: cfg[s] ? cfg[s].cap : null };
+    const c = cfg[s] || {};
+    posDraft[s] = { core: !!c.core, min: c.min ?? null, max: c.max ?? null };
   }
 
   const tbody = $("pos-body");
@@ -1842,10 +1856,14 @@ function openPositionModal() {
         </label>
       </td>
       <td>
-        <div class="seg-toggle pos-caps">
-          ${[null, ...POSITION_CAPS].map(c =>
-            `<button type="button" data-cap="${c == null ? "" : c}"${
-              posDraft[sym].cap === c ? ' class="active"' : ""}>${capLabel(c)}</button>`).join("")}
+        <div class="pos-range">
+          <input type="number" data-role="min" inputmode="decimal" step="any"
+                 min="0" max="100" placeholder="0" aria-label="${sym} 下限百分比"
+                 value="${boundToInput(posDraft[sym].min)}" /><span class="pct">%</span>
+          <span class="dash">–</span>
+          <input type="number" data-role="max" inputmode="decimal" step="any"
+                 min="0" max="100" placeholder="100" aria-label="${sym} 上限百分比"
+                 value="${boundToInput(posDraft[sym].max)}" /><span class="pct">%</span>
         </div>
       </td>
     `;
@@ -1863,7 +1881,25 @@ function closePositionModal() {
   posDraft = null;
 }
 
+// Returns the first offending symbol, or "" when the draft is sound. The
+// server rejects the same cases, but a 400 naming one symbol out of thirty
+// is a worse way to find out than a message next to the row.
+function firstBadBound() {
+  for (const [sym, d] of Object.entries(posDraft || {})) {
+    if (Number.isNaN(d.min) || Number.isNaN(d.max)) return `${sym}：百分比填的不是数字`;
+    for (const v of [d.min, d.max]) {
+      if (v != null && (v < 0 || v > 1)) return `${sym}：百分比要在 0 – 100 之间`;
+    }
+    if (d.min != null && d.max != null && d.min > d.max) {
+      return `${sym}：下限 ${boundToInput(d.min)}% 大于上限 ${boundToInput(d.max)}%`;
+    }
+  }
+  return "";
+}
+
 async function savePositionSettings() {
+  const bad = firstBadBound();
+  if (bad) { $("pos-status").textContent = bad; return; }
   const btn = $("pos-save");
   btn.disabled = true;
   $("pos-status").textContent = "保存中…";
@@ -1871,7 +1907,9 @@ async function savePositionSettings() {
   // sending them would grow the file with every symbol ever held.
   const symbols = {};
   for (const [sym, d] of Object.entries(posDraft || {})) {
-    if (d.core || d.cap != null) symbols[sym] = { core: d.core, cap: d.cap };
+    if (d.core || d.min != null || d.max != null) {
+      symbols[sym] = { core: d.core, min: d.min, max: d.max };
+    }
   }
   try {
     const res = await fetch("/api/settings/positions", {
@@ -1911,13 +1949,15 @@ function wirePositionModal() {
   });
   // Delegated: the table is rebuilt on every open, and per-row listeners
   // would be re-attached (and leak) with it.
-  $("pos-body").addEventListener("click", (e) => {
-    const capBtn = e.target.closest("button[data-cap]");
-    if (!capBtn) return;
-    const raw = capBtn.dataset.cap;
-    posDraft[capBtn.closest("tr").dataset.sym].cap = raw === "" ? null : Number(raw);
-    capBtn.parentElement.querySelectorAll("button").forEach(b => b.classList.remove("active"));
-    capBtn.classList.add("active");
+  $("pos-body").addEventListener("input", (e) => {
+    const role = e.target.dataset.role;
+    if (role !== "min" && role !== "max") return;
+    const d = posDraft[e.target.closest("tr").dataset.sym];
+    d[role] = inputToBound(e.target.value);
+    // Live feedback while typing, but never mid-keystroke clamping — being
+    // told "5 > 1" halfway through typing "15" would be maddening.
+    e.target.classList.toggle("bad", Number.isNaN(d[role]));
+    $("pos-status").textContent = firstBadBound();
   });
   $("pos-body").addEventListener("change", (e) => {
     if (e.target.dataset.role !== "core") return;
@@ -1959,11 +1999,11 @@ function renderTreemap(stocks) {
     div.style.height = h + "px";
     div.style.background = color(d.unrealized_pl);
 
-    // Core / cap markers. NOTE the mixed frame of reference: the tile's AREA
+    // Core / band markers. NOTE the mixed frame of reference: the tile's AREA
     // is this account's stock market value, while the ring and badge describe
-    // the symbol across every account and include its option legs. That is on
-    // purpose — a cap is a portfolio-wide rule — but it means a modest tile
-    // can legitimately wear a 超上限 badge, so the tooltip prints both numbers.
+    // the symbol across every account and include its long option legs. That
+    // is on purpose — a target band is a portfolio-wide rule — but it means a
+    // modest tile can wear a 超上限 badge, so the tooltip prints both numbers.
     const flag = tileFlag(d.symbol);
     if (flag.core) div.classList.add("tile-core");
     if (flag.status === "over" || flag.status === "under") div.classList.add("tile-" + flag.status);

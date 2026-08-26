@@ -203,8 +203,9 @@ def upload():
 
 # --- Position settings: core holdings + per-symbol weight caps -------------
 #
-# Which underlyings are "core" (a position you intend to keep, so being
-# UNDER-weight is itself a signal) and how large each is allowed to get.
+# Which underlyings are "core" (a position you intend to keep) and the target
+# band each one should sit in, as a share of total NAV. Both ends are free
+# numbers and both are optional — see _position_bound.
 # Stored server-side rather than in localStorage: the dashboard is reached
 # from more than one browser/device against the same droplet, and a config
 # that silently differs per browser would make the treemap badges say
@@ -216,27 +217,46 @@ def upload():
 # unlike the shell, do match a leading dot).
 POSITION_SETTINGS_FILE = UPLOAD_DIR / ".position_settings.json"
 
-# The caps the UI offers, as fractions of total NAV. Kept server-side too so
-# a hand-edited config file can't smuggle in a cap the UI can't render.
-#
-# null ("no cap") is the default and it is NOT a formality: it is what makes
-# "configured" distinguishable from "never touched". With a numeric default,
-# a fresh install would have an implicit cap on every symbol and would light
-# up the treemap with warnings about limits the user never set.
-ALLOWED_CAPS = (0.05, 0.10, 0.20)
-DEFAULT_CAP = None
-
 # Symbols are underlyings (equity tickers), uppercased before matching.
 # Deliberately narrow: these strings are echoed back into the dashboard.
 _SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,15}$")
 
 
-def _normalize_position_settings(raw: dict) -> dict[str, dict]:
-    """Validate a {symbol: {core, cap}} map; raise ValueError on bad input.
+def _position_bound(key: str, field: str, raw) -> float | None:
+    """One end of a target band, as a fraction of NAV; None when left blank.
 
-    Entries that carry no information (not core, cap at the default) are
+    None is not the same as a number and is worth keeping distinct all the
+    way to storage: it is what makes "configured" separable from "never
+    touched". The dashboard resolves a blank 'min' to 0 and a blank 'max' to
+    1 — bounds no position can breach — so an unfilled box means that side
+    simply never fires, and a fresh install warns about nothing.
+    """
+    if raw is None or raw == "":
+        return None
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key}: '{field}' must be a number or null") from None
+    if val != val or val in (float("inf"), float("-inf")):   # NaN / ±inf
+        raise ValueError(f"{key}: '{field}' must be a finite number")
+    # 6dp keeps 0.075 (7.5%) and finer exact without storing float noise
+    # like 0.07500000000000001 back into the file.
+    val = round(val, 6)
+    if not 0.0 <= val <= 1.0:
+        # 10 instead of 0.10 is the mistake worth naming — the UI speaks in
+        # percent and the wire format is a fraction.
+        raise ValueError(
+            f"{key}: '{field}' must be between 0 and 1 (a fraction of NAV, "
+            f"not a percentage); got {raw!r}")
+    return val
+
+
+def _normalize_position_settings(raw: dict) -> dict[str, dict]:
+    """Validate a {symbol: {core, min, max}} map; raise ValueError on bad input.
+
+    Entries that carry no information (not core, neither bound filled in) are
     dropped so the stored file only holds real decisions — a symbol absent
-    from the map and a symbol explicitly set to the defaults behave
+    from the map and a symbol with everything left at its default behave
     identically, so there is nothing to lose by not writing it.
     """
     symbols = raw.get("symbols")
@@ -254,23 +274,14 @@ def _normalize_position_settings(raw: dict) -> dict[str, dict]:
         core = cfg.get("core", False)
         if not isinstance(core, bool):
             raise ValueError(f"{key}: 'core' must be a boolean")
-        cap_raw = cfg.get("cap", DEFAULT_CAP)
-        if cap_raw is None:
-            cap = None
-        else:
-            try:
-                cap = round(float(cap_raw), 4)
-            except (TypeError, ValueError):
-                raise ValueError(f"{key}: 'cap' must be a number or null") from None
-            if cap not in ALLOWED_CAPS:
-                # 5 instead of 0.05 is the mistake worth naming — the UI
-                # speaks in percent and the wire format is a fraction.
-                raise ValueError(
-                    f"{key}: 'cap' must be null or one of {ALLOWED_CAPS} "
-                    f"(a fraction of NAV, not a percentage); got {cap_raw!r}")
-        if not core and cap is None:
+        lo = _position_bound(key, "min", cfg.get("min"))
+        hi = _position_bound(key, "max", cfg.get("max"))
+        if lo is not None and hi is not None and lo > hi:
+            raise ValueError(
+                f"{key}: 'min' ({lo}) must not exceed 'max' ({hi})")
+        if not core and lo is None and hi is None:
             continue
-        out[key] = {"core": core, "cap": cap}
+        out[key] = {"core": core, "min": lo, "max": hi}
     return out
 
 
