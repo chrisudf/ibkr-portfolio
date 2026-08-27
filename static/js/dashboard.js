@@ -95,21 +95,47 @@ function maskAccountId(id) {
 //
 // Those leading points are not a cosmetic problem. navStats chains returns
 // with a begin-of-day deposit convention — denom = previous NAV + deposits in
-// the interval — and IBKR dates the funding cash transaction a day BEFORE the
-// NAV row that reflects it. Across the funding day that makes the link
+// the interval — while IBKR's Statement of Funds dates a wire when it was
+// SENT, not when it lands (verified against real statements: lags run -1 to
+// +14 days, and one funding round arrives as several wires landing on
+// different days). Across the funding day that books
 //
-//     $1 / ($1 + $32,675) - 1  =  -99.99%
+//     $1 / ($1 + $32,675) - 1  =  -99.99%    (clamped to -0.99)
 //
-// which navStats' clamp catches but cannot undo: one such link permanently
-// drags the whole chain down. On real data it printed TWR -99.1%, max drawdown
-// -99.5% and 205% vol for U228, and dragged the merged view to a -35.1%
-// drawdown dated to the same two days.
+// and the clamp never gets its money back: the wires land spread over the
+// following days, each arrival-day link carrying that day's own dated
+// deposits in its denominator, so no unclamped mirror rebound forms and the
+// single clamped link pins the whole chain at ~x0.01. On real data it
+// printed TWR -99.1%, max drawdown -99.5% and 205% vol for U228, and
+// dragged the merged view to a -35.1% drawdown dated to the same two days.
+// (In the textbook shape — one wire, fully reflected the next day, no other
+// flows — the mirror rebound IS unclamped and the chain explodes upward
+// instead. Garbage either way, scaled by flow/base.)
 //
 // So drop leading points until the account holds a non-trivial fraction of
 // what it ever held. Only the LEADING run: a mid-series collapse to near zero
-// is a real event and has to stay on the chart. Once an account is funded, the
-// same one-day lag is just noise against a large base — this is fatal only
-// while the base is ~0, which is exactly the stretch being cut.
+// is a real event and has to stay on the chart.
+//
+// The 1%-of-max floor is deliberately NOT capped at an absolute dollar
+// level, because the ratio protects the boundary it trims: a KEPT leading
+// run is >= 1% of the all-time max, so as long as a deposit ever prints in
+// some NAV row (max >= deposit), it cannot exceed ~100x the kept run — just
+// under the ratio at which a funding link would cross -0.99 and stop
+// telescoping away. A $100-style cap would break exactly that: a $150
+// residue kept in front of a $500k wire rebuilds the -99%/+333,233% pair
+// this function exists to remove. The ratio's cost is the mirror image — an
+// account that genuinely grows past 100x has its earliest real history
+// trimmed and the chain restarts, visibly, in the panel's date range.
+//
+// That guarantee is scoped to the LEADING boundary, nothing wider. Still on
+// the clamp's menu (one family — a flow landing on a tiny prev-day NAV):
+// re-funding an account after a kept mid-series collapse (the wire lands on
+// the collapsed base and the loss gets understated), and a deposit that
+// never prints in any NAV row (impaired or withdrawn again within one NAV
+// gap). And even a kept-but-near-boundary funding pair telescopes in LEVEL
+// only — maxDD still records the transient dip, and the paired links blow
+// up the printed vol. The trim removes the fatal ~$1-base stretch; the rest
+// is the date-realignment work documented in TODO.md [P2].
 const FUNDED_MIN_RATIO = 0.01;
 
 function fundedSeries(navHistory) {
@@ -449,10 +475,12 @@ function mergeAccounts(accounts) {
   // account has begun reporting (a partial sum would read as a fake crash).
   // Any account without a history (old JSON) disables the merged curve
   // rather than misrepresenting the household as one thinner account.
-  // Pre-filter with the same total>0 predicate the single-account stats use:
-  // a padded/blank NAV row parses to 0.0, and forward-filling a zero would
+  // Pre-trim with the same fundedSeries the single-account stats use: total>0
+  // (a padded/blank NAV row parses to 0.0, and forward-filling a zero would
   // paint a full-NAV one-day crash on the household curve that neither
-  // per-account view shows.
+  // per-account view shows) plus the leading pre-funding stub, which would
+  // otherwise drag the merged start back to the residue days and rebuild the
+  // same broken links on the household chain.
   const histories = list.map(a => fundedSeries(a.nav_history));
   let nav_history = [];
   if (histories.length && histories.every(h => h.length)) {
