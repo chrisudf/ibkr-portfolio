@@ -1628,6 +1628,14 @@ function positionSettings() {
   return (currentDataRef.positionSettings && currentDataRef.positionSettings.symbols) || {};
 }
 
+// Symbols reach these rows from two places: the settings file, whose keys the
+// server validates against a strict ticker regex, and the parsed statement,
+// whose Symbol column is whatever the uploaded CSV said. The rows below put
+// them in text AND attribute contexts, so escape rather than trust — a stray
+// quote in a ticker would otherwise break straight out of an aria-label.
+const esc = (v) => String(v).replace(/[&<>"']/g, (c) => (
+  { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
 function computeExposures(data) {
   const nav = data.nav || {};
   const totalNav = nav.total || ((nav.cash || 0) + (nav.stock || 0) + (nav.options || 0)) || 0;
@@ -1788,8 +1796,8 @@ function renderCorePositions(scopeLabel) {
       : ' <span class="tag tag-gone">仅卖方期权</span>';
     const tr = document.createElement("tr");
     tr.innerHTML = `
-      <td><b>${r.symbol}</b>${r.core ? ' <span class="tag tag-core">核心</span>' : ""}${stateTag}</td>
-      <td class="num" title="${exposureTip(r)}">${fmtMoney(r.exposure, 0)}</td>
+      <td><b>${esc(r.symbol)}</b>${r.core ? ' <span class="tag tag-core">核心</span>' : ""}${stateTag}</td>
+      <td class="num" title="${esc(exposureTip(r))}">${fmtMoney(r.exposure, 0)}</td>
       <td class="num ${tone}"><b>${fmtPct(r.weight, 1)}</b></td>
       <td class="num muted">${target}</td>
       <td class="band-cell">
@@ -1906,8 +1914,8 @@ function renderPositionRows() {
       : "已清仓";
     tr.innerHTML = `
       <td>
-        <b>${sym}</b>
-        <div class="pos-sub" title="${ex ? exposureTip(ex) : "无持仓"}">${held}</div>
+        <b>${esc(sym)}</b>
+        <div class="pos-sub" title="${esc(ex ? exposureTip(ex) : "无持仓")}">${esc(held)}</div>
       </td>
       <td>
         <label class="pos-check">
@@ -1918,11 +1926,11 @@ function renderPositionRows() {
       <td>
         <div class="pos-range">
           <input type="number" data-role="min" inputmode="decimal" step="any"
-                 min="0" max="100" placeholder="0" aria-label="${sym} 下限百分比"
+                 min="0" max="100" placeholder="0" aria-label="${esc(sym)} 下限百分比"
                  value="${boundToInput(posDraft[sym].min)}" /><span class="pct">%</span>
           <span class="dash">–</span>
           <input type="number" data-role="max" inputmode="decimal" step="any"
-                 min="0" max="100" placeholder="100" aria-label="${sym} 上限百分比"
+                 min="0" max="100" placeholder="100" aria-label="${esc(sym)} 上限百分比"
                  value="${boundToInput(posDraft[sym].max)}" /><span class="pct">%</span>
         </div>
       </td>
@@ -2062,11 +2070,11 @@ function renderTreemap(stocks) {
     div.style.height = h + "px";
     div.style.background = color(d.unrealized_pl);
 
-    // Core / band markers. NOTE the mixed frame of reference: the tile's AREA
-    // is this account's stock market value, while the ring and badge describe
-    // the symbol across every account and include its long option legs. That
-    // is on purpose — a target band is a portfolio-wide rule — but it means a
-    // modest tile can wear a 超上限 badge, so the tooltip prints both numbers.
+    // Core / band markers. Tile and badge describe the same book — whichever
+    // account tab is open — but not the same NUMBER: the tile's AREA is stock
+    // market value, while the badge weighs stock + long option market value
+    // against NAV. So a name held mostly through calls can wear a 超上限 badge
+    // on a modest tile, and the tooltip prints both figures.
     const flag = tileFlag(d.symbol);
     if (flag.core) div.classList.add("tile-core");
     if (flag.status === "over" || flag.status === "under") div.classList.add("tile-" + flag.status);
@@ -2633,16 +2641,28 @@ document.addEventListener("DOMContentLoaded", () => {
   $("refresh-btn").addEventListener("click", refreshFromIBKR);
   wirePositionModal();
 
-  // Core-holding rules. Same shape as the cluster fetch below: the first
-  // render may land before this resolves, so re-render once it arrives.
-  // A failure leaves the panel hidden and the treemap unmarked — the rest
-  // of the dashboard does not depend on it.
+  // Core-holding rules. Like the cluster fetch below, the first render may
+  // land before this resolves, so re-render once it arrives.
+  //
+  // The button ships disabled and only this success path enables it. A failed
+  // GET leaves positionSettings null, which every reader treats as "nothing
+  // configured" — and opening the modal on top of that would show 32 blank
+  // rows, so 保存 would PUT an empty map over a perfectly good server-side
+  // config and wipe every rule without the user ever seeing them. A dead
+  // button and a toast beat silent data loss.
   fetch("/api/settings/positions")
-    .then(r => (r.ok ? r.json() : null))
-    .catch(() => null)
+    .then(r => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
     .then(cfg => {
       currentDataRef.positionSettings = cfg;
+      const btn = $("pos-btn");
+      btn.disabled = false;
+      btn.title = "标记核心持仓、设置每个标的的仓位区间";
       if (currentDataRef.data) render(currentDataRef.data);
+    })
+    .catch(exc => {
+      $("pos-btn").title = "持仓规则读取失败，刷新页面重试";
+      showToast("error", "持仓规则读取失败",
+        `${exc.message || exc} · 按钮已停用，以免空配置覆盖服务器上已存的规则`, 8000);
     });
 
   // Cluster mapping — a static file the user edits by hand. 404/parse

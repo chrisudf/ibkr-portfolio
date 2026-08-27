@@ -226,3 +226,24 @@ def test_settings_file_is_not_mistaken_for_an_account(tmp_path, monkeypatch):
         '{"version": 1, "symbols": {}}', encoding="utf-8")
     (tmp_path / "U17456181.json").write_text('{"nav": {"total": 1}}', encoding="utf-8")
     assert list(app_mod._load_all_accounts()) == ["U17456181"]
+
+
+def test_position_settings_response_shape_is_stable(tmp_path, monkeypatch):
+    """Empty, corrupt and populated all answer with the same keys."""
+    import app as app_mod
+
+    path = tmp_path / ".position_settings.json"
+    monkeypatch.setattr(app_mod, "POSITION_SETTINGS_FILE", path)
+    client = app_mod.app.test_client()
+    keys = {"version", "symbols", "updated_at"}
+
+    assert set(client.get("/api/settings/positions").get_json()) == keys   # missing
+    path.write_text("not json", encoding="utf-8")
+    assert set(client.get("/api/settings/positions").get_json()) == keys   # corrupt
+    path.write_text('{"symbols": {"NVDA": {"max": 999}}}', encoding="utf-8")
+    assert set(client.get("/api/settings/positions").get_json()) == keys   # invalid
+
+    client.put("/api/settings/positions",
+               json={"symbols": {"NVDA": {"core": True, "max": 0.1}}})
+    body = client.get("/api/settings/positions").get_json()
+    assert set(body) == keys and body["updated_at"]

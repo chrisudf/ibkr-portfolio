@@ -285,23 +285,30 @@ def _normalize_position_settings(raw: dict) -> dict[str, dict]:
     return out
 
 
+# Every response carries the same keys — an absent updated_at on the empty
+# path and a present one on the success path would push a shape check into
+# the client for no reason.
+def _blank_position_settings() -> dict:
+    return {"version": 1, "symbols": {}, "updated_at": ""}
+
+
 def _read_position_settings() -> dict:
     try:
         with open(POSITION_SETTINGS_FILE, "r", encoding="utf-8") as f:
             stored = json.load(f)
     except (OSError, json.JSONDecodeError):
-        return {"version": 1, "symbols": {}}
+        return _blank_position_settings()
     if not isinstance(stored, dict):
-        return {"version": 1, "symbols": {}}
+        return _blank_position_settings()
     try:
         symbols = _normalize_position_settings(stored)
     except ValueError:
         # A hand-edited file that no longer validates must not take the
         # dashboard down — fall back to "nothing configured" and say so.
         app.logger.warning("position settings file is invalid; ignoring it")
-        return {"version": 1, "symbols": {}}
+        return _blank_position_settings()
     return {"version": 1, "symbols": symbols,
-            "updated_at": stored.get("updated_at", "")}
+            "updated_at": stored.get("updated_at") or ""}
 
 
 @app.get("/api/settings/positions")
