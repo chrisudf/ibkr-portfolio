@@ -1195,7 +1195,7 @@ function weeklyDiff(current, snapshots) {
     .filter(r => Math.abs(r.total) >= 1 || r.pxPct != null)
     .sort((a, b) => b.total - a.total);
   return {
-    baseDate: base.snap.date, days: base.gap,
+    baseDate: base.snap.date, days: base.gap, liveDate: current.date,
     navBase: base.snap.nav, navNow: current.nav, rows: list,
   };
 }
@@ -1226,6 +1226,7 @@ function renderWeekly(data, accounts, selected) {
   }
   const winnersEl = $("weekly-winners"), losersEl = $("weekly-losers");
   if (!diffs.length) {
+    $("weekly-title").textContent = "周复盘";
     $("weekly-note").textContent = "";
     $("weekly-summary").innerHTML =
       `<span class="muted">快照积累中 —— 最早基线距今不足 ${SNAP_MIN_GAP} 天，`
@@ -1254,9 +1255,28 @@ function renderWeekly(data, accounts, selected) {
   const losers = rows.filter(r => r.total < 0).reverse().slice(0, 5);
 
   const baseDates = diffs.map(d => d.baseDate).sort();
-  const curDate = liveSnapshot(targets[0]).date || "";
+  // "本周" was a lie whenever pickBaseline had to settle for a 5- or
+  // 16-day-old snapshot, so the heading follows the data. Every part of the
+  // label now comes from the SAME diffs: the note used to pair the earliest
+  // baseline with the day count of whichever account was first in file order
+  // and the live date of targets[0] — which may be a fresh account that
+  // produced no diff at all. Days show a range when baselines disagree.
+  const liveDates = diffs.map(d => d.liveDate).filter(Boolean).sort();
+  const curDate = liveDates.length ? liveDates[liveDates.length - 1] : "";
+  const dayVals = diffs.map(d => d.days);
+  const dMin = Math.min(...dayVals), dMax = Math.max(...dayVals);
+  const daysLabel = dMin === dMax ? `${dMax} 天` : `${dMin}–${dMax} 天`;
+  $("weekly-title").textContent = `近 ${daysLabel}复盘`;
+  // The printed endpoints are cross-account extremes (earliest baseline,
+  // latest live date). Independently refreshed accounts can hold equal-length
+  // but OFFSET windows — the endpoints then span more days than any single
+  // window, and "08-10 → 08-20 · 7 天" would read as an arithmetic error.
+  const spanDays = baseDates[0] && curDate
+    ? Math.round((Date.parse(curDate) - Date.parse(baseDates[0])) / DAY_MS)
+    : dMax;
   $("weekly-note").textContent =
-    `${baseDates[0]} → ${curDate || "最新"} · ${diffs[0].days} 天`
+    `${baseDates[0]} → ${curDate || "最新"} · ${daysLabel}`
+    + (spanDays > dMax ? `（跨 ${spanDays} 天，各账户窗口独立）` : "")
     + (fresh ? ` · ${fresh} 个账户快照尚新未计入` : "");
 
   // Headline: NAV change over the same window. Numerator and denominator
