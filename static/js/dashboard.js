@@ -89,6 +89,38 @@ function maskAccountId(id) {
   return id.slice(0, 4) + "*".repeat(Math.max(0, id.length - 6)) + id.slice(-2);
 }
 
+// The daily NAV series starts when IBKR starts REPORTING an account, which can
+// be well before it holds anything: U228 ships 55 rows of $0.00 and then three
+// days at $0.65–$1.00 (the opening test transfer) before the real money lands.
+//
+// Those leading points are not a cosmetic problem. navStats chains returns
+// with a begin-of-day deposit convention — denom = previous NAV + deposits in
+// the interval — and IBKR dates the funding cash transaction a day BEFORE the
+// NAV row that reflects it. Across the funding day that makes the link
+//
+//     $1 / ($1 + $32,675) - 1  =  -99.99%
+//
+// which navStats' clamp catches but cannot undo: one such link permanently
+// drags the whole chain down. On real data it printed TWR -99.1%, max drawdown
+// -99.5% and 205% vol for U228, and dragged the merged view to a -35.1%
+// drawdown dated to the same two days.
+//
+// So drop leading points until the account holds a non-trivial fraction of
+// what it ever held. Only the LEADING run: a mid-series collapse to near zero
+// is a real event and has to stay on the chart. Once an account is funded, the
+// same one-day lag is just noise against a large base — this is fatal only
+// while the base is ~0, which is exactly the stretch being cut.
+const FUNDED_MIN_RATIO = 0.01;
+
+function fundedSeries(navHistory) {
+  const pts = (navHistory || []).filter(p => p.total > 0);
+  if (!pts.length) return pts;
+  const floor = Math.max(...pts.map(p => p.total)) * FUNDED_MIN_RATIO;
+  let i = 0;
+  while (i < pts.length && pts[i].total < floor) i++;
+  return pts.slice(i);
+}
+
 function mergeAccounts(accounts) {
   const list = Object.values(accounts);
   if (list.length === 1) return list[0];
@@ -421,7 +453,7 @@ function mergeAccounts(accounts) {
   // a padded/blank NAV row parses to 0.0, and forward-filling a zero would
   // paint a full-NAV one-day crash on the household curve that neither
   // per-account view shows.
-  const histories = list.map(a => (a.nav_history || []).filter(p => p.total > 0));
+  const histories = list.map(a => fundedSeries(a.nav_history));
   let nav_history = [];
   if (histories.length && histories.every(h => h.length)) {
     const dates = [...new Set(histories.flat().map(p => p.date))].sort();
@@ -1545,7 +1577,7 @@ function navStats(series, flows) {
 
 function renderNavHistory(data) {
   const panel = $("nav-history-panel");
-  const series = (data.nav_history || []).filter(p => p.total > 0);
+  const series = fundedSeries(data.nav_history);
   const stats = navStats(series, data.cash_flows || []);
   if (!stats) { panel.hidden = true; return; }
   panel.hidden = false;
