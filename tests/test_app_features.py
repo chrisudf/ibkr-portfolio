@@ -124,3 +124,126 @@ def test_auto_sync_due_logic():
     assert not _auto_sync_due(sat, "weekly", 9, "sat", "2026-08-22")
 
     assert not _auto_sync_due(dt("2026-08-21T12:00:00"), "off", 9, "sat", "")
+
+
+# --- Position settings: core holdings + per-symbol caps --------------------
+
+
+def test_position_settings_normalization():
+    from app import _normalize_position_settings as norm
+
+    got = norm({"symbols": {
+        "nvda": {"core": True, "min": 0.05, "max": 0.2},   # lowercased input
+        "BRK.B": {"core": False, "max": 0.075},            # dotted, upper only
+        "AAPL": {"core": False, "min": 0.03},              # lower only
+        "GOOG": {"core": True},                            # core, band open
+        "TSLA": {"core": False, "min": None, "max": None},  # says nothing
+        "MSFT": {},                                        # says nothing
+    }})
+    assert got == {
+        "NVDA": {"core": True, "min": 0.05, "max": 0.2},
+        "BRK.B": {"core": False, "min": None, "max": 0.075},
+        "AAPL": {"core": False, "min": 0.03, "max": None},
+        "GOOG": {"core": True, "min": None, "max": None},
+    }
+    # A blank box arrives as "" from the form, not as null.
+    assert norm({"symbols": {"NVDA": {"core": True, "min": "", "max": ""}}}) == {
+        "NVDA": {"core": True, "min": None, "max": None}}
+
+
+def test_position_settings_rejects_bad_input():
+    import pytest
+
+    from app import _normalize_position_settings as norm
+
+    with pytest.raises(ValueError):
+        norm({})                                          # no symbols map
+    with pytest.raises(ValueError):
+        norm({"symbols": {"../etc": {"core": True}}})     # not a ticker
+    with pytest.raises(ValueError):
+        norm({"symbols": {"NVDA": {"core": "yes"}}})      # core not a bool
+    with pytest.raises(ValueError):
+        norm({"symbols": {"NVDA": {"min": "abc"}}})       # not a number
+    with pytest.raises(ValueError):
+        norm({"symbols": {"NVDA": {"max": -0.1}}})        # out of range
+    # The mistake worth catching: percent where a fraction is expected. 10
+    # would otherwise mean "1000% of NAV" and silently never fire.
+    with pytest.raises(ValueError):
+        norm({"symbols": {"NVDA": {"max": 10}}})
+    # An inverted band would make every position both over and under.
+    with pytest.raises(ValueError):
+        norm({"symbols": {"NVDA": {"min": 0.2, "max": 0.1}}})
+    # Touching ends are fine — a band of exactly one point is a real choice.
+    assert norm({"symbols": {"NVDA": {"min": 0.1, "max": 0.1}}})["NVDA"]["min"] == 0.1
+
+
+def test_position_settings_roundtrip(tmp_path, monkeypatch):
+    import app as app_mod
+
+    monkeypatch.setattr(app_mod, "POSITION_SETTINGS_FILE",
+                        tmp_path / ".position_settings.json")
+    client = app_mod.app.test_client()
+
+    assert client.get("/api/settings/positions").get_json()["symbols"] == {}
+
+    res = client.put("/api/settings/positions", json={"symbols": {
+        "NVDA": {"core": True, "min": 0.05, "max": 0.10},
+        "SOFI": {"core": False, "min": None, "max": None},   # dropped on write
+    }})
+    assert res.status_code == 200
+    assert res.get_json()["symbols"] == {
+        "NVDA": {"core": True, "min": 0.05, "max": 0.10}}
+
+    stored = client.get("/api/settings/positions").get_json()
+    assert stored["symbols"] == {"NVDA": {"core": True, "min": 0.05, "max": 0.10}}
+    assert stored["updated_at"]
+
+    assert client.put("/api/settings/positions",
+                      json={"symbols": {"NVDA": {"max": 33}}}).status_code == 400
+    # A rejected write must leave the previous config intact.
+    assert client.get("/api/settings/positions").get_json()["symbols"] == {
+        "NVDA": {"core": True, "min": 0.05, "max": 0.10}}
+
+
+def test_corrupt_position_settings_degrade_to_empty(tmp_path, monkeypatch):
+    import app as app_mod
+
+    path = tmp_path / ".position_settings.json"
+    monkeypatch.setattr(app_mod, "POSITION_SETTINGS_FILE", path)
+    path.write_text('{"symbols": {"NVDA": {"max": 999}}}', encoding="utf-8")
+    # A hand-edited file that no longer validates must not 500 the dashboard.
+    res = app_mod.app.test_client().get("/api/settings/positions")
+    assert res.status_code == 200
+    assert res.get_json()["symbols"] == {}
+
+
+def test_settings_file_is_not_mistaken_for_an_account(tmp_path, monkeypatch):
+    """The leading dot is load-bearing: uploads/*.json is the account sweep."""
+    import app as app_mod
+
+    monkeypatch.setattr(app_mod, "UPLOAD_DIR", tmp_path)
+    (tmp_path / ".position_settings.json").write_text(
+        '{"version": 1, "symbols": {}}', encoding="utf-8")
+    (tmp_path / "U17456181.json").write_text('{"nav": {"total": 1}}', encoding="utf-8")
+    assert list(app_mod._load_all_accounts()) == ["U17456181"]
+
+
+def test_position_settings_response_shape_is_stable(tmp_path, monkeypatch):
+    """Empty, corrupt and populated all answer with the same keys."""
+    import app as app_mod
+
+    path = tmp_path / ".position_settings.json"
+    monkeypatch.setattr(app_mod, "POSITION_SETTINGS_FILE", path)
+    client = app_mod.app.test_client()
+    keys = {"version", "symbols", "updated_at"}
+
+    assert set(client.get("/api/settings/positions").get_json()) == keys   # missing
+    path.write_text("not json", encoding="utf-8")
+    assert set(client.get("/api/settings/positions").get_json()) == keys   # corrupt
+    path.write_text('{"symbols": {"NVDA": {"max": 999}}}', encoding="utf-8")
+    assert set(client.get("/api/settings/positions").get_json()) == keys   # invalid
+
+    client.put("/api/settings/positions",
+               json={"symbols": {"NVDA": {"core": True, "max": 0.1}}})
+    body = client.get("/api/settings/positions").get_json()
+    assert set(body) == keys and body["updated_at"]

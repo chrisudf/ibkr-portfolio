@@ -509,6 +509,7 @@ async function loadPortfolio() {
   const accounts = payload.accounts || { [payload.account?.Account || "default"]: payload };
   currentDataRef.allAccounts = accounts;
   currentDataRef.sync = payload.sync || null;
+  currentDataRef._universe = null;    // memoized symbol list is now stale
   // Default to the alphabetically-first account (puts U17xxxx ahead of U22xxxx)
   // rather than the merged view — most viewing happens per-account.
   if (!currentDataRef.selected || (currentDataRef.selected !== "ALL" && !accounts[currentDataRef.selected])) {
@@ -611,8 +612,16 @@ function render(data) {
   // Weekly recap (per-underlying movers vs the ~7-day-old snapshot)
   renderWeekly(data, currentDataRef.allAccounts, currentDataRef.selected);
 
-  // Treemap
+  // Position rules are judged against THIS view — recompute before the
+  // treemap reads it per tile.
+  currentDataRef._exposures = computeExposures(data);
+
+  // Treemap (tiles carry the core-holding ring / over-under badge)
   renderTreemap(stocks);
+
+  // Core holdings vs their bands — the badge legend, and the only place an
+  // underlying with no stock leg (long options only) can show up.
+  renderCorePositions(masked);
 
   // Allocation bar — position view: cash, stock, long options (MV)
   // Short options excluded (their premium is already in cash); shown as a footnote.
@@ -1575,6 +1584,458 @@ function renderNavHistory(data) {
   ].join("");
 }
 
+/* ---------------------------------------------------------------------------
+ * Core holdings & position caps
+ *
+ * Two decisions per underlying, set in the modal behind the topbar button:
+ *   核心持仓 — a label: the treemap ring, the tag, sort priority. Not a rule.
+ *   仓位区间 — the share of total assets it should sit between, both ends
+ *              typed as free percentages and either one optional
+ *
+ * The RULES are global — one set of numbers, shared by every account — but the
+ * NUMBERS THEY JUDGE follow the account tab you are on: switch to U228 and the
+ * weights, badges and verdicts are all that account's. So the same 5–10% band
+ * is applied separately to each book, and the 总账户 tab applies it to the
+ * combined one.
+ *
+ * Exposure, per underlying:
+ *
+ *   正股市值 + 期权多头市值
+ *
+ * — capital actually deployed into the name. Long options enter at MARKET
+ * VALUE, the same number the 资产配置 bar counts, rather than at notional: a
+ * LEAPS call's strike × 100 would print a position several times the capital
+ * actually at risk. Short legs are excluded on both sides — a short put has no
+ * capital in it (its collateral is already counted as cash) and a short call
+ * only caps the upside on stock counted above.
+ *
+ * So an underlying you are only short puts on reads as 0% here. That is the
+ * definition working as intended, not a gap: assignment risk is a different
+ * question, and 保证金占用 + 卖方到期日历 are the panels that answer it.
+ * ------------------------------------------------------------------------- */
+
+// Both ends of the band are free numbers typed as percentages of total NAV
+// and stored as fractions. Either may be left blank, which resolves to a
+// bound no position can breach — so a blank side simply never fires, and a
+// symbol with both blank is "not configured" and warns about nothing.
+const BOUND_FLOOR = 0, BOUND_CEIL = 1;
+const resolveBounds = (cfg) => [
+  cfg && cfg.min != null ? cfg.min : BOUND_FLOOR,
+  cfg && cfg.max != null ? cfg.max : BOUND_CEIL,
+];
+
+function positionSettings() {
+  return (currentDataRef.positionSettings && currentDataRef.positionSettings.symbols) || {};
+}
+
+// Symbols reach these rows from two places: the settings file, whose keys the
+// server validates against a strict ticker regex, and the parsed statement,
+// whose Symbol column is whatever the uploaded CSV said. The rows below put
+// them in text AND attribute contexts, so escape rather than trust — a stray
+// quote in a ticker would otherwise break straight out of an aria-label.
+const esc = (v) => String(v).replace(/[&<>"']/g, (c) => (
+  { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+function computeExposures(data) {
+  const nav = data.nav || {};
+  const totalNav = nav.total || ((nav.cash || 0) + (nav.stock || 0) + (nav.options || 0)) || 0;
+  const rows = {};
+  const bucket = (sym) => rows[sym] || (rows[sym] = {
+    symbol: sym, stockMV: 0, longOptMV: 0, optionLegs: 0,
+  });
+  for (const s of data.stocks || []) {
+    if (CASH_EQUIVALENTS.has(s.symbol)) continue;
+    bucket(s.symbol).stockMV += s.value || 0;
+  }
+  for (const o of data.options || []) {
+    const sym = o.underlying;
+    if (!sym || CASH_EQUIVALENTS.has(sym)) continue;
+    const b = bucket(sym);
+    // Short legs still create the bucket — an underlying held only through
+    // sold puts must stay listed (and configurable) even at 0 exposure.
+    b.optionLegs += 1;
+    if (o.quantity > 0) b.longOptMV += Math.max(o.value || 0, 0);
+  }
+  for (const b of Object.values(rows)) {
+    b.exposure = b.stockMV + b.longOptMV;
+    b.weight = totalNav > 0 ? b.exposure / totalNav : 0;
+  }
+  return { totalNav, bySymbol: rows };
+}
+
+// Exposure for the account currently on screen (the 总账户 tab passes the
+// merged book, so that case falls out for free). render() recomputes this
+// once per pass before anything reads it — the treemap calls it per tile, and
+// re-walking every position 22 times would be silly.
+function currentExposures() {
+  return currentDataRef._exposures || { totalNav: 0, bySymbol: {} };
+}
+
+// Every underlying held in ANY loaded account. The rules are global, so the
+// modal has to offer every symbol — otherwise a name held only in the account
+// you are not looking at would be unconfigurable until you switched tabs.
+// Memoized per data load; loadPortfolio() clears it.
+function allUnderlyings() {
+  if (!currentDataRef._universe) {
+    const set = new Set();
+    for (const acct of Object.values(currentDataRef.allAccounts || {})) {
+      for (const st of acct.stocks || []) {
+        if (!CASH_EQUIVALENTS.has(st.symbol)) set.add(st.symbol);
+      }
+      for (const o of acct.options || []) {
+        if (o.underlying && !CASH_EQUIVALENTS.has(o.underlying)) set.add(o.underlying);
+      }
+    }
+    currentDataRef._universe = set;
+  }
+  return currentDataRef._universe;
+}
+
+// null when there is nothing to judge (both boxes blank); else ok/over/under.
+// 核心持仓 does NOT gate this. Once the floor is a number you type, gating the
+// under-alert on a separate checkbox would mean typing 5% and getting silence
+// — the number you entered IS the intent. The flag stays a label: the treemap
+// ring, the 核心 tag, and sort priority in the panel.
+function positionStatus(weight, cfg) {
+  if (!cfg || (cfg.min == null && cfg.max == null)) return null;
+  const [lo, hi] = resolveBounds(cfg);
+  if (weight > hi) return "over";
+  if (weight < lo) return "under";
+  return "ok";
+}
+
+const POS_STATUS_LABEL = { over: "超上限", under: "欠配", ok: "区间内" };
+
+function exposureTip(r) {
+  const bits = [];
+  if (r.stockMV) bits.push(`正股 ${fmtMoney(r.stockMV, 0)}`);
+  if (r.longOptMV) bits.push(`期权多头 ${fmtMoney(r.longOptMV, 0)}`);
+  return bits.join(" + ") || "无投入资本";
+}
+
+// One row per CONFIGURED symbol, scored against the account on screen.
+// Symbols with no position in this view keep their row: a core holding at 0%
+// here is the most extreme under-weight there is, and dropping the row would
+// hide exactly the case the panel exists to catch. Whether it is 0% because
+// you exited or because it lives in the other account is a real distinction
+// though, so carry it.
+function positionRows() {
+  const cfg = positionSettings();
+  const { totalNav, bySymbol } = currentExposures();
+  const universe = allUnderlyings();
+  const empty = { stockMV: 0, longOptMV: 0, exposure: 0, weight: 0, optionLegs: 0 };
+  const rows = Object.keys(cfg).map(sym => {
+    const ex = bySymbol[sym] || empty;
+    const c = cfg[sym];
+    return {
+      symbol: sym, ...ex,
+      core: !!c.core,
+      min: c.min, max: c.max,
+      status: positionStatus(ex.weight, c),
+      held: !!bySymbol[sym],
+      elsewhere: !bySymbol[sym] && universe.has(sym),
+    };
+  });
+  const rank = { over: 0, under: 1, ok: 2 };
+  rows.sort((a, b) =>
+    (rank[a.status] ?? 3) - (rank[b.status] ?? 3)
+    || (b.core - a.core)
+    || b.weight - a.weight);
+  return { totalNav, rows };
+}
+
+function renderCorePositions(scopeLabel) {
+  const panel = $("core-panel");
+  const { totalNav, rows } = positionRows();
+  if (!rows.length) { panel.hidden = true; return; }
+  panel.hidden = false;
+
+  const alerts = rows.filter(r => r.status === "over" || r.status === "under");
+  const coreCount = rows.filter(r => r.core).length;
+  $("core-note").textContent =
+    `${coreCount} 个核心持仓 · ${rows.length} 条规则 · `
+    + (alerts.length ? `${alerts.length} 项需要调整` : "全部在区间内")
+    + ` · 口径 ${scopeLabel || "当前账号"}（总净值 ${fmtMoney(totalNav)}）`;
+
+  const tbody = $("core-body");
+  tbody.innerHTML = "";
+  for (const r of rows) {
+    const [lo, hi] = resolveBounds(r);
+    // Bar scale leaves room above the upper bound so an over-weight marker
+    // lands inside the track instead of pinning to the right edge. A blank
+    // 上限 resolves to 100%, which must NOT set the scale — it would squash
+    // every real number into the leftmost few pixels — so only a typed one
+    // counts, and the open-ended zone just runs off the right edge.
+    const scale = Math.max((r.max || 0) * 1.6, lo * 1.6, r.weight * 1.15, 0.02);
+    const pct = (v) => Math.min(100, Math.max(0, v / scale * 100));
+    let band = "";
+    if (r.status) {
+      band = `<div class="band-zone" style="left:${pct(lo)}%;width:${pct(hi) - pct(lo)}%"></div>`;
+      if (r.max != null) band += `<div class="band-cap" style="left:${pct(hi)}%"></div>`;
+    }
+    const tone = r.status === "over" ? "down" : r.status === "under" ? "amber" : "";
+    const target = !r.status ? "—"
+      : r.min == null ? `≤ ${fmtPct(r.max, 1)}`
+      : r.max == null ? `≥ ${fmtPct(r.min, 1)}`
+      : `${fmtPct(r.min, 1)} – ${fmtPct(r.max, 1)}`;
+    let verdict = '<span class="muted">未设区间</span>';
+    if (r.status === "over") {
+      verdict = `<span class="tag tag-over">超上限 +${((r.weight - hi) * 100).toFixed(1)}pp</span>`;
+    } else if (r.status === "under") {
+      verdict = `<span class="tag tag-under">欠配 −${((lo - r.weight) * 100).toFixed(1)}pp</span>`;
+    } else if (r.status === "ok") {
+      verdict = '<span class="tag tag-inband">区间内</span>';
+    }
+    // Zero exposure has three very different causes and a core holding sitting
+    // at 0% deserves to say which: it is in the other account, you are out of
+    // it entirely, or you only sold premium on it (which this definition
+    // deliberately does not count as capital deployed).
+    const stateTag = r.elsewhere ? ' <span class="tag tag-gone">本账号无持仓</span>'
+      : !r.held ? ' <span class="tag tag-gone">已清仓</span>'
+      : r.exposure > 0 ? ""
+      : ' <span class="tag tag-gone">仅卖方期权</span>';
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td><b>${esc(r.symbol)}</b>${r.core ? ' <span class="tag tag-core">核心</span>' : ""}${stateTag}</td>
+      <td class="num" title="${esc(exposureTip(r))}">${fmtMoney(r.exposure, 0)}</td>
+      <td class="num ${tone}"><b>${fmtPct(r.weight, 1)}</b></td>
+      <td class="num muted">${target}</td>
+      <td class="band-cell">
+        <div class="band-bar" title="标尺 0 – ${fmtPct(scale, 1)}">
+          ${band}<div class="band-mark ${r.status || ""}" style="left:${pct(r.weight)}%"></div>
+        </div>
+      </td>
+      <td>${verdict}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+
+// Treemap decoration for one stock tile. Tile and badge now describe the same
+// book — whichever account is on screen. They are still not the same NUMBER:
+// the tile's AREA is stock market value, the badge weighs stock + long option
+// market value against NAV, so a name held mostly through calls can wear a
+// 超上限 badge on a modest tile. The tooltip prints both.
+function tileFlag(symbol) {
+  const cfg = positionSettings()[symbol];
+  if (!cfg) return { core: false, status: null };
+  const row = currentExposures().bySymbol[symbol];
+  const weight = row ? row.weight : 0;
+  const status = positionStatus(weight, cfg);
+  const scope = currentDataRef.selected === "ALL" ? "全账户合并" : "本账号";
+  const parts = [cfg.core ? "核心持仓" : "已设区间", `${scope}敞口占比 ${fmtPct(weight, 1)}`];
+  if (cfg.min != null || cfg.max != null) {
+    parts.push(cfg.min == null ? `上限 ${fmtPct(cfg.max, 1)}`
+      : cfg.max == null ? `下限 ${fmtPct(cfg.min, 1)}`
+      : `目标区间 ${fmtPct(cfg.min, 1)} – ${fmtPct(cfg.max, 1)}`);
+  }
+  if (status === "over" || status === "under") parts.push(POS_STATUS_LABEL[status]);
+  return {
+    core: !!cfg.core,
+    status,
+    icon: status === "over" ? "▲" : status === "under" ? "▼" : "",
+    badge: status === "over" ? "▲ 超上限" : status === "under" ? "▼ 欠配" : "",
+    tip: parts.join(" · "),
+  };
+}
+
+/* --- The settings modal --------------------------------------------------- */
+
+// Draft state lives here while the modal is open; nothing is written until
+// 保存, so 取消 / Esc really do discard.
+let posDraft = null;
+
+// Fraction → the string that goes in the input box, and back. The toFixed
+// round-trip is not decoration: 0.05 * 100 is 5.000000000000001 in binary
+// floating point, and that is what the user would see in the box.
+const boundToInput = (v) => (v == null || Number.isNaN(v) ? "" : String(+(v * 100).toFixed(4)));
+const inputToBound = (raw) => {
+  const t = String(raw).trim();
+  if (t === "") return null;
+  const n = Number(t);
+  return Number.isFinite(n) ? +(n / 100).toFixed(6) : NaN;
+};
+
+// Row order in the modal. Kept in module scope, not reset on open — the order
+// you last picked is the one you get next time.
+const POS_SORTS = {
+  // Ties broken by ticker in every mode, so the list never reshuffles between
+  // two renders that agree on the primary key.
+  weight: (a, b) => b.w - a.w || a.sym.localeCompare(b.sym),
+  symbol: (a, b) => a.sym.localeCompare(b.sym),
+  core: (a, b) => b.core - a.core || b.w - a.w || a.sym.localeCompare(b.sym),
+};
+let posSort = "weight";
+
+function openPositionModal() {
+  const cfg = positionSettings();
+  // Rows: every underlying held in ANY account (the rules are global), plus
+  // anything already configured — so a rule on a since-exited symbol stays
+  // editable and removable. The percentages beside them are the CURRENT
+  // view's, which the modal note says out loud.
+  posDraft = {};
+  for (const sym of new Set([...allUnderlyings(), ...Object.keys(cfg)])) {
+    const c = cfg[sym] || {};
+    posDraft[sym] = { core: !!c.core, min: c.min ?? null, max: c.max ?? null };
+  }
+  renderPositionRows();
+  $("pos-status").textContent = "";
+  $("pos-modal").hidden = false;
+  document.body.classList.add("modal-open");
+  $("pos-modal-close").focus();
+}
+
+// Rebuilt from posDraft, never from the stored config — so re-sorting in the
+// middle of an edit keeps every box exactly as typed.
+function renderPositionRows() {
+  const { bySymbol } = currentExposures();
+  const rows = Object.keys(posDraft || {}).map(sym => ({
+    sym,
+    core: posDraft[sym].core,
+    // Not held in THIS view sorts below a held-but-zero position (short
+    // premium only), which is a real difference, not a tie.
+    w: bySymbol[sym] ? bySymbol[sym].weight : -1,
+  }));
+  rows.sort(POS_SORTS[posSort] || POS_SORTS.weight);
+
+  $("pos-sort").querySelectorAll("button").forEach(b =>
+    b.classList.toggle("active", b.dataset.sort === posSort));
+
+  const tbody = $("pos-body");
+  tbody.innerHTML = "";
+  for (const { sym } of rows) {
+    const ex = bySymbol[sym];
+    const tr = document.createElement("tr");
+    tr.dataset.sym = sym;
+    const held = ex && ex.exposure > 0
+      ? `${fmtPct(ex.weight, 1)} · ${fmtMoney(ex.exposure, 0)}`
+      : ex ? "0% · 仅卖方期权"
+      : allUnderlyings().has(sym) ? "本账号无持仓"
+      : "已清仓";
+    tr.innerHTML = `
+      <td>
+        <b>${esc(sym)}</b>
+        <div class="pos-sub" title="${esc(ex ? exposureTip(ex) : "无持仓")}">${esc(held)}</div>
+      </td>
+      <td>
+        <label class="pos-check">
+          <input type="checkbox" data-role="core" ${posDraft[sym].core ? "checked" : ""} />
+          <span>核心持仓</span>
+        </label>
+      </td>
+      <td>
+        <div class="pos-range">
+          <input type="number" data-role="min" inputmode="decimal" step="any"
+                 min="0" max="100" placeholder="0" aria-label="${esc(sym)} 下限百分比"
+                 value="${boundToInput(posDraft[sym].min)}" /><span class="pct">%</span>
+          <span class="dash">–</span>
+          <input type="number" data-role="max" inputmode="decimal" step="any"
+                 min="0" max="100" placeholder="100" aria-label="${esc(sym)} 上限百分比"
+                 value="${boundToInput(posDraft[sym].max)}" /><span class="pct">%</span>
+        </div>
+      </td>
+    `;
+    tbody.appendChild(tr);
+  }
+}
+
+function closePositionModal() {
+  $("pos-modal").hidden = true;
+  document.body.classList.remove("modal-open");
+  posDraft = null;
+}
+
+// Returns the first offending symbol, or "" when the draft is sound. The
+// server rejects the same cases, but a 400 naming one symbol out of thirty
+// is a worse way to find out than a message next to the row.
+function firstBadBound() {
+  for (const [sym, d] of Object.entries(posDraft || {})) {
+    if (Number.isNaN(d.min) || Number.isNaN(d.max)) return `${sym}：百分比填的不是数字`;
+    for (const v of [d.min, d.max]) {
+      if (v != null && (v < 0 || v > 1)) return `${sym}：百分比要在 0 – 100 之间`;
+    }
+    if (d.min != null && d.max != null && d.min > d.max) {
+      return `${sym}：下限 ${boundToInput(d.min)}% 大于上限 ${boundToInput(d.max)}%`;
+    }
+  }
+  return "";
+}
+
+async function savePositionSettings() {
+  const bad = firstBadBound();
+  if (bad) { $("pos-status").textContent = bad; return; }
+  const btn = $("pos-save");
+  btn.disabled = true;
+  $("pos-status").textContent = "保存中…";
+  // Only real decisions travel. The server drops no-op entries anyway, but
+  // sending them would grow the file with every symbol ever held.
+  const symbols = {};
+  for (const [sym, d] of Object.entries(posDraft || {})) {
+    if (d.core || d.min != null || d.max != null) {
+      symbols[sym] = { core: d.core, min: d.min, max: d.max };
+    }
+  }
+  try {
+    const res = await fetch("/api/settings/positions", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ symbols }),
+    });
+    const j = await res.json();
+    if (!res.ok) {
+      $("pos-status").textContent = "";
+      showToast("error", "保存失败", j.error || `HTTP ${res.status}`);
+      return;
+    }
+    currentDataRef.positionSettings = j;
+    closePositionModal();
+    showToast("success", "已保存", `${Object.keys(j.symbols || {}).length} 条持仓规则`);
+    if (currentDataRef.data) render(currentDataRef.data);
+  } catch (exc) {
+    $("pos-status").textContent = "";
+    showToast("error", "保存失败", String(exc));
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function wirePositionModal() {
+  $("pos-btn").addEventListener("click", openPositionModal);
+  $("pos-modal-close").addEventListener("click", closePositionModal);
+  $("pos-cancel").addEventListener("click", closePositionModal);
+  $("pos-save").addEventListener("click", savePositionSettings);
+  // Re-sorting rebuilds the rows from posDraft, so anything typed survives it.
+  $("pos-sort").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-sort]");
+    if (!btn || btn.dataset.sort === posSort) return;
+    posSort = btn.dataset.sort;
+    renderPositionRows();
+  });
+  // Backdrop click closes; a click inside the dialog must not reach it.
+  $("pos-modal").addEventListener("click", (e) => {
+    if (e.target === $("pos-modal")) closePositionModal();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("pos-modal").hidden) closePositionModal();
+  });
+  // Delegated: the table is rebuilt on every open, and per-row listeners
+  // would be re-attached (and leak) with it.
+  $("pos-body").addEventListener("input", (e) => {
+    const role = e.target.dataset.role;
+    if (role !== "min" && role !== "max") return;
+    const d = posDraft[e.target.closest("tr").dataset.sym];
+    d[role] = inputToBound(e.target.value);
+    // Live feedback while typing, but never mid-keystroke clamping — being
+    // told "5 > 1" halfway through typing "15" would be maddening.
+    e.target.classList.toggle("bad", Number.isNaN(d[role]));
+    $("pos-status").textContent = firstBadBound();
+  });
+  $("pos-body").addEventListener("change", (e) => {
+    if (e.target.dataset.role !== "core") return;
+    posDraft[e.target.closest("tr").dataset.sym].core = e.target.checked;
+  });
+}
+
 function renderTreemap(stocks) {
   const el = $("treemap");
   el.innerHTML = "";
@@ -1609,6 +2070,15 @@ function renderTreemap(stocks) {
     div.style.height = h + "px";
     div.style.background = color(d.unrealized_pl);
 
+    // Core / band markers. Tile and badge describe the same book — whichever
+    // account tab is open — but not the same NUMBER: the tile's AREA is stock
+    // market value, while the badge weighs stock + long option market value
+    // against NAV. So a name held mostly through calls can wear a 超上限 badge
+    // on a modest tile, and the tooltip prints both figures.
+    const flag = tileFlag(d.symbol);
+    if (flag.core) div.classList.add("tile-core");
+    if (flag.status === "over" || flag.status === "under") div.classList.add("tile-" + flag.status);
+
     // Scale font sizes proportionally to tile size, with a floor
     const symSize = Math.max(8, Math.min(16, Math.min(w / 5, h / 4)));
     const metaSize = Math.max(8, symSize * 0.7);
@@ -1625,7 +2095,17 @@ function renderTreemap(stocks) {
         <div class="meta" style="font-size:${metaSize}px">${fmtMoney(d.value)}</div>
         <div class="pnl" style="font-size:${metaSize}px">${d.unrealized_pl >= 0 ? "+" : ""}${fmtMoney(d.unrealized_pl)}</div>`;
     }
-    div.title = `${d.symbol}\n市值 ${fmtMoney(d.value, 2)}\n成本 ${fmtMoney(d.cost_basis, 2)}\n浮盈 ${fmtMoney(d.unrealized_pl, 2)}`;
+    // Badge goes on after innerHTML — the text branches above overwrite it.
+    // Below ~48px it would sit on top of the ticker, and the coloured
+    // outline (red over / amber under) already carries the same signal.
+    if (flag.badge && w >= 48 && h >= 28) {
+      const badge = document.createElement("div");
+      badge.className = `tile-badge ${flag.status}`;
+      badge.textContent = w < 90 ? flag.icon : flag.badge;
+      div.appendChild(badge);
+    }
+    div.title = `${d.symbol}\n市值 ${fmtMoney(d.value, 2)}\n成本 ${fmtMoney(d.cost_basis, 2)}\n浮盈 ${fmtMoney(d.unrealized_pl, 2)}`
+      + (flag.tip ? `\n\n${flag.tip}` : "");
     el.appendChild(div);
   }
 }
@@ -2159,6 +2639,31 @@ async function refreshFromIBKR() {
 
 document.addEventListener("DOMContentLoaded", () => {
   $("refresh-btn").addEventListener("click", refreshFromIBKR);
+  wirePositionModal();
+
+  // Core-holding rules. Like the cluster fetch below, the first render may
+  // land before this resolves, so re-render once it arrives.
+  //
+  // The button ships disabled and only this success path enables it. A failed
+  // GET leaves positionSettings null, which every reader treats as "nothing
+  // configured" — and opening the modal on top of that would show 32 blank
+  // rows, so 保存 would PUT an empty map over a perfectly good server-side
+  // config and wipe every rule without the user ever seeing them. A dead
+  // button and a toast beat silent data loss.
+  fetch("/api/settings/positions")
+    .then(r => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+    .then(cfg => {
+      currentDataRef.positionSettings = cfg;
+      const btn = $("pos-btn");
+      btn.disabled = false;
+      btn.title = "标记核心持仓、设置每个标的的仓位区间";
+      if (currentDataRef.data) render(currentDataRef.data);
+    })
+    .catch(exc => {
+      $("pos-btn").title = "持仓规则读取失败，刷新页面重试";
+      showToast("error", "持仓规则读取失败",
+        `${exc.message || exc} · 按钮已停用，以免空配置覆盖服务器上已存的规则`, 8000);
+    });
 
   // Cluster mapping — a static file the user edits by hand. 404/parse
   // failure just leaves the panel hidden; nothing else depends on it.
