@@ -1246,14 +1246,36 @@ function renderWeekly(data, accounts, selected) {
   // of a baseline is enough. Only publish the statistic when every target
   // actually produced a diff.
   const allDiffed = diffs.length === targets.length;
+  // Slice from fundedSeries, not raw history — this is the third navStats
+  // feeder. For the first ~16 days after an account is funded, the 5-16-day
+  // baseline window still reaches back into the pre-funding stub, and one
+  // $1-base link chains the same clamped-crash / unclamped-rebound garbage
+  // into the period-return stat that the NAV panel just stopped printing.
   const slice = allDiffed
-    ? (data.nav_history || []).filter(p => p.date >= baseDates[0]) : [];
+    ? fundedSeries(data.nav_history).filter(p => p.date >= baseDates[0]) : [];
   const st = allDiffed ? navStats(slice, data.cash_flows || []) : null;
+  // The stat's real window can be NARROWER than the one the note names, on
+  // both ends: the trim starts it later (exactly the freshly-funded case
+  // above), and in the ALL view the merged history is end-truncated at the
+  // stalest account's last observation while the note's right endpoint is
+  // the freshest. Label the stat with its own bounds rather than silently
+  // borrowing the panel's window — the delta beside it spans the full
+  // window, and the two must not read as one period. The label lands in
+  // innerHTML, so a date only gets in if it is shaped like one — everything
+  // else falls back to the plain label.
+  const isoDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s);
+  const stStart = slice.length ? String(slice[0].date) : "";
+  const stEnd = slice.length ? String(slice[slice.length - 1].date) : "";
+  const stParts = [];
+  if (isoDate(stStart) && stStart > baseDates[0]) stParts.push(`自 ${stStart}`);
+  if (isoDate(stEnd) && curDate && stEnd < curDate) stParts.push(`截至 ${stEnd}`);
+  const stLabel = stParts.length
+    ? `期间收益(剔除出入金 · ${stParts.join(" ")})` : "期间收益(剔除出入金)";
   const navDelta = navNow - navBase;
   $("weekly-summary").innerHTML =
     `<span class="nav-stat"><span class="muted">净值变化</span> <b class="${navDelta >= 0 ? "up" : "down"}">`
     + `${navDelta >= 0 ? "+" : ""}${fmtMoney(navDelta)}</b></span>`
-    + (st ? `<span class="nav-stat"><span class="muted">期间收益(剔除出入金)</span> `
+    + (st ? `<span class="nav-stat"><span class="muted">${stLabel}</span> `
       + `<b class="${st.periodReturn >= 0 ? "up" : "down"}">${st.periodReturn >= 0 ? "+" : ""}`
       + `${fmtPct(st.periodReturn, 2)}</b></span>` : "")
     + `<span class="nav-stat"><span class="muted">上涨/下跌标的</span> `
