@@ -14,7 +14,11 @@ const src = readFileSync(
   "utf8");
 
 function extract(name) {
-  const m = src.match(new RegExp(`function ${name}\\([^)]*\\) \\{[\\s\\S]*?\\n\\}`));
+  // 与 test_funded_series.mjs 同一份正则（含顶格锁定）：不锁行首会匹到缩进
+  // 里的同名嵌套声明，而"到第一个顶格 } 为止"会把外层函数尾巴一起割进来，
+  // 抽出语法碎片、拖到 new Function 才炸成无关的 SyntaxError。
+  const m = src.match(
+    new RegExp(`^function ${name}\\s*\\([^)]*\\)\\s*\\{[\\s\\S]*?\\n\\}`, "m"));
   if (!m) throw new Error(`cannot extract function ${name} from dashboard.js`);
   return m[0];
 }
