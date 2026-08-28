@@ -176,3 +176,51 @@ test("navStats 对裁剩不足 5 点的序列返回 null（面板隐藏而非打
   const hist = stubHistory().slice(0, 8);   // 裁剪后只剩 1 个注资点
   assert.equal(navStats(fundedSeries(hist), FUNDING_FLOWS), null);
 });
+
+// ---------------------------------------------------------------------------
+// 期间高/低是这一行里唯一的原始美元数字。注资爬坡期的低点不是"跌下去"，
+// 是钱还没到 —— 得标出来，否则跟旁边的回撤并排会被读成一次没发生过的崩盘。
+// ---------------------------------------------------------------------------
+
+// U228 的真实形状：低点 $29,224 之后还进来 $87,023，区间是注资撑出来的。
+const rampHistory = () => ([
+  { date: "2025-11-14", total: 29413 },
+  { date: "2025-11-17", total: 29224 },   // 低点，钱还没到齐
+  { date: "2025-11-18", total: 45500 },
+  { date: "2025-11-27", total: 98000 },
+  { date: "2026-04-01", total: 150000 },
+  { date: "2026-08-26", total: 183903 },
+]);
+const RAMP_FLOWS = [
+  { date: "2025-11-14", amount: 29413 },
+  { date: "2025-11-18", amount: 16270 },
+  { date: "2025-11-27", amount: 52513 },
+  { date: "2026-06-10", amount: 18240 },
+];
+
+test("注资爬坡期的低点被标记：低点之后进来的钱比低点本身还多", () => {
+  const st = navStats(fundedSeries(rampHistory()), RAMP_FLOWS);
+  assert.equal(st.lowDate, "2025-11-17");
+  assert.equal(st.low, 29224);
+  assert.equal(st.lowPreFunding, true);
+});
+
+test("成熟账户小额补仓不会误标 —— 补的钱远小于低点", () => {
+  // 同一条曲线，但后续注资只有 $5k：区间讲的是业绩，不该多嘴。
+  const st = navStats(fundedSeries(rampHistory()),
+    [{ date: "2025-11-14", amount: 29413 }, { date: "2026-06-10", amount: 5000 }]);
+  assert.equal(st.lowPreFunding, false);
+});
+
+test("低点之前的入金不参与判定 —— 只有低点之后到的钱才撑大区间", () => {
+  // 全部注资都在低点当天或更早：低点已经是"钱到齐后"的真实低位。
+  const st = navStats(fundedSeries(rampHistory()),
+    [{ date: "2025-11-14", amount: 116436 }]);
+  assert.equal(st.lowPreFunding, false);
+});
+
+test("出金不算数：取钱不会把区间撑大，只有入金会", () => {
+  const st = navStats(fundedSeries(rampHistory()),
+    [{ date: "2025-11-14", amount: 29413 }, { date: "2026-04-02", amount: -90000 }]);
+  assert.equal(st.lowPreFunding, false);
+});

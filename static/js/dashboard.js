@@ -1657,6 +1657,7 @@ function navStats(series, flows) {
   const variance = rets.reduce((s, r) => s + (r - mean) ** 2, 0) / Math.max(n - 1, 1);
   const annVol = Math.sqrt(variance) * Math.sqrt(252);
   const annRet = n > 0 ? Math.pow(Math.max(index, 1e-9), 252 / n) - 1 : 0;
+  const lowPt = pts.reduce((a, p) => (p.total < a.total ? p : a), pts[0]);
   return {
     maxDD, ddStart, ddEnd,
     curDD: 1 - index / peak,
@@ -1668,7 +1669,19 @@ function navStats(series, flows) {
     retOverVol: annVol > 0 ? annRet / annVol : 0,
     calmar: maxDD > 0 ? annRet / maxDD : 0,
     high: Math.max(...pts.map(p => p.total)),
-    low: Math.min(...pts.map(p => p.total)),
+    low: lowPt.total, lowDate: lowPt.date,
+    // high/low are the only numbers on this row quoted in RAW dollars —
+    // every other stat divides the deposits back out. During a funding ramp
+    // the low is therefore not a fall at all: the account was smaller because
+    // the money had not landed yet, and "$184,146 / $29,224" sitting next to
+    // a drawdown figure reads as a crash that never happened. Flag it when
+    // the deposits that arrived AFTER the low exceed the low itself — that is
+    // exactly when the range describes funding rather than performance, and
+    // it needs no tuned threshold: a mature book topped up by 10% never trips
+    // it, while an account that doubled its capital after a genuine dip trips
+    // it correctly, because its range did stop being a performance number.
+    lowPreFunding: fl.reduce(
+      (s, f) => (f.date > lowPt.date && f.amount > 0 ? s + f.amount : s), 0) > lowPt.total,
     first: pts[0], last: pts[pts.length - 1],
   };
 }
@@ -1698,11 +1711,13 @@ function renderNavHistory(data) {
         vector-effect="non-scaling-stroke"></polyline>
     </svg>`;
 
-  const chip = (label, val, cls = "") =>
-    `<span class="nav-stat"><span class="muted">${label}</span> <b class="${cls}">${val}</b></span>`;
+  const chip = (label, val, cls = "", note = "") =>
+    `<span class="nav-stat"><span class="muted">${label}</span> <b class="${cls}">${val}</b>`
+    + (note ? ` <span class="muted">${note}</span>` : "") + `</span>`;
   $("nav-stats").innerHTML = [
     chip("期末", fmtMoney(stats.last.total)),
-    chip("期间高/低", `${fmtMoney(stats.high)} / ${fmtMoney(stats.low)}`),
+    chip("期间高/低", `${fmtMoney(stats.high)} / ${fmtMoney(stats.low)}`, "",
+      stats.lowPreFunding ? "（低点在注资完成前）" : ""),
     chip("最大回撤", `−${fmtPct(stats.maxDD, 1)}（${stats.ddStart.slice(5)} → ${stats.ddEnd.slice(5)}）`,
       stats.maxDD >= 0.2 ? "down" : ""),
     chip("当前回撤", stats.curDD > 0.001 ? `−${fmtPct(stats.curDD, 1)}` : "在高点",
