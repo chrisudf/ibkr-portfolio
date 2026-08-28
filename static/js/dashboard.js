@@ -89,6 +89,64 @@ function maskAccountId(id) {
   return id.slice(0, 4) + "*".repeat(Math.max(0, id.length - 6)) + id.slice(-2);
 }
 
+// The daily NAV series starts when IBKR starts REPORTING an account, which can
+// be well before it holds anything: U228 ships 55 rows of $0.00 and then three
+// days at $0.65–$1.00 (the opening test transfer) before the real money lands.
+//
+// Those leading points are not a cosmetic problem. navStats chains returns
+// with a begin-of-day deposit convention — denom = previous NAV + deposits in
+// the interval — while IBKR's Statement of Funds dates a wire when it was
+// SENT, not when it lands (verified against real statements: lags run -1 to
+// +14 days, and one funding round arrives as several wires landing on
+// different days). Across the funding day that books
+//
+//     $1 / ($1 + $32,675) - 1  =  -99.99%    (clamped to -0.99)
+//
+// and the clamp never gets its money back: the wires land spread over the
+// following days, each arrival-day link carrying that day's own dated
+// deposits in its denominator, so no unclamped mirror rebound forms and the
+// single clamped link pins the whole chain at ~x0.01. On real data it
+// printed TWR -99.1%, max drawdown -99.5% and 205% vol for U228, and
+// dragged the merged view to a -35.1% drawdown dated to the same two days.
+// (In the textbook shape — one wire, fully reflected the next day, no other
+// flows — the mirror rebound IS unclamped and the chain explodes upward
+// instead. Garbage either way, scaled by flow/base.)
+//
+// So drop leading points until the account holds a non-trivial fraction of
+// what it ever held. Only the LEADING run: a mid-series collapse to near zero
+// is a real event and has to stay on the chart.
+//
+// The 1%-of-max floor is deliberately NOT capped at an absolute dollar
+// level, because the ratio protects the boundary it trims: a KEPT leading
+// run is >= 1% of the all-time max, so as long as a deposit ever prints in
+// some NAV row (max >= deposit), it cannot exceed ~100x the kept run — just
+// under the ratio at which a funding link would cross -0.99 and stop
+// telescoping away. A $100-style cap would break exactly that: a $150
+// residue kept in front of a $500k wire rebuilds the -99%/+333,233% pair
+// this function exists to remove. The ratio's cost is the mirror image — an
+// account that genuinely grows past 100x has its earliest real history
+// trimmed and the chain restarts, visibly, in the panel's date range.
+//
+// That guarantee is scoped to the LEADING boundary, nothing wider. Still on
+// the clamp's menu (one family — a flow landing on a tiny prev-day NAV):
+// re-funding an account after a kept mid-series collapse (the wire lands on
+// the collapsed base and the loss gets understated), and a deposit that
+// never prints in any NAV row (impaired or withdrawn again within one NAV
+// gap). And even a kept-but-near-boundary funding pair telescopes in LEVEL
+// only — maxDD still records the transient dip, and the paired links blow
+// up the printed vol. The trim removes the fatal ~$1-base stretch; the rest
+// is the date-realignment work documented in TODO.md [P2].
+const FUNDED_MIN_RATIO = 0.01;
+
+function fundedSeries(navHistory) {
+  const pts = (navHistory || []).filter(p => p.total > 0);
+  if (!pts.length) return pts;
+  const floor = Math.max(...pts.map(p => p.total)) * FUNDED_MIN_RATIO;
+  let i = 0;
+  while (i < pts.length && pts[i].total < floor) i++;
+  return pts.slice(i);
+}
+
 function mergeAccounts(accounts) {
   const list = Object.values(accounts);
   if (list.length === 1) return list[0];
@@ -417,11 +475,13 @@ function mergeAccounts(accounts) {
   // account has begun reporting (a partial sum would read as a fake crash).
   // Any account without a history (old JSON) disables the merged curve
   // rather than misrepresenting the household as one thinner account.
-  // Pre-filter with the same total>0 predicate the single-account stats use:
-  // a padded/blank NAV row parses to 0.0, and forward-filling a zero would
+  // Pre-trim with the same fundedSeries the single-account stats use: total>0
+  // (a padded/blank NAV row parses to 0.0, and forward-filling a zero would
   // paint a full-NAV one-day crash on the household curve that neither
-  // per-account view shows.
-  const histories = list.map(a => (a.nav_history || []).filter(p => p.total > 0));
+  // per-account view shows) plus the leading pre-funding stub, which would
+  // otherwise drag the merged start back to the residue days and rebuild the
+  // same broken links on the household chain.
+  const histories = list.map(a => fundedSeries(a.nav_history));
   let nav_history = [];
   if (histories.length && histories.every(h => h.length)) {
     const dates = [...new Set(histories.flat().map(p => p.date))].sort();
@@ -1135,7 +1195,7 @@ function weeklyDiff(current, snapshots) {
     .filter(r => Math.abs(r.total) >= 1 || r.pxPct != null)
     .sort((a, b) => b.total - a.total);
   return {
-    baseDate: base.snap.date, days: base.gap,
+    baseDate: base.snap.date, days: base.gap, liveDate: current.date,
     navBase: base.snap.nav, navNow: current.nav, rows: list,
   };
 }
@@ -1166,6 +1226,7 @@ function renderWeekly(data, accounts, selected) {
   }
   const winnersEl = $("weekly-winners"), losersEl = $("weekly-losers");
   if (!diffs.length) {
+    $("weekly-title").textContent = "周复盘";
     $("weekly-note").textContent = "";
     $("weekly-summary").innerHTML =
       `<span class="muted">快照积累中 —— 最早基线距今不足 ${SNAP_MIN_GAP} 天，`
@@ -1194,9 +1255,28 @@ function renderWeekly(data, accounts, selected) {
   const losers = rows.filter(r => r.total < 0).reverse().slice(0, 5);
 
   const baseDates = diffs.map(d => d.baseDate).sort();
-  const curDate = liveSnapshot(targets[0]).date || "";
+  // "本周" was a lie whenever pickBaseline had to settle for a 5- or
+  // 16-day-old snapshot, so the heading follows the data. Every part of the
+  // label now comes from the SAME diffs: the note used to pair the earliest
+  // baseline with the day count of whichever account was first in file order
+  // and the live date of targets[0] — which may be a fresh account that
+  // produced no diff at all. Days show a range when baselines disagree.
+  const liveDates = diffs.map(d => d.liveDate).filter(Boolean).sort();
+  const curDate = liveDates.length ? liveDates[liveDates.length - 1] : "";
+  const dayVals = diffs.map(d => d.days);
+  const dMin = Math.min(...dayVals), dMax = Math.max(...dayVals);
+  const daysLabel = dMin === dMax ? `${dMax} 天` : `${dMin}–${dMax} 天`;
+  $("weekly-title").textContent = `近 ${daysLabel}复盘`;
+  // The printed endpoints are cross-account extremes (earliest baseline,
+  // latest live date). Independently refreshed accounts can hold equal-length
+  // but OFFSET windows — the endpoints then span more days than any single
+  // window, and "08-10 → 08-20 · 7 天" would read as an arithmetic error.
+  const spanDays = baseDates[0] && curDate
+    ? Math.round((Date.parse(curDate) - Date.parse(baseDates[0])) / DAY_MS)
+    : dMax;
   $("weekly-note").textContent =
-    `${baseDates[0]} → ${curDate || "最新"} · ${diffs[0].days} 天`
+    `${baseDates[0]} → ${curDate || "最新"} · ${daysLabel}`
+    + (spanDays > dMax ? `（跨 ${spanDays} 天，各账户窗口独立）` : "")
     + (fresh ? ` · ${fresh} 个账户快照尚新未计入` : "");
 
   // Headline: NAV change over the same window. Numerator and denominator
@@ -1214,14 +1294,36 @@ function renderWeekly(data, accounts, selected) {
   // of a baseline is enough. Only publish the statistic when every target
   // actually produced a diff.
   const allDiffed = diffs.length === targets.length;
+  // Slice from fundedSeries, not raw history — this is the third navStats
+  // feeder. For the first ~16 days after an account is funded, the 5-16-day
+  // baseline window still reaches back into the pre-funding stub, and one
+  // $1-base link chains the same clamped-crash / unclamped-rebound garbage
+  // into the period-return stat that the NAV panel just stopped printing.
   const slice = allDiffed
-    ? (data.nav_history || []).filter(p => p.date >= baseDates[0]) : [];
+    ? fundedSeries(data.nav_history).filter(p => p.date >= baseDates[0]) : [];
   const st = allDiffed ? navStats(slice, data.cash_flows || []) : null;
+  // The stat's real window can be NARROWER than the one the note names, on
+  // both ends: the trim starts it later (exactly the freshly-funded case
+  // above), and in the ALL view the merged history is end-truncated at the
+  // stalest account's last observation while the note's right endpoint is
+  // the freshest. Label the stat with its own bounds rather than silently
+  // borrowing the panel's window — the delta beside it spans the full
+  // window, and the two must not read as one period. The label lands in
+  // innerHTML, so a date only gets in if it is shaped like one — everything
+  // else falls back to the plain label.
+  const isoDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s);
+  const stStart = slice.length ? String(slice[0].date) : "";
+  const stEnd = slice.length ? String(slice[slice.length - 1].date) : "";
+  const stParts = [];
+  if (isoDate(stStart) && stStart > baseDates[0]) stParts.push(`自 ${stStart}`);
+  if (isoDate(stEnd) && curDate && stEnd < curDate) stParts.push(`截至 ${stEnd}`);
+  const stLabel = stParts.length
+    ? `期间收益(剔除出入金 · ${stParts.join(" ")})` : "期间收益(剔除出入金)";
   const navDelta = navNow - navBase;
   $("weekly-summary").innerHTML =
     `<span class="nav-stat"><span class="muted">净值变化</span> <b class="${navDelta >= 0 ? "up" : "down"}">`
     + `${navDelta >= 0 ? "+" : ""}${fmtMoney(navDelta)}</b></span>`
-    + (st ? `<span class="nav-stat"><span class="muted">期间收益(剔除出入金)</span> `
+    + (st ? `<span class="nav-stat"><span class="muted">${stLabel}</span> `
       + `<b class="${st.periodReturn >= 0 ? "up" : "down"}">${st.periodReturn >= 0 ? "+" : ""}`
       + `${fmtPct(st.periodReturn, 2)}</b></span>` : "")
     + `<span class="nav-stat"><span class="muted">上涨/下跌标的</span> `
@@ -1545,7 +1647,7 @@ function navStats(series, flows) {
 
 function renderNavHistory(data) {
   const panel = $("nav-history-panel");
-  const series = (data.nav_history || []).filter(p => p.total > 0);
+  const series = fundedSeries(data.nav_history);
   const stats = navStats(series, data.cash_flows || []);
   if (!stats) { panel.hidden = true; return; }
   panel.hidden = false;
