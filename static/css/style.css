@@ -384,12 +384,15 @@ ul.rank .sym { font-weight: 600; }
 .wk-fill.pos { background: var(--green); }
 .wk-fill.neg { background: var(--red); }
 .wk-val { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
-/* Right-aligned so the option amounts stack into a readable column of their
-   own, and dimmer/smaller than the total it decomposes — it is a footnote to
-   the number on its left, not a second headline. Ellipsis is a guard for an
-   implausibly wide row (six-figure single-name week), never the normal case. */
+/* Left-aligned: the rows that carry a full breakdown and the rows that carry
+   the short "全期权" then start at the same x, so the eye reads one column of
+   labels instead of two ragged clusters — right-aligning stacked the amounts
+   neatly but left the short labels floating alone against the right edge.
+   Dimmer and smaller than the total it decomposes: a footnote to the number
+   on its left, not a second headline. Ellipsis is a guard for an implausibly
+   wide row (six-figure single-name week), never the normal case. */
 .wk-split {
-  font-size: 11px; text-align: right; white-space: nowrap;
+  font-size: 11px; text-align: left; white-space: nowrap;
   font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis;
 }
 .wk-meta { font-size: 12px; text-align: right; white-space: nowrap; }
@@ -402,7 +405,7 @@ ul.rank .sym { font-weight: 600; }
 @media (max-width: 600px) {
   .wk-row { grid-template-columns: 52px 1fr 72px; gap: 8px; row-gap: 2px; }
   .wk-meta { display: none; }
-  .wk-split { grid-column: 2 / 4; text-align: left; }
+  .wk-split { grid-column: 2 / 4; }
 }
 
 /* Core holdings & position caps */
