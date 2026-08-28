@@ -16,7 +16,12 @@ const src = readFileSync(
 
 function extract(name) {
   // 函数体到第一个顶格 "}" 为止 —— repo 风格所有顶层函数都如此闭合。
-  const m = src.match(new RegExp(`function ${name}\\([^)]*\\) \\{[\\s\\S]*?\\n\\}`));
+  // 声明本身也锁在顶格（^ 配 m 标志）：嵌套的同名函数一定带缩进，匹配不上。
+  // 不锁的话一旦匹到嵌套那个，"到第一个顶格 }" 会把它所在外层函数的尾巴
+  // 一起割进来，抽出的是段语法碎片而不是报错。空白写成 \s* —— 括号前后的
+  // 空格风格变了不该弄断抽取；改名/改签名依旧照常报错。
+  const m = src.match(
+    new RegExp(`^function ${name}\\s*\\([^)]*\\)\\s*\\{[\\s\\S]*?\\n\\}`, "m"));
   if (!m) throw new Error(`cannot extract function ${name} from dashboard.js`);
   return m[0];
 }
@@ -151,6 +156,14 @@ test("三个 navStats 消费点都从 fundedSeries 出（源码级 tripwire）",
     "renderNavHistory 必须走 fundedSeries");
   assert.match(src, /\? fundedSeries\(data\.nav_history\)\.filter\(p => p\.date >= baseDates\[0\]\)/,
     "周复盘期间收益切片必须走 fundedSeries");
+});
+
+test("extract 只认顶格声明 —— 抽到嵌套同名函数会割出语法碎片而不是报错", () => {
+  for (const name of ["fundedSeries", "navStats"]) {
+    const at = src.indexOf(extract(name));
+    assert.ok(at === 0 || src[at - 1] === "\n",
+      `${name} 的抽取起点不在行首（index ${at}），说明匹到了缩进里的声明`);
+  }
 });
 
 test("裁剪后注资流水被吸收为起始本金，链条无极端链环", () => {
