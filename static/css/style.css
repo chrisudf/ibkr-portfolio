@@ -369,9 +369,14 @@ ul.rank .sym { font-weight: 600; }
   display: flex; flex-wrap: wrap; gap: 8px 22px;
   margin-bottom: 14px; font-size: 13px; color: var(--text-dim);
 }
+/* Every track after the bar is a FIXED width, deliberately: with auto tracks
+   each row sized its own columns, so an underlying with a short trailer got a
+   wider bar track than one with a long trailer and the two bars stopped being
+   comparable at a glance — which is the only thing a bar is for. Fixed tracks
+   also give the list one flush right edge instead of a ragged one. */
 .wk-row {
   display: grid;
-  grid-template-columns: 64px 1fr 90px minmax(90px, auto);
+  grid-template-columns: 64px 1fr 76px 152px 84px;
   gap: 10px; align-items: center; padding: 5px 0; font-size: 13px;
 }
 .wk-bar { height: 10px; background: var(--panel-2); border-radius: 5px; overflow: hidden; }
@@ -379,7 +384,29 @@ ul.rank .sym { font-weight: 600; }
 .wk-fill.pos { background: var(--green); }
 .wk-fill.neg { background: var(--red); }
 .wk-val { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
-.wk-meta { font-size: 12px; }
+/* Left-aligned: the rows that carry a full breakdown and the rows that carry
+   the short "全期权" then start at the same x, so the eye reads one column of
+   labels instead of two ragged clusters — right-aligning stacked the amounts
+   neatly but left the short labels floating alone against the right edge.
+   Dimmer and smaller than the total it decomposes: a footnote to the number
+   on its left, not a second headline. Ellipsis is a guard for an implausibly
+   wide row (six-figure single-name week), never the normal case. */
+.wk-split {
+  font-size: 11px; text-align: left; white-space: nowrap;
+  font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis;
+}
+.wk-meta { font-size: 12px; text-align: right; white-space: nowrap; }
+/* Below 800px .dual-list is already one column, which the fixed tracks fit.
+   Under 600px they do not — side by side they squeeze the bar to nothing and
+   push the row off-screen. Keep the bar on line one and drop the split to a
+   line of its own under it; the price/position trailer is the one thing that
+   goes, being the only part the row states twice (the bar already carries
+   direction and size). An empty split collapses its row to zero height. */
+@media (max-width: 600px) {
+  .wk-row { grid-template-columns: 52px 1fr 72px; gap: 8px; row-gap: 2px; }
+  .wk-meta { display: none; }
+  .wk-split { grid-column: 2 / 4; }
+}
 
 /* Core holdings & position caps */
 
