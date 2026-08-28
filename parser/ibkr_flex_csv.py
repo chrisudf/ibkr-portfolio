@@ -780,7 +780,26 @@ def _ingest_statement_of_funds(account: dict[str, Any], row: dict[str, str]) -> 
         return
     if code not in _EXTERNAL_CF_CODES:
         return
-    d = _parse_date(row.get("Date", ""))
+    # Book by ReportDate (the day IBKR posts the money), NOT Date (the day the
+    # wire was initiated). navStats chains returns with a begin-of-day deposit
+    # convention against the NAV series, and that series is keyed by ReportDate
+    # — booking a flow on its initiation date puts money in the denominator
+    # days before the NAV row that reflects it, or leaves it out of the day it
+    # actually lands on. Measured on a year of real statements the drift runs
+    # -1 to +14 days (11 of 20 rows same-day, 6 at -1, one each at +1/+10/+14),
+    # and a single funding round arrives as several wires posting on different
+    # days, so no fixed offset fits.
+    #
+    # 2025-11-27 on U228 is the case that motivated this: four wires posted
+    # that day (initiated 11-27, 11-13, 11-17 and 11-28) totalling $52,512.87
+    # against a NAV move of $52,584.29. Booked by ReportDate the residual is
+    # $71.42 of genuine P&L; booked by Date only $13,068.20 counted and the
+    # remaining $39,516.09 was chained in as a +64% one-day "return".
+    #
+    # Fall back to Date when ReportDate is absent — older Flex layouts and
+    # non-Flex statements do not always carry it, and a flow booked on a
+    # slightly wrong day still beats dropping it from the ledger entirely.
+    d = _parse_date(row.get("ReportDate", "")) or _parse_date(row.get("Date", ""))
     if d is None:
         return
     amount = _to_float(row.get("Amount"))

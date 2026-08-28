@@ -40,6 +40,10 @@ CASH_HDR_TXN = CASH_HDR + ["TransactionID"]
 SOF_HDR = ["ClientAccountID", "ActivityCode", "ActivityDescription", "Amount", "Balance",
            "Date", "Symbol", "CurrencyPrimary", "AssetClass", "TradeQuantity",
            "TradePrice", "TradeCommission"]
+# Real Flex Statement of Funds also carries ReportDate (the posting day).
+# Kept as a separate header so the plain SOF_HDR fixtures above keep pinning
+# the no-ReportDate fallback path.
+SOF_HDR_RD = SOF_HDR + ["ReportDate"]
 
 
 def _csv(sections: list[tuple[list[str], list[list[str]]]]) -> str:
@@ -83,6 +87,15 @@ def _sof_trade(symbol, qty, price, commission, date):
 
 def _sof_div(amount, desc, sym, date="20260310", code="DIV"):
     return [ACCT, code, desc, str(amount), "0", date, sym, "USD", "", "", "", ""]
+
+
+def _sof_wire(amount, date, report_date=None, code="DEP"):
+    """One external cash-flow row. `date` is the day the wire was initiated,
+    `report_date` the day IBKR posts it — the two differ by -1..+14 days on
+    real statements. Omit report_date to build a pre-ReportDate layout."""
+    row = [ACCT, code, "Electronic Fund Transfer", str(amount), "0",
+           date, "", "USD", "", "", "", ""]
+    return row if report_date is None else row + [report_date]
 
 
 def parse(sections):
@@ -426,6 +439,74 @@ def test_row_order_invariance():
         assert base["dividends"][k] == other["dividends"][k]
     assert base["dividends"]["by_symbol"] == other["dividends"]["by_symbol"]
     assert base["cost_history"] == other["cost_history"]
+
+
+# ---------------------------------------------------------------------------
+# External cash flows book on ReportDate (posting), not Date (initiation).
+# The NAV series is keyed by ReportDate, and navStats chains returns against
+# it with a begin-of-day deposit convention — a flow booked on its initiation
+# date sits in the denominator days before the NAV row that reflects it.
+# ---------------------------------------------------------------------------
+
+def _flows(rows, header=SOF_HDR_RD):
+    return parse([_pnl(), _nav(), (header, rows)])["cash_flows"]
+
+
+def test_cash_flow_books_on_report_date_not_initiation_date():
+    flows = _flows([_sof_wire(16335.25, date="20251113", report_date="20251127")])
+    assert len(flows) == 1
+    # 14 days in transit: the money is not in the account until it posts.
+    assert flows[0]["date"] == "2025-11-27"
+    assert flows[0]["amount"] == 16335.25
+
+
+def test_cash_flow_falls_back_to_date_when_no_report_date():
+    # Older Flex layouts and Activity Statements ship no ReportDate here.
+    # Booking on a slightly wrong day still beats dropping the flow.
+    flows = _flows([_sof_wire(5000, date="20251113")], header=SOF_HDR)
+    assert [f["date"] for f in flows] == ["2025-11-13"]
+
+
+def test_wires_in_transit_all_land_on_the_day_they_post():
+    """U228 2025-11-27, the case this fix exists for.
+
+    Four wires initiated on four different days (one of them the NEXT day)
+    posted together. Booked by Date only $13,068.20 counted against a NAV
+    move of $52,584.29, and the missing $39,516.09 chained in as a +64%
+    one-day return. Booked by ReportDate all four land on 11-27.
+    """
+    flows = _flows([
+        _sof_wire(13068.20, date="20251127", report_date="20251127"),
+        _sof_wire(16335.25, date="20251113", report_date="20251127"),  # +14d
+        _sof_wire(8904.49, date="20251117", report_date="20251127"),   # +10d
+        _sof_wire(14204.93, date="20251128", report_date="20251127"),  # -1d
+    ])
+    on_1127 = [f for f in flows if f["date"] == "2025-11-27"]
+    assert len(on_1127) == 4, "every posted wire belongs to the posting day"
+    assert round(sum(f["amount"] for f in on_1127), 2) == 52512.87
+    # The NAV move that day was 52584.29; what the chain must be left to
+    # explain as return is the residual, not a 64% phantom.
+    assert round(52584.29 - sum(f["amount"] for f in on_1127), 2) == 71.42
+
+
+def test_report_date_booking_keeps_flows_distinct_not_deduped():
+    # Same posting day, same amount, different wires: the realignment must
+    # not collapse them. Real statements carry TransactionID; without it the
+    # synth key's occurrence ordinal has to keep them apart.
+    flows = _flows([
+        _sof_wire(10000, date="20251113", report_date="20251127"),
+        _sof_wire(10000, date="20251117", report_date="20251127"),
+    ])
+    assert len(flows) == 2
+    assert len({f["id"] for f in flows}) == 2
+    assert sum(f["amount"] for f in flows) == 20000
+
+
+def test_withdrawal_also_books_on_report_date():
+    flows = _flows([_sof_wire(-2500, date="20260101",
+                              report_date="20260105", code="WITH")])
+    assert flows[0]["date"] == "2026-01-05"
+    assert flows[0]["amount"] == -2500  # sign convention unchanged
 
 
 # ---------------------------------------------------------------------------
