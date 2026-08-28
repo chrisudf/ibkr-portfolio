@@ -1141,8 +1141,12 @@ function weeklyDiff(current, snapshots) {
   const base = pickBaseline(snapshots, current.date);
   if (!base) return null;
   const rows = {};
+  // pnlU/pnlR split realized vs unrealized; sPnl/oPnl split the SAME total
+  // along the other axis, stock vs option. Two independent decompositions of
+  // one number — sPnl + oPnl === pnlU + pnlR by construction, which is what
+  // lets the row print a breakdown without re-deriving the total.
   const R = (u) => rows[u] || (rows[u] = {
-    u, pnlU: 0, pnlR: 0, pxPct: null, qtyNow: 0, qtyBase: 0,
+    u, pnlU: 0, pnlR: 0, sPnl: 0, oPnl: 0, pxPct: null, qtyNow: 0, qtyBase: 0,
   });
   // P&L per underlying: stock rows key by their own symbol, option rows by
   // the underlying pulled from the contract description.
@@ -1157,6 +1161,8 @@ function weeklyDiff(current, snapshots) {
     if (CASH_EQUIVALENTS.has(u)) continue;  // SGOV drift is not a "mover"
     const r = R(u);
     r.pnlR += now[0] - was[0];
+    if (kind === "S") r.sPnl += now[0] - was[0];
+    else r.oPnl += (now[0] - was[0]) + (now[1] - was[1]);
     // Stocks take ΔU from the position maps below, NOT from perf: a stock
     // held at the baseline but absent from that statement's MTM section
     // would otherwise default to 0 and book its entire LIFETIME unrealized
@@ -1174,6 +1180,7 @@ function weeklyDiff(current, snapshots) {
     const was = (base.snap.stocks || {})[sym];
     const r = R(sym);
     r.pnlU += (now ? now[3] : 0) - (was ? was[3] : 0);
+    r.sPnl += (now ? now[3] : 0) - (was ? was[3] : 0);
     r.qtyNow = now ? now[0] : 0;
     r.qtyBase = was ? was[0] : 0;
     if (now && was && now[1] > 0 && was[1] > 0) {
@@ -1198,6 +1205,24 @@ function weeklyDiff(current, snapshots) {
     baseDate: base.snap.date, days: base.gap, liveDate: current.date,
     navBase: base.snap.nav, navNow: current.nav, rows: list,
   };
+}
+
+// A row aggregates an underlying's shares AND every option leg on it into one
+// number, which a reader takes for a stock move. That reading is wrong exactly
+// twice: when both sides contributed, and when there are no shares at all —
+// a year of closed CSP ladders (CRWV, AMZN, GDX) lands on the board looking
+// like a phantom stock position nobody holds. Speak up in those two cases and
+// stay quiet otherwise; a silent row IS the stock-only row.
+const SPLIT_MIN = 1;
+
+function splitLabel(r) {
+  const s = r.sPnl || 0, o = r.oPnl || 0;
+  const signed = (v) => `${v >= 0 ? "+" : ""}${fmtMoney(v, 0)}`;
+  if (Math.abs(s) >= SPLIT_MIN && Math.abs(o) >= SPLIT_MIN) {
+    return `正股 ${signed(s)} · 期权 ${signed(o)}`;
+  }
+  if (Math.abs(o) >= SPLIT_MIN) return "全期权";
+  return "";
 }
 
 function positionTag(r) {
@@ -1241,9 +1266,11 @@ function renderWeekly(data, accounts, selected) {
   for (const d of diffs) {
     for (const r of d.rows) {
       const t = merged[r.u] || (merged[r.u] = {
-        u: r.u, pnlU: 0, pnlR: 0, total: 0, pxPct: null, qtyNow: 0, qtyBase: 0,
+        u: r.u, pnlU: 0, pnlR: 0, sPnl: 0, oPnl: 0,
+        total: 0, pxPct: null, qtyNow: 0, qtyBase: 0,
       });
       t.pnlU += r.pnlU; t.pnlR += r.pnlR; t.total += r.total;
+      t.sPnl += r.sPnl; t.oPnl += r.oPnl;
       t.qtyNow += r.qtyNow; t.qtyBase += r.qtyBase;
       if (t.pxPct == null) t.pxPct = r.pxPct;  // same security, same move
       t.splitLike = t.splitLike || !!r.splitLike;
@@ -1340,6 +1367,7 @@ function renderWeekly(data, accounts, selected) {
       <div class="wk-bar"><div class="wk-fill ${r.total >= 0 ? "pos" : "neg"}"
         style="width:${Math.max(3, Math.abs(r.total) / maxAbs * 100)}%"></div></div>
       <span class="wk-val ${r.total >= 0 ? "up" : "down"}">${r.total >= 0 ? "+" : ""}${fmtMoney(r.total, 0)}</span>
+      <span class="wk-split muted">${splitLabel(r)}</span>
       <span class="wk-meta muted">${meta}</span>
     </div>`;
   };

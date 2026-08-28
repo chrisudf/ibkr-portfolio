@@ -371,7 +371,7 @@ ul.rank .sym { font-weight: 600; }
 }
 .wk-row {
   display: grid;
-  grid-template-columns: 64px 1fr 90px minmax(90px, auto);
+  grid-template-columns: 64px 1fr 90px auto minmax(90px, auto);
   gap: 10px; align-items: center; padding: 5px 0; font-size: 13px;
 }
 .wk-bar { height: 10px; background: var(--panel-2); border-radius: 5px; overflow: hidden; }
@@ -379,6 +379,9 @@ ul.rank .sym { font-weight: 600; }
 .wk-fill.pos { background: var(--green); }
 .wk-fill.neg { background: var(--red); }
 .wk-val { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+/* Empty in the common stock-only row, where auto collapses the track to 0 and
+   the bar takes the width back — the split only costs space where it speaks. */
+.wk-split { font-size: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .wk-meta { font-size: 12px; }
 
 /* Core holdings & position caps */
