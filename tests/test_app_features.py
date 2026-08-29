@@ -247,3 +247,42 @@ def test_position_settings_response_shape_is_stable(tmp_path, monkeypatch):
                json={"symbols": {"NVDA": {"core": True, "max": 0.1}}})
     body = client.get("/api/settings/positions").get_json()
     assert set(body) == keys and body["updated_at"]
+
+
+# ---------------------------------------------------------------------------
+# Flex fetch budgets. The 2026-08-28/29 outage was these two constants being
+# EQUAL: a fetch that used its whole poll budget was immediately re-runnable,
+# so the next request reached IBKR while it was still generating the one we
+# had just abandoned, and got 1001 for it. The relationship is the fix, so
+# the relationship is what gets pinned — not the literals.
+# ---------------------------------------------------------------------------
+
+def test_cooldown_outlasts_a_full_length_fetch():
+    import app as app_mod
+    from parser.flex_fetch import FLEX_MAX_POLLS, FLEX_POLL_INTERVAL
+
+    budget = FLEX_MAX_POLLS * FLEX_POLL_INTERVAL
+    assert app_mod.REFRESH_MIN_INTERVAL_SEC > budget, (
+        "cooldown is measured from attempt START: if it does not outlast the "
+        "poll budget, a timed-out fetch can be retried while IBKR is still "
+        "generating the abandoned one"
+    )
+
+
+def test_poll_budget_covers_observed_generation_time():
+    from parser.flex_fetch import FLEX_MAX_POLLS, FLEX_POLL_INTERVAL
+
+    # Real statements came back 1019 ("still generating") at 300s twice.
+    # Whatever else changes, the budget must stay clear of that watermark.
+    assert FLEX_MAX_POLLS * FLEX_POLL_INTERVAL > 300
+
+
+def test_fetch_one_defaults_track_the_module_constants():
+    # The defaults are what app.py actually gets — a literal left behind in the
+    # signature would silently keep the old budget while the constants moved.
+    import inspect
+    from parser import flex_fetch
+
+    defaults = inspect.signature(flex_fetch.fetch_one).parameters
+    assert defaults["max_polls"].default == flex_fetch.FLEX_MAX_POLLS
+    assert defaults["poll_interval"].default == flex_fetch.FLEX_POLL_INTERVAL

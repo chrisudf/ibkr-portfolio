@@ -21,7 +21,8 @@ from threading import Lock
 from flask import Flask, jsonify, render_template, request
 
 from parser import parse_ibkr_auto, parse_ibkr_pdf
-from parser.flex_fetch import FlexFetchError, fetch_one, parse_accounts_env
+from parser.flex_fetch import (FLEX_MAX_POLLS, FLEX_POLL_INTERVAL,
+                               FlexFetchError, fetch_one, parse_accounts_env)
 from parser.ibkr_flex_csv import describe_sections
 from parser.snapshots import load_snapshots, record_snapshot
 
@@ -49,7 +50,15 @@ app.logger.setLevel(logging.INFO)
 # regardless of success or failure). Prevents button-spam from chewing
 # through IBKR's per-query throttle quota — IBKR locks a query for ~30 min
 # if hit too often, success or not, so we cool down on every attempt.
-REFRESH_MIN_INTERVAL_SEC = 5 * 60
+#
+# Must stay LONGER than a full-length fetch, since the clock starts when the
+# attempt starts: at the old 5 minutes it exactly equalled the poll budget, so
+# an attempt that ran the budget out was immediately re-runnable and the next
+# request landed while IBKR was still generating the abandoned one. Sized to
+# leave a real gap after even a maximal fetch (FLEX_MAX_POLLS *
+# FLEX_POLL_INTERVAL = 900s), so a timed-out generation gets room to finish
+# before anything asks again.
+REFRESH_MIN_INTERVAL_SEC = int(FLEX_MAX_POLLS * FLEX_POLL_INTERVAL) + 5 * 60
 # In-process state: only authoritative because the Dockerfile runs a single
 # Gunicorn worker (threads share this dict). Adding workers would need a
 # cross-process lock (file lock / redis) instead.

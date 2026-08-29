@@ -105,11 +105,33 @@ def _find_tag(body: str, tag: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+# 15 minutes of polling, up from the 5 inherited from the retired bash script.
+# Measured reason, not a guess: on 2026-08-28/29 six consecutive syncs failed,
+# and the two that got furthest returned 1019 ("Statement generation in
+# progress") after the FULL 300s — IBKR had accepted the request and was still
+# working when we walked away. The query has grown into a 1.4MB two-account
+# 365-day report since that budget was set, and no longer fits inside it.
+#
+# Walking away is worse than waiting: the generation job keeps running on
+# IBKR's side, so the next SendRequest for the same query is answered 1001
+# ("could not be generated at this time") — the shape of the other four
+# failures. Every timeout plants the refusal that greets the following
+# attempt, which is why the run of failures sustained itself across two days
+# and three times of day. Waiting longer costs no extra requests; it is
+# strictly fewer.
+#
+# Safe to block this long: the Dockerfile runs gthread, whose heartbeat comes
+# from the accept loop rather than per-request, so a slow refresh cannot trip
+# the worker timeout and other threads keep serving the UI meanwhile.
+FLEX_MAX_POLLS = 180
+FLEX_POLL_INTERVAL = 5.0
+
+
 def fetch_one(
     spec: AccountSpec,
     *,
-    max_polls: int = 60,
-    poll_interval: float = 5.0,
+    max_polls: int = FLEX_MAX_POLLS,
+    poll_interval: float = FLEX_POLL_INTERVAL,
 ) -> str:
     """Block until IBKR delivers the CSV for this query, or raise.
 
