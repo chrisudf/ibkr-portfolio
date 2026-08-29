@@ -49,11 +49,28 @@ app.logger.setLevel(logging.INFO)
 # regardless of success or failure). Prevents button-spam from chewing
 # through IBKR's per-query throttle quota — IBKR locks a query for ~30 min
 # if hit too often, success or not, so we cool down on every attempt.
+#
+# Measured from when an attempt ENDS, not when it starts. Starting the clock at
+# the start conflates two different things and gets both wrong: the constant
+# then has to cover the longest possible fetch, which punishes the common fast
+# case (a 2-minute success would owe the rest of the window before you could
+# ask again), and if it is ever set to exactly the poll budget the gap
+# collapses to zero — which is the bug that took syncing down on 2026-08-28/29.
+# A fetch that gave up after its full budget left IBKR still generating, the
+# cooldown expired in the same instant, and the next request was answered 1001
+# ("could not be generated at this time"); every timeout planted the refusal
+# that greeted the next attempt.
+#
+# Gating on the end makes the guarantee independent of how long a fetch runs:
+# a slow attempt provides its own spacing and still owes this gap afterwards,
+# so a timed-out generation always gets room to finish before anything asks
+# again, and a fast success is only held for this long.
 REFRESH_MIN_INTERVAL_SEC = 5 * 60
 # In-process state: only authoritative because the Dockerfile runs a single
 # Gunicorn worker (threads share this dict). Adding workers would need a
 # cross-process lock (file lock / redis) instead.
-_refresh_state = {"last_started": 0.0, "in_progress": False}
+# last_finished starts at 0.0 so the first refresh after a boot is never held.
+_refresh_state = {"last_finished": 0.0, "in_progress": False}
 _refresh_lock = Lock()
 
 # Account ids become filenames (uploads/{id}.json) and come from parsed
@@ -360,7 +377,7 @@ def _run_refresh(trigger: str) -> tuple[dict, int]:
     with _refresh_lock:
         if _refresh_state["in_progress"]:
             return {"error": "refresh already in progress"}, 429
-        elapsed = now - _refresh_state["last_started"]
+        elapsed = now - _refresh_state["last_finished"]
         if elapsed < REFRESH_MIN_INTERVAL_SEC:
             wait = int(REFRESH_MIN_INTERVAL_SEC - elapsed)
             return {
@@ -368,7 +385,6 @@ def _run_refresh(trigger: str) -> tuple[dict, int]:
                 "retry_after_sec": wait,
             }, 429
         _refresh_state["in_progress"] = True
-        _refresh_state["last_started"] = now
 
     results: list[dict] = []
     try:
@@ -410,6 +426,10 @@ def _run_refresh(trigger: str) -> tuple[dict, int]:
     finally:
         with _refresh_lock:
             _refresh_state["in_progress"] = False
+            # Stamp on the way out, in finally: a fetch that raised still
+            # reached IBKR and still owes the cooldown — arguably more so,
+            # since a timeout leaves a generation running on their side.
+            _refresh_state["last_finished"] = time.time()
 
     any_ok = any(r.get("ok") for r in results)
     app.logger.info("[refresh:%s] %s", trigger,
