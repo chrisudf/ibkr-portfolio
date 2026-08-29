@@ -6,6 +6,7 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -250,22 +251,56 @@ def test_position_settings_response_shape_is_stable(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Flex fetch budgets. The 2026-08-28/29 outage was these two constants being
-# EQUAL: a fetch that used its whole poll budget was immediately re-runnable,
-# so the next request reached IBKR while it was still generating the one we
-# had just abandoned, and got 1001 for it. The relationship is the fix, so
-# the relationship is what gets pinned — not the literals.
+# Flex fetch budgets. The 2026-08-28/29 outage was the cooldown being measured
+# from the attempt's START while set to exactly the poll budget: a fetch that
+# used its whole budget was re-runnable the instant it gave up, so the next
+# request reached IBKR while it was still generating the one we had just
+# abandoned, and was answered 1001. Gating on the END is the fix, and that is
+# what gets pinned — a constant picked to outlast the budget would also work,
+# but only until someone moved the budget.
 # ---------------------------------------------------------------------------
 
-def test_cooldown_outlasts_a_full_length_fetch():
+def test_cooldown_is_measured_from_attempt_end(monkeypatch):
+    # However long a fetch runs, the gap owed afterwards is the same.
     import app as app_mod
-    from parser.flex_fetch import FLEX_MAX_POLLS, FLEX_POLL_INTERVAL
 
-    budget = FLEX_MAX_POLLS * FLEX_POLL_INTERVAL
-    assert app_mod.REFRESH_MIN_INTERVAL_SEC > budget, (
-        "cooldown is measured from attempt START: if it does not outlast the "
-        "poll budget, a timed-out fetch can be retried while IBKR is still "
-        "generating the abandoned one"
+    spec = SimpleNamespace(tag="test", token="tok", query_id="123")
+    monkeypatch.setattr(app_mod, "parse_accounts_env", lambda _: [spec])
+    monkeypatch.setenv("ACCOUNTS", "tok:123")
+    clock = {"t": 10_000.0}
+    monkeypatch.setattr(app_mod.time, "time", lambda: clock["t"])
+
+    def slow_failing_fetch(_spec):
+        # Burns far more than one cooldown before failing.
+        clock["t"] += 10 * app_mod.REFRESH_MIN_INTERVAL_SEC
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(app_mod, "fetch_one", slow_failing_fetch)
+    app_mod._refresh_state.update({"last_finished": 0.0, "in_progress": False})
+
+    _, status = app_mod._run_refresh("test")
+    assert status == 200          # ran; the per-account failure is inside
+
+    # Start-gating would wave this through: the attempt STARTED many cooldowns
+    # ago. Only end-gating still owes the gap.
+    _, status = app_mod._run_refresh("test")
+    assert status == 429, "a long attempt must still owe the full gap after it ends"
+
+    clock["t"] += app_mod.REFRESH_MIN_INTERVAL_SEC + 1
+    _, status = app_mod._run_refresh("test")
+    assert status == 200, "once the gap has passed, the next attempt runs"
+
+
+def test_failed_fetch_still_stamps_the_cooldown():
+    # A timeout leaves IBKR generating, so it owes the gap at least as much as
+    # a success does — the stamp has to be in finally, not on the happy path.
+    import inspect
+
+    import app as app_mod
+
+    finally_block = inspect.getsource(app_mod._run_refresh).split("finally:")[-1]
+    assert "last_finished" in finally_block, (
+        "stamp must live in finally, or a raising fetch skips the cooldown"
     )
 
 
