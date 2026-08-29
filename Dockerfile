@@ -19,7 +19,7 @@ EXPOSE 8000
 #   authoritative with exactly one worker. More workers would let refreshes
 #   run concurrently and bypass the IBKR throttle guard.
 # - gthread heartbeats from its accept loop, not per-request, so a long
-#   /api/refresh (up to ~900s per account — see FLEX_MAX_POLLS — accounts
+#   /api/refresh (up to ~600s per account — see FLEX_MAX_POLLS — accounts
 #   fetched serially) can't trip the worker timeout the way sync workers
 #   would. Timeout is liveness-only here; other threads keep serving the UI
 #   meanwhile. That budget now outlasts any browser/proxy patience: the

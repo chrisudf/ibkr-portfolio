@@ -105,25 +105,34 @@ def _find_tag(body: str, tag: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-# 15 minutes of polling, up from the 5 inherited from the retired bash script.
-# Measured reason, not a guess: on 2026-08-28/29 six consecutive syncs failed,
+# 10 minutes of polling, up from the 5 inherited from the retired bash script.
+# Sized against the measured normal, not padded for comfort: the last healthy
+# sync (2026-08-22) started 06:00:08 and had parsed and written both accounts
+# by 06:02 — the whole pass, generation included, inside ~2 minutes. So 5x the
+# normal, with 2x headroom over the two failures below.
+#
+# Why it needed raising at all: on 2026-08-28/29 six consecutive syncs failed,
 # and the two that got furthest returned 1019 ("Statement generation in
 # progress") after the FULL 300s — IBKR had accepted the request and was still
-# working when we walked away. The query has grown into a 1.4MB two-account
-# 365-day report since that budget was set, and no longer fits inside it.
+# working when we walked away. Whatever slowed it down, 2.5x the normal was no
+# longer enough of a margin.
 #
-# Walking away is worse than waiting: the generation job keeps running on
-# IBKR's side, so the next SendRequest for the same query is answered 1001
-# ("could not be generated at this time") — the shape of the other four
-# failures. Every timeout plants the refusal that greets the following
-# attempt, which is why the run of failures sustained itself across two days
-# and three times of day. Waiting longer costs no extra requests; it is
-# strictly fewer.
+# Note this is the SECOND line of defence, not the cure. The cure is that the
+# cooldown now outlasts this budget (see REFRESH_MIN_INTERVAL_SEC): walking
+# away does not stop the generation job on IBKR's side, so the next
+# SendRequest for the same query is answered 1001 ("could not be generated at
+# this time") — the shape of the other four failures. With both budgets at
+# 300s the cooldown expired at the exact moment we gave up, so every timeout
+# planted the refusal that greeted the next attempt, and the failure run
+# sustained itself across two days and three times of day.
 #
 # Safe to block this long: the Dockerfile runs gthread, whose heartbeat comes
 # from the accept loop rather than per-request, so a slow refresh cannot trip
-# the worker timeout and other threads keep serving the UI meanwhile.
-FLEX_MAX_POLLS = 180
+# the worker timeout and other threads keep serving the UI meanwhile. Kept to
+# 10 rather than 15 minutes because this call blocks a request thread, and a
+# budget far above the observed generation time buys nothing but a longer hang
+# on the day IBKR is genuinely stuck.
+FLEX_MAX_POLLS = 120
 FLEX_POLL_INTERVAL = 5.0
 
 

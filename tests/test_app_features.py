@@ -269,12 +269,18 @@ def test_cooldown_outlasts_a_full_length_fetch():
     )
 
 
-def test_poll_budget_covers_observed_generation_time():
+def test_poll_budget_is_bounded_on_both_sides():
     from parser.flex_fetch import FLEX_MAX_POLLS, FLEX_POLL_INTERVAL
 
-    # Real statements came back 1019 ("still generating") at 300s twice.
-    # Whatever else changes, the budget must stay clear of that watermark.
-    assert FLEX_MAX_POLLS * FLEX_POLL_INTERVAL > 300
+    budget = FLEX_MAX_POLLS * FLEX_POLL_INTERVAL
+    # Floor: real statements came back 1019 ("still generating") at 300s twice,
+    # so the budget must stay clear of that watermark.
+    assert budget > 300
+    # Ceiling: this call blocks a request thread, and the last healthy sync
+    # generated in ~2 minutes. A budget far above the observed generation time
+    # buys nothing but a longer hang on the day IBKR is genuinely stuck — the
+    # cooldown, not a bigger budget, is what breaks the 1001 cascade.
+    assert budget <= 900
 
 
 def test_fetch_one_defaults_track_the_module_constants():
