@@ -56,8 +56,9 @@ app.logger.setLevel(logging.INFO)
 # an attempt that ran the budget out was immediately re-runnable and the next
 # request landed while IBKR was still generating the abandoned one. Sized to
 # leave a real gap after even a maximal fetch (FLEX_MAX_POLLS *
-# FLEX_POLL_INTERVAL = 900s), so a timed-out generation gets room to finish
-# before anything asks again.
+# FLEX_POLL_INTERVAL), so a timed-out generation gets room to finish before
+# anything asks again. Derived rather than written out, so that moving the
+# poll budget can never silently re-close the gap the way it did here.
 REFRESH_MIN_INTERVAL_SEC = int(FLEX_MAX_POLLS * FLEX_POLL_INTERVAL) + 5 * 60
 # In-process state: only authoritative because the Dockerfile runs a single
 # Gunicorn worker (threads share this dict). Adding workers would need a
