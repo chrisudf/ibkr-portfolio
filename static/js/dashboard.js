@@ -2820,6 +2820,17 @@ async function refreshFromIBKR() {
     const res = await fetch("/api/refresh", { method: "POST" });
     const data = await res.json();
     if (res.status === 429) {
+      // Two refusals share the status. "too soon" (retry_after_sec) really is
+      // a wait. "already in progress" means a live pass exists — the server
+      // sends its run_id precisely so this tab can adopt it instead of
+      // sitting idle next to a running sync (and missing its reload when it
+      // lands). Keep the busy state; the poll repaints the label.
+      if (data.run_id && !data.retry_after_sec) {
+        trackedRunId = data.run_id;
+        showToast("info", "已有同步在进行", "正在跟踪它的进度");
+        pollRefreshStatus();
+        return;
+      }
       setRefreshBusy(false);
       showToast("warn", "请稍后再试", data.error || "刷新过于频繁");
       return;
