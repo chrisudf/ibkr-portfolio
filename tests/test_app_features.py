@@ -260,13 +260,16 @@ def test_position_settings_response_shape_is_stable(tmp_path, monkeypatch):
 # but only until someone moved the budget.
 # ---------------------------------------------------------------------------
 
-def test_cooldown_is_measured_from_attempt_end(monkeypatch):
+def test_cooldown_is_measured_from_attempt_end(tmp_path, monkeypatch):
     # However long a fetch runs, the gap owed afterwards is the same.
     import app as app_mod
 
     spec = SimpleNamespace(tag="test", token="tok", query_id="123")
     monkeypatch.setattr(app_mod, "parse_accounts_env", lambda _: [spec])
     monkeypatch.setenv("ACCOUNTS", "tok:123")
+    # A completed pass now records its outcome; keep that off the real
+    # uploads/ so the suite stays side-effect free.
+    monkeypatch.setattr(app_mod, "SYNC_STATE_FILE", tmp_path / ".auto_sync_state.json")
     clock = {"t": 10_000.0}
     monkeypatch.setattr(app_mod.time, "time", lambda: clock["t"])
 
@@ -299,23 +302,29 @@ def test_failed_fetch_still_stamps_the_cooldown():
     import app as app_mod
 
     finally_block = inspect.getsource(app_mod._run_refresh).split("finally:")[-1]
-    assert "last_finished" in finally_block, (
-        "stamp must live in finally, or a raising fetch skips the cooldown"
+    assert "_release_refresh()" in finally_block, (
+        "the release must live in finally, or a raising fetch skips the cooldown"
+    )
+    # And the release is what actually moves the clock — asserting on the
+    # finally alone would pass for a release that forgot to stamp.
+    assert "last_finished" in inspect.getsource(app_mod._release_refresh), (
+        "_release_refresh is what the finally relies on to stamp the cooldown"
     )
 
 
 def test_poll_budget_is_bounded_on_both_sides():
-    from parser.flex_fetch import FLEX_MAX_POLLS, FLEX_POLL_INTERVAL
+    from parser.flex_fetch import BUDGET_CEILING_SEC, FLEX_BUDGET_SEC
 
-    budget = FLEX_MAX_POLLS * FLEX_POLL_INTERVAL
-    # Floor: real statements came back 1019 ("still generating") at 300s twice,
-    # so the budget must stay clear of that watermark.
-    assert budget > 300
-    # Ceiling: this call blocks a request thread, and the last healthy sync
-    # generated in ~2 minutes. A budget far above the observed generation time
-    # buys nothing but a longer hang on the day IBKR is genuinely stuck — the
-    # cooldown, not a bigger budget, is what breaks the 1001 cascade.
-    assert budget <= 900
+    # Floor: real statements came back 1019 ("still generating") past 300s
+    # twice, and past 600s four times across 2026-09-01..04. The shipped
+    # default sits at 600 only because the true generation time is still
+    # unmeasured — it is the last known floor, not a fix.
+    assert FLEX_BUDGET_SEC >= 600
+    # Ceiling: the old 900s cap existed because the fetch blocked a request
+    # thread. /api/refresh hands the pass to a background thread now, so the
+    # only reason left to cap is that a mistyped env must not wedge a refresh
+    # for hours.
+    assert FLEX_BUDGET_SEC <= BUDGET_CEILING_SEC
 
 
 def test_fetch_one_defaults_track_the_module_constants():
@@ -327,3 +336,132 @@ def test_fetch_one_defaults_track_the_module_constants():
     defaults = inspect.signature(flex_fetch.fetch_one).parameters
     assert defaults["max_polls"].default == flex_fetch.FLEX_MAX_POLLS
     assert defaults["poll_interval"].default == flex_fetch.FLEX_POLL_INTERVAL
+
+
+# ---------------------------------------------------------------------------
+# Async refresh. The button used to hold the HTTP request open for the whole
+# poll budget — 10 minutes of spinner for a response nobody was still waiting
+# for. These lock the split: config errors and the throttle stay synchronous,
+# the fetch does not.
+# ---------------------------------------------------------------------------
+
+def test_refresh_returns_immediately_and_reports_progress(tmp_path, monkeypatch):
+    import threading
+    import time as time_mod
+
+    import app as app_mod
+
+    spec = SimpleNamespace(tag="test", token="tok", query_id="123")
+    monkeypatch.setattr(app_mod, "parse_accounts_env", lambda _: [spec])
+    monkeypatch.setenv("ACCOUNTS", "tok:123")
+    monkeypatch.setattr(app_mod, "SYNC_STATE_FILE", tmp_path / ".auto_sync_state.json")
+    app_mod._refresh_state.update({"last_finished": 0.0, "in_progress": False,
+                                   "last_result": None})
+
+    started, release = threading.Event(), threading.Event()
+
+    def blocking_fetch(_spec):
+        started.set()
+        release.wait(5)
+        raise RuntimeError("boom")   # the outcome is not what is under test
+
+    monkeypatch.setattr(app_mod, "fetch_one", blocking_fetch)
+    client = app_mod.app.test_client()
+
+    res = client.post("/api/refresh")
+    assert res.status_code == 202, "the button must not wait out the poll budget"
+    run_id = res.get_json()["run_id"]
+    assert started.wait(5), "the pass should be running in the background"
+
+    st = client.get("/api/refresh/status").get_json()
+    assert st["in_progress"] is True
+    assert st["run_id"] == run_id
+    assert st["trigger"] == "button"
+
+    # A second press while one is in flight is refused, never queued — two
+    # concurrent passes would defeat the point of the single slot.
+    assert client.post("/api/refresh").status_code == 429
+
+    release.set()
+    for _ in range(100):
+        st = client.get("/api/refresh/status").get_json()
+        if not st["in_progress"]:
+            break
+        time_mod.sleep(0.05)
+    assert st["in_progress"] is False
+    # The finished result carries the id the button started with, so a reload
+    # cannot mistake an older pass's outcome for its own.
+    assert st["last"]["run_id"] == run_id
+    assert st["last"]["ok"] is False
+
+
+def test_refresh_config_errors_stay_synchronous(monkeypatch):
+    import app as app_mod
+
+    monkeypatch.setenv("ACCOUNTS", "")
+    app_mod._refresh_state.update({"last_finished": 0.0, "in_progress": False})
+    res = app_mod.app.test_client().post("/api/refresh")
+    # Nothing was started, so this must not come back as an accepted 202 the
+    # UI would then poll forever.
+    assert res.status_code == 500
+    assert "ACCOUNTS" in res.get_json()["error"]
+
+
+def test_button_outcome_does_not_consume_the_scheduler_slot(tmp_path, monkeypatch):
+    import app as app_mod
+
+    path = tmp_path / ".auto_sync_state.json"
+    monkeypatch.setattr(app_mod, "SYNC_STATE_FILE", path)
+    path.write_text(json.dumps({
+        "mode": "daily",
+        "last_attempt_date": "2026-09-04",
+        "last_attempt": "2026-09-04T06:00:00+00:00",
+    }), encoding="utf-8")
+
+    app_mod._record_sync_outcome(
+        {"ok": True, "results": [{"tag": "154914", "ok": True}]}, "button")
+    state = json.loads(path.read_text(encoding="utf-8"))
+    # The day's single automatic attempt is the scheduler's to spend; a button
+    # press at 08:57 must not skip a whole daily slot.
+    assert state["last_attempt_date"] == "2026-09-04"
+    assert state["last_attempt"] == "2026-09-04T06:00:00+00:00"
+    # But "when did data last actually arrive" is trigger-agnostic.
+    assert state["ok"] is True
+    assert state["last_run_trigger"] == "button"
+    first_success = state["last_success"]
+    assert first_success
+
+    app_mod._record_sync_outcome(
+        {"ok": False, "results": [{"tag": "154914", "ok": False, "error": "1019"}]},
+        "auto")
+    state = json.loads(path.read_text(encoding="utf-8"))
+    assert state["ok"] is False
+    # A later failure must not erase the last known-good time — it is the only
+    # thing the staleness banner can count from.
+    assert state["last_success"] == first_success
+
+
+def test_poll_budget_env_override_is_clamped(monkeypatch):
+    import importlib
+
+    from parser import flex_fetch
+
+    monkeypatch.setenv("FLEX_MAX_POLLS", "180")
+    monkeypatch.setenv("FLEX_POLL_INTERVAL", "15")
+    mod = importlib.reload(flex_fetch)
+    assert mod.FLEX_BUDGET_SEC == 2700, "a night of diagnosis needs a movable budget"
+
+    # A mistyped env must degrade to something bounded, not wedge a refresh
+    # for hours or crash the import on a droplet nobody is watching.
+    monkeypatch.setenv("FLEX_MAX_POLLS", "99999")
+    monkeypatch.setenv("FLEX_POLL_INTERVAL", "nonsense")
+    mod = importlib.reload(flex_fetch)
+    assert mod.FLEX_POLL_INTERVAL == 5.0
+    assert mod.FLEX_BUDGET_SEC <= mod.BUDGET_CEILING_SEC
+    assert mod.FLEX_CONFIG_NOTES, "a corrected value has to be visible in the log"
+
+    monkeypatch.delenv("FLEX_MAX_POLLS")
+    monkeypatch.delenv("FLEX_POLL_INTERVAL")
+    mod = importlib.reload(flex_fetch)
+    assert mod.FLEX_BUDGET_SEC == 600, "the shipped default must not move by accident"
+    assert mod.FLEX_CONFIG_NOTES == []

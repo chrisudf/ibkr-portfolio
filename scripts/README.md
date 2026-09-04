@@ -76,8 +76,11 @@ IBKR 周末有计划维护窗口（一般 2–4 小时），脚本内置 2 次�
 
 ## 常见问题
 
-- **`Statement generation in progress` 卡很久**: IBKR 偶尔慢，每次拉取最多
-  轮询 30 × 5s = 2.5 分钟，正常 5–15 秒就好。
+- **`Statement generation in progress` 卡很久**: 每次拉取的轮询预算是
+  `FLEX_MAX_POLLS × FLEX_POLL_INTERVAL`，默认 120 × 5s = 10 分钟。健康时
+  5–15 秒就好；2026-09 起这个 query 连续四次打满 600s 仍是 1019，真实生成
+  时间尚未测出，所以默认值是「已知的下限」而不是够用的值。刷新按钮不会因此
+  卡住 —— 它拿到 202 就返回，进度走 `/api/refresh/status`。
 - **`ErrorCode 1001` Statement could not be generated**: 暂时不可用（维护或
   限流），脚本会自动 backoff 重试，无需手动干预。
 - **`ErrorCode 1019` 限流**: 同上，会自动重试。
@@ -92,7 +95,8 @@ IBKR 周末有计划维护窗口（一般 2–4 小时），脚本内置 2 次�
 
 - 本地：`run-local.ps1` 的终端输出
 - droplet：`docker compose logs -f app`
-- 浏览器：DevTools → Network → `/api/refresh` 响应里的 `raw` 字段
+- 浏览器：DevTools → Network → `/api/refresh/status` 响应里 `last.results[].raw`
+  （`/api/refresh` 本身只回一个 202，真正的结果在 status 里）
 
 **成功**的那次也会记一行，列出这份报表实际包含哪些 section，例如：
 

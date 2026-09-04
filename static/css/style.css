@@ -103,9 +103,25 @@ body {
 .toast.success { border-left: 3px solid var(--green); }
 .toast.error { border-left: 3px solid var(--red); }
 .toast.warn { border-left: 3px solid var(--amber); }
+.toast.info { border-left: 3px solid var(--accent); }
 .toast .toast-title { font-weight: 600; margin-bottom: 4px; }
 .toast .toast-detail { color: var(--text-dim); font-size: 12px; }
 @keyframes toast-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
+
+/* Staleness banner. Sits above the panel rather than inside it: the whole
+   point is that it is seen without looking for it. Amber = the numbers are
+   old; red = the sync itself is failing, which is the one that needs a human. */
+.stale-banner {
+  margin: 12px 32px 0;
+  padding: 10px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--amber);
+}
+.stale-banner.bad { border-left-color: var(--red); }
 
 main { padding: 28px 32px 80px; max-width: 1400px; margin: 0 auto; }
 
