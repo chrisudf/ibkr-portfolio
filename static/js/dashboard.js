@@ -2804,12 +2804,27 @@ async function pollRefreshStatus() {
   }
   setRefreshBusy(false);
   const last = st.last;
-  // Only report the pass this page is actually following. Without the id, a
-  // reload would replay the last result as if it had just happened.
-  const mine = last && trackedRunId !== null && last.run_id === trackedRunId;
+  // Only speak for a pass this page was actually following — without the id,
+  // a reload would replay the last result as if it had just happened. But the
+  // gate is "not older", not "exactly equal": a tab that slept through its
+  // own run being superseded by the scheduler's next one would otherwise
+  // come back to pre-refresh numbers in silence.
+  const followed = last && trackedRunId !== null && last.run_id >= trackedRunId;
   trackedRunId = null;
-  if (!mine) return;
-  if (reportRefreshOutcome(last)) await loadPortfolio();
+  if (!followed) return;
+  reportRefreshOutcome(last);
+  // Reload even after a failed pass: it still wrote the sync verdict that the
+  // header ✗ and the staleness banner read, and nothing else refetches it —
+  // the page would keep showing the load-time ✓ next to a broken pipe. The
+  // portfolio files themselves are untouched by a failure, so this is safe.
+  try {
+    await loadPortfolio();
+  } catch (exc) {
+    // The sync's own outcome was just reported; what failed here is only the
+    // page's refetch. Say so — never leave a green 已更新 over stale numbers,
+    // or die as an unhandled rejection nobody sees.
+    showToast("error", "页面数据刷新失败", `${exc} — 请手动刷新页面`, 9000);
+  }
 }
 
 async function refreshFromIBKR() {
