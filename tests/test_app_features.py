@@ -493,3 +493,34 @@ def test_poll_budget_env_override_is_clamped(monkeypatch):
     mod = importlib.reload(flex_fetch)
     assert mod.FLEX_BUDGET_SEC == 600, "the shipped default must not move by accident"
     assert mod.FLEX_CONFIG_NOTES == []
+
+
+def test_poll_budget_env_survives_nan_and_quotes(monkeypatch):
+    import importlib
+
+    from parser import flex_fetch
+
+    # float("nan") passes the cast AND slips through a min/max clamp (every
+    # comparison against NaN is False), so before the explicit check it
+    # reached int(POLLS * nan) and crashed the IMPORT — under
+    # restart:unless-stopped, a boot loop with no dashboard at all. The
+    # repo's own bar (_parse_sync_hour): a typo'd env degrades, never crashes.
+    monkeypatch.setenv("FLEX_POLL_INTERVAL", "nan")
+    mod = importlib.reload(flex_fetch)
+    assert mod.FLEX_POLL_INTERVAL == 5.0
+    assert mod.FLEX_BUDGET_SEC == 600
+    assert mod.FLEX_CONFIG_NOTES, "a corrected value has to be visible in the log"
+
+    # sync.env.example writes every value quoted; if the quotes reach the
+    # process, the override must still take rather than silently falling
+    # back to the default it was set to replace.
+    monkeypatch.setenv("FLEX_MAX_POLLS", '"180"')
+    monkeypatch.setenv("FLEX_POLL_INTERVAL", "'15'")
+    mod = importlib.reload(flex_fetch)
+    assert mod.FLEX_BUDGET_SEC == 2700
+
+    monkeypatch.delenv("FLEX_MAX_POLLS")
+    monkeypatch.delenv("FLEX_POLL_INTERVAL")
+    mod = importlib.reload(flex_fetch)
+    assert mod.FLEX_BUDGET_SEC == 600
+    assert mod.FLEX_CONFIG_NOTES == []

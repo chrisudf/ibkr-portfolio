@@ -137,12 +137,24 @@ FLEX_CONFIG_NOTES: list[str] = []
 
 
 def _env_num(name: str, default, lo, hi, cast):
-    raw = os.environ.get(name, "").strip()
+    # Quotes stripped like _parse_sync_hour/_parse_sync_day in app.py:
+    # sync.env.example writes every value quoted, and not every env_file
+    # loader strips the quotes — a quoted override silently falling back to
+    # the default would defeat the diagnosis knob this exists for.
+    raw = os.environ.get(name, "").strip().strip('"').strip("'")
     if not raw:
         return default
     try:
         value = cast(raw)
     except ValueError:
+        FLEX_CONFIG_NOTES.append(f"{name}={raw!r} is not a number; using {default}")
+        return default
+    if value != value:
+        # NaN: the one float() accepts that a comparison clamp cannot catch —
+        # it fails lo <= v <= hi into the clamp branch, but min/max pass NaN
+        # through, and int(POLLS * nan) below would crash the IMPORT. Under
+        # restart:unless-stopped that is a boot loop taking the whole
+        # dashboard down; a typo'd env must degrade, never crash.
         FLEX_CONFIG_NOTES.append(f"{name}={raw!r} is not a number; using {default}")
         return default
     if not lo <= value <= hi:
