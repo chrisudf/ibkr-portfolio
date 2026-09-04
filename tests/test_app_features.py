@@ -407,6 +407,34 @@ def test_refresh_config_errors_stay_synchronous(monkeypatch):
     assert "ACCOUNTS" in res.get_json()["error"]
 
 
+def test_failed_thread_start_does_not_strand_the_slot(monkeypatch):
+    import app as app_mod
+
+    spec = SimpleNamespace(tag="test", token="tok", query_id="123")
+    monkeypatch.setattr(app_mod, "parse_accounts_env", lambda _: [spec])
+    monkeypatch.setenv("ACCOUNTS", "tok:123")
+    app_mod._refresh_state.update({"last_finished": 0.0, "in_progress": False})
+
+    class DeadThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(app_mod.threading, "Thread", DeadThread)
+    res = app_mod.app.test_client().post("/api/refresh")
+    assert res.status_code == 500
+    # The slot must come back: the claim..start gap has no worker finally, so
+    # without an explicit release here every later press (and the scheduler)
+    # would be told "already in progress" until the container restarts.
+    assert app_mod._refresh_state["in_progress"] is False
+    # And no cool-down owed — nothing reached IBKR, so the next press must
+    # not be made to wait out REFRESH_MIN_INTERVAL_SEC for a pass that never
+    # existed.
+    assert app_mod._refresh_state["last_finished"] == 0.0
+
+
 def test_button_outcome_does_not_consume_the_scheduler_slot(tmp_path, monkeypatch):
     import app as app_mod
 

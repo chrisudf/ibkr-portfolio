@@ -411,16 +411,19 @@ def _try_claim_refresh(trigger: str) -> tuple[tuple[dict, int] | None, int]:
         return None, _refresh_state["run_id"]
 
 
-def _release_refresh() -> None:
-    """Free the slot and stamp the cool-down.
+def _release_refresh(stamp: bool = True) -> None:
+    """Free the slot and (normally) stamp the cool-down.
 
     Stamping here rather than at each call site is what makes the guarantee
     hold for the async path too: whatever happened inside the pass, the gap
-    is owed from the moment it ended.
+    is owed from the moment it ended. stamp=False is for the one caller that
+    claimed but never reached IBKR (a worker thread that failed to start):
+    no request was made, so no gap is owed.
     """
     with _refresh_lock:
         _refresh_state["in_progress"] = False
-        _refresh_state["last_finished"] = time.time()
+        if stamp:
+            _refresh_state["last_finished"] = time.time()
 
 
 def _record_refresh_result(payload: dict, trigger: str) -> None:
@@ -544,7 +547,18 @@ def refresh():
         finally:
             _release_refresh()
 
-    threading.Thread(target=worker, daemon=True, name=f"refresh-{run_id}").start()
+    try:
+        threading.Thread(target=worker, daemon=True, name=f"refresh-{run_id}").start()
+    except Exception:
+        # The claim..start gap has no worker finally to lean on: if the thread
+        # never starts (fd/memory pressure), nothing would ever release the
+        # slot, and every later press — and the scheduler — would be refused
+        # "already in progress" until a restart. The synchronous path guards
+        # the same gap with try/finally; this is its async twin. No cool-down
+        # stamped: nothing reached IBKR.
+        app.logger.exception("[refresh:button] worker thread failed to start")
+        _release_refresh(stamp=False)
+        return jsonify({"error": "could not start refresh worker"}), 500
     return jsonify({"started": True, "run_id": run_id,
                     "budget_sec": FLEX_BUDGET_SEC}), 202
 
