@@ -77,10 +77,15 @@ IBKR 周末有计划维护窗口（一般 2–4 小时），脚本内置 2 次�
 ## 常见问题
 
 - **`Statement generation in progress` 卡很久**: 每次拉取的轮询预算是
-  `FLEX_MAX_POLLS × FLEX_POLL_INTERVAL`，默认 120 × 5s = 10 分钟。健康时
-  5–15 秒就好；2026-09 起这个 query 连续四次打满 600s 仍是 1019，真实生成
-  时间尚未测出，所以默认值是「已知的下限」而不是够用的值。刷新按钮不会因此
-  卡住 —— 它拿到 202 就返回，进度走 `/api/refresh/status`。
+  `FLEX_MAX_POLLS × FLEX_POLL_INTERVAL`，默认 120 × 15s = 30 分钟。实测这个
+  query 的生成时间在 24 秒到 **696 秒**之间跳（2026-09-05 那次 696 秒，比
+  当时 600s 的预算多 96 秒）。注意 09-01..04 那四次是被我们自己在 600 秒
+  掐断的，**它们各自还差多久从没被观测到** —— 「预算不够」是目前最合理的
+  解释，但不是测量结果。预算按观测到的最大值留 2.6 倍余量，不是按典型值。刷新按钮不会因此卡住 —— 它拿到 202
+  就返回，进度走 `/api/refresh/status`。
+
+  预算再不够时，下一步不是继续加数字，而是把报表本身改小：缩短 Flex query
+  的期间，或者把 `MTMPerformance` / `StatementOfFunds` 拆成单独的低频 query。
 - **`ErrorCode 1001` Statement could not be generated**: 暂时不可用（维护或
   限流），脚本会自动 backoff 重试，无需手动干预。
 - **`ErrorCode 1019` 限流**: 同上，会自动重试。

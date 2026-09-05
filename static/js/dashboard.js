@@ -2905,9 +2905,26 @@ async function resumeRefreshWatch() {
 // only as a small ✗ in the header, which is exactly how they went unnoticed.
 const STALE_AFTER_DAYS = 3;
 
-const ymdFromISO = (str) => {
-  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(str || "");
-  return m ? { y: +m[1], m: +m[2], d: +m[3] } : null;
+// How long a failure is tolerated before the banner calls it an outage: one
+// scheduled cycle. Measured in elapsed milliseconds, never in calendar days —
+// a success at 23:59 and a failure at 00:01 are one UTC day apart and two
+// minutes apart in reality, and a weekly schedule judged by the day would be
+// declared broken almost a full cycle early.
+const SYNC_GRACE_MS = { daily: 24 * 3600e3, weekly: 7 * 24 * 3600e3 };
+const syncGraceMs = (mode) => SYNC_GRACE_MS[mode] || SYNC_GRACE_MS.daily;
+
+const sinceLastSuccessMs = (sync) => {
+  const t = Date.parse((sync && sync.last_success) || "");
+  return Number.isNaN(t) ? null : Math.max(0, Date.now() - t);
+};
+
+// Sub-day gaps read as hours: right after a scheduled run fails, "0 天前" is
+// both odd-looking and less useful than "5 小时前".
+const fmtSince = (ms) => {
+  const h = Math.floor(ms / 3600e3);
+  if (h < 1) return "不到 1 小时前";
+  if (h < 24) return `${h} 小时前`;
+  return `${Math.floor(h / 24)} 天前`;
 };
 
 const fmtYMD = (ymd) => ymd
@@ -2946,16 +2963,32 @@ function renderStaleBanner(data) {
   const sync = currentDataRef.sync;
   const asOf = oldestPeriodEnd((data.statement || {}).Period || "");
   const dataAge = daysSinceYMD(asOf);
-  const syncAge = daysSinceYMD(ymdFromISO(sync && sync.last_success));
-  const syncFailing = !!(sync && sync.ok === false);
+  const sinceSuccess = sinceLastSuccessMs(sync);
+  // A failed run is news when the pipe is broken, not merely when the last
+  // attempt happened to fail. Two different situations:
+  //
+  //   a SCHEDULED run failed — the pipe missed its cycle. Always news.
+  //   a MANUAL retry failed  — only news if no success is still recent.
+  //
+  // 2026-09-05 made the distinction concrete: the scheduler synced fine at
+  // 06:12, then a manual retry at 11:21 bounced off IBKR's per-query throttle
+  // (1001). Nothing was wrong, the data on screen was current, and the
+  // button's own toast had already said so. Painting the page red there is how
+  // a banner earns the right to be ignored — which costs exactly the outage
+  // this one exists to catch. Never having succeeded still counts as failing.
+  const syncFailing = !!(sync && sync.ok === false) && (
+    sync.last_run_trigger !== "button"
+    || sinceSuccess === null
+    || sinceSuccess >= syncGraceMs(sync.mode)
+  );
 
   const parts = [];
   if (dataAge !== null && dataAge >= STALE_AFTER_DAYS) {
     parts.push(`数据停留在 ${fmtYMD(asOf)}（${dataAge} 天前）`);
   }
   if (syncFailing) {
-    parts.push(syncAge !== null
-      ? `同步失败中 · 最近一次成功 ${syncAge} 天前`
+    parts.push(sinceSuccess !== null
+      ? `同步失败中 · 最近一次成功 ${fmtSince(sinceSuccess)}`
       : "同步失败中 · 尚无成功记录");
   }
   if (!parts.length) {

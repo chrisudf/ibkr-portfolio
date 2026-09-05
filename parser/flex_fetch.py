@@ -108,26 +108,54 @@ def _find_tag(body: str, tag: str) -> Optional[str]:
 
 # Poll budget = FLEX_MAX_POLLS * FLEX_POLL_INTERVAL seconds. Both are
 # overridable from the environment so the budget can be moved for a night of
-# diagnosis without rebuilding the image; the defaults below (120 * 5s = 600s)
-# are what ships.
+# diagnosis without rebuilding the image; the defaults below are 120 * 15s =
+# 1800s.
 #
-# History of the number: 5 minutes inherited from the retired bash script, then
-# 10 after 2026-08-28/29, sized against the measured normal — the last healthy
-# sync (2026-08-22) had parsed and written both accounts inside ~2 minutes.
+# The number is measured, not guessed. On 2026-09-05 06:00 UTC a scheduled
+# sync ran with a deliberately raised budget (180 * 15s) and came back:
 #
-# That is no longer the shape of the problem. On 2026-09-01/02/03 and again on
-# 09-04 every attempt returned 1019 ("Statement generation in progress") for
-# the FULL 600s, and a probe 33 minutes after one of those gave up was refused
-# outright with 1001 — IBKR was still holding the query. So generation now runs
-# well past 10 minutes, and the honest budget is unknown until a run is allowed
-# to finish. Hence the env override: raise it for one scheduled run, read the
-# number off the log, then set the default from evidence.
+#     06:00:24  attempt stamped, SendRequest
+#     06:12:00  fetched 1,408,193 bytes
+#     -------------------------------------
+#               696 seconds
 #
-# The old ceiling ("this call blocks a request thread") is gone: /api/refresh
-# now hands the work to a background thread and returns 202 immediately, so a
-# long budget costs a background thread, not the UI. What it still cannot
-# exceed is a sane wall-clock cap — a typo in the env must not wedge a refresh
-# for hours — so the product is clamped to BUDGET_CEILING_SEC.
+# That is 96 seconds past the 600s budget this file shipped before. What that
+# measurement establishes, precisely: the old budget was smaller than at least
+# one real generation of this query.
+#
+# It does NOT establish that the 2026-09-01..04 attempts were also 96 seconds
+# short. Those four were cut off by us at 600s and their remaining time was
+# never observed — given the spread below they could have been seconds away or
+# far longer. "The budget was too small" is the best explanation we have for
+# them and it is now known to be possible, but it stays an inference; the
+# 1019 they returned looks identical whether the statement was one minute away
+# or thirty. Worth keeping straight, because if the next outage survives 1800s
+# it means this inference was wrong and the cause is elsewhere.
+#
+# So why 1800 and not, say, 800? Because the spread is the real finding, not
+# the mean. The same query on the same two accounts:
+#
+#     2026-08-22   ~120s
+#     2026-08-31     24s
+#     2026-09-05    696s
+#
+# 24s to 696s is a 29x spread with no visible cause, and the three points we
+# have are too few to call a trend. Sizing to the observed maximum plus a bit
+# would just book the next outage; 1800s is ~2.6x the worst seen. The cost of being generous
+# is now close to zero — /api/refresh hands the pass to a background thread,
+# so a long budget occupies no request thread and no browser is waiting on it.
+# The only price is a longer wait on the day IBKR is genuinely stuck, which is
+# what BUDGET_CEILING_SEC and the cool-down are for.
+#
+# The interval moved 5s -> 15s in the same breath: the diagnostic run used 15s
+# and finished fine, and it is a third of the requests for the same wall clock.
+# Nothing here needs 5-second resolution — the fetch either lands in minutes or
+# not at all.
+#
+# When this stops being enough, the answer is NOT another rung on this ladder.
+# It is to make the statement smaller: shrink the Flex query's period, or split
+# MTMPerformance / StatementOfFunds into a separate low-frequency query. This
+# constant accommodates a slow IBKR; it cannot make one fast.
 BUDGET_CEILING_SEC = 3600
 
 # Clamp notes, drained by app.py at import so a corrected value is visible in
@@ -164,7 +192,7 @@ def _env_num(name: str, default, lo, hi, cast):
     return value
 
 
-FLEX_POLL_INTERVAL = _env_num("FLEX_POLL_INTERVAL", 5.0, 1.0, 60.0, float)
+FLEX_POLL_INTERVAL = _env_num("FLEX_POLL_INTERVAL", 15.0, 1.0, 60.0, float)
 FLEX_MAX_POLLS = _env_num("FLEX_MAX_POLLS", 120, 1, 1000, int)
 
 if FLEX_MAX_POLLS * FLEX_POLL_INTERVAL > BUDGET_CEILING_SEC:
