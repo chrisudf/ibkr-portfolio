@@ -524,3 +524,131 @@ def test_poll_budget_env_survives_nan_and_quotes(monkeypatch):
     mod = importlib.reload(flex_fetch)
     assert mod.FLEX_BUDGET_SEC == 600
     assert mod.FLEX_CONFIG_NOTES == []
+
+
+# ---------------------------------------------------------------------------
+# Second review round. The sync state file is what the header verdict and the
+# staleness banner both read, so every one of these is a way for a broken pipe
+# to keep looking healthy.
+# ---------------------------------------------------------------------------
+
+def test_partial_success_is_not_persisted_as_healthy(tmp_path, monkeypatch):
+    import app as app_mod
+
+    path = tmp_path / ".auto_sync_state.json"
+    monkeypatch.setattr(app_mod, "SYNC_STATE_FILE", path)
+
+    # payload["ok"] is any-success — right for the partial toast, wrong to
+    # persist. One account failing forever behind another's success would keep
+    # a green ✓ in the header and suppress the banner indefinitely.
+    app_mod._record_sync_outcome({"ok": True, "results": [
+        {"tag": "aaa", "ok": True},
+        {"tag": "bbb", "ok": False, "error": "1019"},
+    ]}, "auto")
+    state = json.loads(path.read_text(encoding="utf-8"))
+    assert state["ok"] is False, "a half-broken pipe is not a healthy one"
+    assert "last_success" not in state, "a partial pass must not advance last_success"
+    assert "bbb" in state["detail"]
+
+    # All-success still counts.
+    app_mod._record_sync_outcome({"ok": True, "results": [
+        {"tag": "aaa", "ok": True},
+        {"tag": "bbb", "ok": True},
+    ]}, "auto")
+    state = json.loads(path.read_text(encoding="utf-8"))
+    assert state["ok"] is True
+    assert state["last_success"]
+
+
+def test_legacy_state_keeps_its_success_time_across_the_upgrade(tmp_path, monkeypatch):
+    import app as app_mod
+
+    path = tmp_path / ".auto_sync_state.json"
+    monkeypatch.setattr(app_mod, "SYNC_STATE_FILE", path)
+    # What a pre-upgrade droplet actually has on disk: a verdict and an attempt
+    # time, no last_success (the field did not exist yet).
+    path.write_text(json.dumps({
+        "mode": "daily",
+        "last_attempt_date": "2026-08-31",
+        "last_attempt": "2026-08-31T06:00:24+00:00",
+        "ok": True,
+        "detail": "154914: ok",
+    }), encoding="utf-8")
+
+    app_mod._record_sync_outcome(
+        {"ok": False, "results": [{"tag": "154914", "ok": False, "error": "1019"}]},
+        "auto")
+    state = json.loads(path.read_text(encoding="utf-8"))
+    assert state["ok"] is False
+    # Without the backfill the banner would announce "尚无成功记录" about a box
+    # that synced fine the day before the deploy.
+    assert state["last_success"] == "2026-08-31T06:00:24+00:00"
+
+
+def test_refused_scheduler_attempt_keeps_a_concurrent_outcome(tmp_path, monkeypatch):
+    import app as app_mod
+
+    path = tmp_path / ".auto_sync_state.json"
+    monkeypatch.setattr(app_mod, "SYNC_STATE_FILE", path)
+    path.write_text(json.dumps({
+        "mode": "daily",
+        "last_attempt_date": "2026-09-03",
+        "last_attempt": "2026-09-03T06:00:00+00:00",
+    }), encoding="utf-8")
+
+    now = datetime(2026, 9, 4, 6, 0, tzinfo=timezone.utc)
+    prev = app_mod._stamp_sync_attempt(now)
+    assert json.loads(path.read_text(encoding="utf-8"))["last_attempt_date"] == "2026-09-04"
+
+    # The refusal almost always comes FROM a button pass still in flight, and
+    # that pass lands its own outcome while we are being turned away.
+    app_mod._record_sync_outcome(
+        {"ok": True, "results": [{"tag": "154914", "ok": True}]}, "button")
+
+    app_mod._restore_sync_attempt(prev)
+    state = json.loads(path.read_text(encoding="utf-8"))
+    # The slot is given back — the day's automatic attempt was never spent.
+    assert state["last_attempt_date"] == "2026-09-03"
+    assert state["last_attempt"] == "2026-09-03T06:00:00+00:00"
+    # ...but a verbatim restore of the pre-stamp snapshot would have erased the
+    # button's result, including the only timestamp the banner counts from.
+    assert state["ok"] is True
+    assert state["last_run_trigger"] == "button"
+    assert state["last_success"]
+
+
+def test_restore_removes_the_marker_when_there_was_none(tmp_path, monkeypatch):
+    import app as app_mod
+
+    path = tmp_path / ".auto_sync_state.json"
+    monkeypatch.setattr(app_mod, "SYNC_STATE_FILE", path)
+    path.write_text(json.dumps({"mode": "daily"}), encoding="utf-8")
+
+    prev = app_mod._stamp_sync_attempt(datetime(2026, 9, 4, 6, 0, tzinfo=timezone.utc))
+    app_mod._restore_sync_attempt(prev)
+    state = json.loads(path.read_text(encoding="utf-8"))
+    # Restoring "" would read as an attempt that happened at the epoch and let
+    # _auto_sync_due compare against a date that never existed.
+    assert "last_attempt_date" not in state
+    assert "last_attempt" not in state
+
+
+def test_advertised_budget_covers_the_whole_pass(monkeypatch):
+    import app as app_mod
+    from parser.flex_fetch import FLEX_BUDGET_SEC
+
+    one = SimpleNamespace(tag="a", token="t", query_id="1")
+    two = SimpleNamespace(tag="b", token="t", query_id="2")
+    # Specs are fetched serially and each gets the FULL per-query budget, so
+    # the button's "最长 N" has to multiply — advertising 45 minutes for a pass
+    # that can legitimately run 90 is how a healthy sync looks hung.
+    assert app_mod._pass_budget_sec([one, two]) == FLEX_BUDGET_SEC * 2
+    assert app_mod._pass_budget_sec([one]) == FLEX_BUDGET_SEC
+    # No accounts configured: report one budget rather than zero.
+    assert app_mod._pass_budget_sec([]) == FLEX_BUDGET_SEC
+
+    monkeypatch.setattr(app_mod, "parse_accounts_env", lambda _: [one, two])
+    monkeypatch.setenv("ACCOUNTS", "t:1 t:2")
+    app_mod._refresh_state.update({"last_finished": 0.0, "in_progress": False})
+    st = app_mod.app.test_client().get("/api/refresh/status").get_json()
+    assert st["budget_sec"] == FLEX_BUDGET_SEC * 2

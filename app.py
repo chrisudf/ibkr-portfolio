@@ -373,6 +373,17 @@ def put_position_settings():
     return jsonify(payload)
 
 
+def _pass_budget_sec(specs: list) -> int:
+    """Wall-clock ceiling for a whole pass, not for one query.
+
+    _refresh_work fetches specs serially and each fetch_one gets the FULL
+    per-query budget, so two accounts can burn twice FLEX_BUDGET_SEC. The
+    button prints this number as "最长 N"; advertising the per-query figure
+    would promise 45 minutes for a pass that may legitimately run 90.
+    """
+    return FLEX_BUDGET_SEC * max(1, len(specs))
+
+
 def _refresh_specs() -> tuple[list, tuple[dict, int] | None]:
     """Resolve ACCOUNTS into specs, or the (payload, status) to return instead."""
     accounts_env = os.environ.get("ACCOUNTS", "").strip()
@@ -517,7 +528,7 @@ def refresh():
     """Start an IBKR sync in the background and return immediately.
 
     A pass can now outlast any browser's patience (see FLEX_BUDGET_SEC), so
-    blocking the request bought nothing but a spinner that span for the whole
+    blocking the request bought nothing but a spinner that spun for the whole
     poll budget and a response nobody was still waiting for. Config errors
     and the throttle are still settled synchronously — those answers are
     instant and the button should hear them at once — and only the slow part
@@ -560,7 +571,7 @@ def refresh():
         _release_refresh(stamp=False)
         return jsonify({"error": "could not start refresh worker"}), 500
     return jsonify({"started": True, "run_id": run_id,
-                    "budget_sec": FLEX_BUDGET_SEC}), 202
+                    "budget_sec": _pass_budget_sec(specs)}), 202
 
 
 @app.get("/api/refresh/status")
@@ -573,7 +584,11 @@ def refresh_status():
     """
     with _refresh_lock:
         st = dict(_refresh_state)
-    out: dict = {"in_progress": st["in_progress"], "budget_sec": FLEX_BUDGET_SEC}
+    # Recomputed rather than remembered: the answer depends only on how many
+    # accounts are configured, and a stale copy would outlive an ACCOUNTS edit.
+    specs, _err = _refresh_specs()
+    out: dict = {"in_progress": st["in_progress"],
+                 "budget_sec": _pass_budget_sec(specs)}
     if st["in_progress"]:
         out["run_id"] = st.get("run_id", 0)
         out["trigger"] = st.get("trigger", "")
@@ -657,8 +672,44 @@ def _read_sync_state() -> dict:
         return {}
 
 
+# Every read-modify-write of the sync state goes through this. Two writers
+# exist — the scheduler stamping/rolling back its attempt marker, and a button
+# worker recording an outcome — and they are NOT mutually exclusive: the
+# scheduler can be refused (429) by a button pass that is still running and
+# about to write its own result. Without this, either side can read, be
+# overtaken, and write back a whole dict that erases the other's fields.
+_sync_state_lock = Lock()
+
+
 def _write_sync_state(state: dict) -> None:
     _atomic_write_json(SYNC_STATE_FILE, state)
+
+
+def _stamp_sync_attempt(now: datetime) -> dict:
+    """Claim the scheduler's slot for today. Returns the pre-stamp snapshot."""
+    with _sync_state_lock:
+        prev = _read_sync_state()
+        _write_sync_state({**prev, "last_attempt_date": now.date().isoformat(),
+                           "last_attempt": now.isoformat(timespec="seconds")})
+    return prev
+
+
+def _restore_sync_attempt(prev: dict) -> None:
+    """Undo the attempt stamp, keeping any outcome written meanwhile.
+
+    Restoring the whole snapshot would be simpler and wrong: a button worker
+    that finished during our refused attempt has already written ok/detail/
+    last_success, and a verbatim restore would throw that away — including the
+    one field the staleness banner counts from.
+    """
+    with _sync_state_lock:
+        state = _read_sync_state()
+        for key in ("last_attempt_date", "last_attempt"):
+            if key in prev:
+                state[key] = prev[key]
+            else:
+                state.pop(key, None)
+        _write_sync_state(state)
 
 
 def _record_sync_outcome(payload: dict, trigger: str) -> None:
@@ -671,23 +722,36 @@ def _record_sync_outcome(payload: dict, trigger: str) -> None:
     the only honest source for "how long have we been flying blind", since the
     statement's own period end lags the fetch by a couple of days.
     """
-    ok = bool(payload.get("ok"))
+    results = payload.get("results", [])
+    # payload["ok"] means "at least one spec succeeded" — the right rule for
+    # the partial-success toast, the wrong one to persist as health. One
+    # account failing forever would hide behind another's success: green ✓ in
+    # the header, no banner, and last_success creeping forward the whole time.
+    ok = bool(results) and all(r.get("ok") for r in results)
     detail = "; ".join(
         f"{r.get('tag', '?')}: {'ok' if r.get('ok') else (r.get('error') or '?')}"
-        for r in payload.get("results", [])
+        for r in results
     ) or (payload.get("error") or "")
     now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    state = _read_sync_state()
-    state.update({
-        "mode": AUTO_SYNC,
-        "ok": ok,
-        "detail": detail[:500],
-        "last_run_at": now_iso,
-        "last_run_trigger": trigger,
-    })
-    if ok:
-        state["last_success"] = now_iso
-    _write_sync_state(state)
+    with _sync_state_lock:
+        state = _read_sync_state()
+        # Pre-upgrade state files carry ok/last_attempt but no last_success.
+        # Without this, the first failure after a deploy makes the banner
+        # announce "尚无成功记录" about a box that synced fine yesterday.
+        if "last_success" not in state and state.get("ok"):
+            legacy = state.get("last_run_at") or state.get("last_attempt")
+            if legacy:
+                state["last_success"] = legacy
+        state.update({
+            "mode": AUTO_SYNC,
+            "ok": ok,
+            "detail": detail[:500],
+            "last_run_at": now_iso,
+            "last_run_trigger": trigger,
+        })
+        if ok:
+            state["last_success"] = now_iso
+        _write_sync_state(state)
 
 
 def _auto_sync_loop() -> None:
@@ -704,24 +768,23 @@ def _auto_sync_loop() -> None:
                 continue
             # Stamp the attempt BEFORE running: a crash mid-pull must not
             # turn into a retry loop against a throttled endpoint.
-            today = now.date().isoformat()
-            _write_sync_state({**state, "last_attempt_date": today,
-                               "last_attempt": now.isoformat(timespec="seconds")})
+            prev = _stamp_sync_attempt(now)
             payload, status = _run_refresh("auto")
             if status == 429:
                 # Our OWN throttle/lock refused — zero requests reached IBKR,
                 # so this must not consume the day's single attempt (a button
                 # press at 08:57 would otherwise skip a whole daily/weekly
-                # slot). Restore the state VERBATIM; the next 60s tick retries
-                # once the cool-down passes. The one-attempt-per-day rule
-                # guards IBKR quota, and this branch never spent any.
+                # slot). Roll the attempt marker back; the next 60s tick
+                # retries once the cool-down passes. The one-attempt-per-day
+                # rule guards IBKR quota, and this branch never spent any.
                 #
                 # Writing a fresh last_attempt here would be a lie in the
                 # header: ok/detail still describe the PREVIOUS run, so the
                 # top bar would pair a just-now timestamp with an older ✓ and
-                # claim a sync that never reached IBKR. prev_date is implicit
-                # in `state` — no field of it changed.
-                _write_sync_state(state)
+                # claim a sync that never reached IBKR. Only the two attempt
+                # fields are rolled back — whoever refused us is very likely a
+                # button pass still in flight, and its outcome must survive.
+                _restore_sync_attempt(prev)
                 continue
             if status != 200:
                 # A pass that never reached _refresh_work (bad ACCOUNTS, say)

@@ -605,8 +605,13 @@ function render(data) {
     // scheduler's slot marker alone, so preferring it would pair a stale
     // timestamp with a verdict from a run minutes ago.
     const ran = sync.last_run_at || sync.last_attempt;
+    // Name the trigger that actually ran. Labelling a button press 自动同步
+    // would turn a manual refresh into proof the scheduler is alive, which is
+    // the single question this line exists to answer.
+    const ranBy = sync.last_run_trigger === "button"
+      ? "手动刷新" : `自动同步(${cadence})`;
     syncLabel = ran
-      ? `自动同步(${cadence}) ${ran.slice(5, 16).replace("T", " ")}Z ${sync.ok ? "✓" : "✗"}`
+      ? `${ranBy} ${ran.slice(5, 16).replace("T", " ")}Z ${sync.ok ? "✓" : "✗"}`
       : `自动同步(${cadence}) 待首跑`;
   }
   const line = $("account-line");
@@ -2754,6 +2759,13 @@ function showToast(kind, title, detail = "", durationMs = 4500) {
 // server's state rather than this tab's memory of it.
 let refreshPollTimer = null;
 let trackedRunId = null;
+// Poll generation. The load-time resume and a button press can both start a
+// poll, and clearTimeout only cancels a pending timer — never a request
+// already in flight. An older in_progress response landing after a newer poll
+// saw completion would re-adopt the finished run, put the spinner back, and
+// report the same outcome twice. Every poll takes a ticket; stale tickets drop
+// their response before touching any shared state.
+let refreshPollGen = 0;
 
 function setRefreshBusy(busy, label) {
   const btn = $("refresh-btn");
@@ -2785,11 +2797,14 @@ function reportRefreshOutcome(last) {
 
 async function pollRefreshStatus() {
   clearTimeout(refreshPollTimer);
+  const gen = ++refreshPollGen;
   let st;
   try {
     const res = await fetch("/api/refresh/status");
     st = await res.json();
+    if (gen !== refreshPollGen) return;   // superseded while in flight
   } catch (exc) {
+    if (gen !== refreshPollGen) return;
     // A dropped poll says nothing about the pass — it is running on the
     // server either way. Keep watching instead of declaring failure.
     refreshPollTimer = setTimeout(pollRefreshStatus, 5000);
@@ -2873,6 +2888,9 @@ async function resumeRefreshWatch() {
   try {
     const st = await (await fetch("/api/refresh/status")).json();
     if (!st.in_progress) return;
+    // A button press during this fetch already adopted the pass; re-adopting
+    // it here would start a second poll chain against the same run.
+    if (trackedRunId !== null) return;
     trackedRunId = st.run_id;
     pollRefreshStatus();
   } catch (exc) {
@@ -2900,15 +2918,33 @@ const daysSinceYMD = (ymd) => ymd === null || ymd === undefined
   ? null
   : Math.floor((Date.now() - Date.UTC(ymd.y, ymd.m - 1, ymd.d)) / 86400000);
 
+// The oldest as-of across every period in the string, not the first one.
+// Single accounts carry one period; the merged ALL view joins the distinct
+// ones with " / " (see mergeAccounts), and parsePeriodBounds only ever returns
+// the first match — so a freshly-synced account would hide a stale one, while
+// the merged NAV is truncated to the stalest account anyway.
+//
+// Parsing goes through the shared parser rather than a split on the arrow:
+// Activity uploads spell the window "January 1, 2026 - June 30, 2026", and
+// matching only the ISO form is the exact bug parsePeriodBounds exists to stop.
+function oldestPeriodEnd(period) {
+  const ends = String(period || "")
+    .split(" / ")
+    .map(one => {
+      const b = parsePeriodBounds(one);
+      return b ? b[1] : null;
+    })
+    .filter(Boolean);
+  if (!ends.length) return null;
+  const key = (d) => Date.UTC(d.y, d.m - 1, d.d);
+  return ends.reduce((a, b) => (key(a) <= key(b) ? a : b));
+}
+
 function renderStaleBanner(data) {
   const el = $("stale-banner");
   if (!el) return;
   const sync = currentDataRef.sync;
-  // Through the shared parser, not a split on the arrow: Activity uploads
-  // spell the window "January 1, 2026 - June 30, 2026", and matching only the
-  // ISO form is the exact bug parsePeriodBounds was written to stop.
-  const bounds = parsePeriodBounds((data.statement || {}).Period || "");
-  const asOf = bounds ? bounds[1] : null;
+  const asOf = oldestPeriodEnd((data.statement || {}).Period || "");
   const dataAge = daysSinceYMD(asOf);
   const syncAge = daysSinceYMD(ymdFromISO(sync && sync.last_success));
   const syncFailing = !!(sync && sync.ok === false);
