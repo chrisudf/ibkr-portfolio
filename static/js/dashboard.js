@@ -2947,7 +2947,15 @@ function renderStaleBanner(data) {
   const asOf = oldestPeriodEnd((data.statement || {}).Period || "");
   const dataAge = daysSinceYMD(asOf);
   const syncAge = daysSinceYMD(ymdFromISO(sync && sync.last_success));
-  const syncFailing = !!(sync && sync.ok === false);
+  // A failed run is only news if no success has followed it. Today's proof:
+  // 2026-09-05 the scheduler synced fine at 06:12, then a manual retry at
+  // 11:21 bounced off IBKR's per-query throttle (1001) — nothing was wrong,
+  // the data on screen was current, and the button's own toast had already
+  // said so. Painting the whole page red for that is how a banner earns the
+  // right to be ignored, which costs exactly the断更 this one exists to catch.
+  // Never succeeded (syncAge null) still counts as failing.
+  const syncFailing = !!(sync && sync.ok === false)
+    && (syncAge === null || syncAge >= 1);
 
   const parts = [];
   if (dataAge !== null && dataAge >= STALE_AFTER_DAYS) {

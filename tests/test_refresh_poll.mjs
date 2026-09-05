@@ -244,3 +244,84 @@ test("合并视图取最旧的 as-of —— 新账号不该把陈旧的那个挡
   // 读不出两个日期的兜底期间：不猜，交给 banner 跳过这一半。
   assert.equal(oldestPeriodEnd("截至 2026-08-28"), null);
 });
+
+
+// ---- 告警条 ----------------------------------------------------------------
+// renderStaleBanner 不纯（$ / currentDataRef），所以整块连同它依赖的日期助手
+// 一起塞进 new Function，只把 $ 和 currentDataRef 换成可观测的 stub。
+function extractBannerBlock() {
+  const start = src.indexOf("const STALE_AFTER_DAYS = 3;");
+  const fnStart = src.indexOf("function renderStaleBanner(data) {");
+  if (start < 0 || fnStart < 0) throw new Error("cannot locate the banner block");
+  // 收尾用正则找行首的 } —— Windows 检出下工作区是 CRLF，字面量 "\n}\n" 永远
+  // 找不到。上面 extract()/extractConst() 里的 [\s\S]*? 恰好能吃掉 \r，所以它
+  // 们没踩到这个坑。
+  const m = /\r?\n\}\r?\n/.exec(src.slice(fnStart));
+  if (!m) throw new Error("cannot find the end of renderStaleBanner");
+  return src.slice(start, fnStart + m.index + m[0].length);
+}
+
+// 相对今天算，避开对 Date.now 打桩。UTC 口径和 daysSinceYMD 一致。
+const dayOffset = (n) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
+
+function bannerSandbox({ sync, period }) {
+  const el = { hidden: null, className: "", textContent: "", title: "" };
+  const build = new Function("stubs", `
+    const { $, currentDataRef } = stubs;
+    ${extractConst("MONTH_NUM")}
+    ${extractConst("parsePeriodBounds")}
+    ${extractBannerBlock()}
+    return renderStaleBanner;
+  `);
+  build({ $: () => el, currentDataRef: { sync } })({ statement: { Period: period } });
+  return el;
+}
+
+test("当天同步成功、随后手点失败：不报红 —— 数据是新的，什么都没坏", () => {
+  // 2026-09-05 的真实情形：06:12 调度同步成功，11:21 手点撞上 IBKR 的
+  // per-query 节流回 1001。按钮自己的 toast 已经说过了，面板不该再报警。
+  const el = bannerSandbox({
+    period: `2025-09-05 → ${dayOffset(1)}`,
+    sync: { ok: false, last_success: `${dayOffset(0)}T06:12:00+00:00`, detail: "1001" },
+  });
+  assert.equal(el.hidden, true);
+});
+
+test("失败且已经跨过一个调度周期：报红 —— 这才是断更", () => {
+  const el = bannerSandbox({
+    period: `2025-09-05 → ${dayOffset(8)}`,
+    sync: { ok: false, last_success: `${dayOffset(5)}T06:00:00+00:00`, detail: "1019" },
+  });
+  assert.equal(el.hidden, false);
+  assert.match(el.className, /bad/);
+  assert.match(el.textContent, /数据停留在/);
+  assert.match(el.textContent, /最近一次成功 5 天前/);
+});
+
+test("数据旧但同步正常：只说数据旧，不涂成失败色", () => {
+  // 报表期间本来就滞后（比如 query 的窗口结束在几天前），这不是管子断了。
+  const el = bannerSandbox({
+    period: `2025-09-05 → ${dayOffset(8)}`,
+    sync: { ok: true, last_success: `${dayOffset(0)}T06:00:00+00:00` },
+  });
+  assert.equal(el.hidden, false);
+  assert.doesNotMatch(el.className, /bad/);
+  assert.doesNotMatch(el.textContent, /同步失败中/);
+});
+
+test("从来没成功过：即使今天刚失败也要报", () => {
+  const el = bannerSandbox({
+    period: `2025-09-05 → ${dayOffset(1)}`,
+    sync: { ok: false },
+  });
+  assert.equal(el.hidden, false);
+  assert.match(el.textContent, /尚无成功记录/);
+});
+
+test("一切正常：不出现", () => {
+  const el = bannerSandbox({
+    period: `2025-09-05 → ${dayOffset(1)}`,
+    sync: { ok: true, last_success: `${dayOffset(0)}T06:00:00+00:00` },
+  });
+  assert.equal(el.hidden, true);
+});
