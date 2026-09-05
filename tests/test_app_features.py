@@ -315,11 +315,11 @@ def test_failed_fetch_still_stamps_the_cooldown():
 def test_poll_budget_is_bounded_on_both_sides():
     from parser.flex_fetch import BUDGET_CEILING_SEC, FLEX_BUDGET_SEC
 
-    # Floor: real statements came back 1019 ("still generating") past 300s
-    # twice, and past 600s four times across 2026-09-01..04. The shipped
-    # default sits at 600 only because the true generation time is still
-    # unmeasured — it is the last known floor, not a fix.
-    assert FLEX_BUDGET_SEC >= 600
+    # Floor: the generation time is measured now — 696s on 2026-09-05, after
+    # four scheduled syncs died at the old 600s budget about ninety seconds
+    # short. A budget at or under that watermark reinstates the outage, so the
+    # floor is the measurement itself with room over it.
+    assert FLEX_BUDGET_SEC > 696
     # Ceiling: the old 900s cap existed because the fetch blocked a request
     # thread. /api/refresh hands the pass to a background thread now, so the
     # only reason left to cap is that a mistyped env must not wedge a refresh
@@ -484,14 +484,14 @@ def test_poll_budget_env_override_is_clamped(monkeypatch):
     monkeypatch.setenv("FLEX_MAX_POLLS", "99999")
     monkeypatch.setenv("FLEX_POLL_INTERVAL", "nonsense")
     mod = importlib.reload(flex_fetch)
-    assert mod.FLEX_POLL_INTERVAL == 5.0
+    assert mod.FLEX_POLL_INTERVAL == 15.0
     assert mod.FLEX_BUDGET_SEC <= mod.BUDGET_CEILING_SEC
     assert mod.FLEX_CONFIG_NOTES, "a corrected value has to be visible in the log"
 
     monkeypatch.delenv("FLEX_MAX_POLLS")
     monkeypatch.delenv("FLEX_POLL_INTERVAL")
     mod = importlib.reload(flex_fetch)
-    assert mod.FLEX_BUDGET_SEC == 600, "the shipped default must not move by accident"
+    assert mod.FLEX_BUDGET_SEC == 1800, "the shipped default must not move by accident"
     assert mod.FLEX_CONFIG_NOTES == []
 
 
@@ -507,8 +507,8 @@ def test_poll_budget_env_survives_nan_and_quotes(monkeypatch):
     # repo's own bar (_parse_sync_hour): a typo'd env degrades, never crashes.
     monkeypatch.setenv("FLEX_POLL_INTERVAL", "nan")
     mod = importlib.reload(flex_fetch)
-    assert mod.FLEX_POLL_INTERVAL == 5.0
-    assert mod.FLEX_BUDGET_SEC == 600
+    assert mod.FLEX_POLL_INTERVAL == 15.0
+    assert mod.FLEX_BUDGET_SEC == 1800
     assert mod.FLEX_CONFIG_NOTES, "a corrected value has to be visible in the log"
 
     # sync.env.example writes every value quoted; if the quotes reach the
@@ -522,7 +522,7 @@ def test_poll_budget_env_survives_nan_and_quotes(monkeypatch):
     monkeypatch.delenv("FLEX_MAX_POLLS")
     monkeypatch.delenv("FLEX_POLL_INTERVAL")
     mod = importlib.reload(flex_fetch)
-    assert mod.FLEX_BUDGET_SEC == 600
+    assert mod.FLEX_BUDGET_SEC == 1800
     assert mod.FLEX_CONFIG_NOTES == []
 
 
