@@ -264,16 +264,22 @@ function extractBannerBlock() {
 // 相对今天算，避开对 Date.now 打桩。UTC 口径和 daysSinceYMD 一致。
 const dayOffset = (n) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
 
-function bannerSandbox({ sync, period }) {
+function bannerSandbox({ sync, period, nowMs }) {
   const el = { hidden: null, className: "", textContent: "", title: "" };
+  // 冻结时钟才能测跨午夜：只有 now/parse/UTC 被用到。
+  const Real = Date;
+  const clock = nowMs === undefined ? Real : Object.assign(
+    function (...a) { return new Real(...a); },
+    { now: () => nowMs, parse: Real.parse, UTC: Real.UTC });
   const build = new Function("stubs", `
-    const { $, currentDataRef } = stubs;
+    const { $, currentDataRef, Date } = stubs;
     ${extractConst("MONTH_NUM")}
     ${extractConst("parsePeriodBounds")}
     ${extractBannerBlock()}
     return renderStaleBanner;
   `);
-  build({ $: () => el, currentDataRef: { sync } })({ statement: { Period: period } });
+  build({ $: () => el, currentDataRef: { sync }, Date: clock })(
+    { statement: { Period: period } });
   return el;
 }
 
@@ -282,7 +288,10 @@ test("当天同步成功、随后手点失败：不报红 —— 数据是新的
   // per-query 节流回 1001。按钮自己的 toast 已经说过了，面板不该再报警。
   const el = bannerSandbox({
     period: `2025-09-05 → ${dayOffset(1)}`,
-    sync: { ok: false, last_success: `${dayOffset(0)}T06:12:00+00:00`, detail: "1001" },
+    sync: {
+      ok: false, mode: "daily", last_run_trigger: "button",
+      last_success: `${dayOffset(0)}T06:12:00+00:00`, detail: "1001",
+    },
   });
   assert.equal(el.hidden, true);
 });
@@ -290,7 +299,10 @@ test("当天同步成功、随后手点失败：不报红 —— 数据是新的
 test("失败且已经跨过一个调度周期：报红 —— 这才是断更", () => {
   const el = bannerSandbox({
     period: `2025-09-05 → ${dayOffset(8)}`,
-    sync: { ok: false, last_success: `${dayOffset(5)}T06:00:00+00:00`, detail: "1019" },
+    sync: {
+      ok: false, mode: "daily", last_run_trigger: "auto",
+      last_success: `${dayOffset(5)}T06:00:00+00:00`, detail: "1019",
+    },
   });
   assert.equal(el.hidden, false);
   assert.match(el.className, /bad/);
@@ -312,7 +324,7 @@ test("数据旧但同步正常：只说数据旧，不涂成失败色", () => {
 test("从来没成功过：即使今天刚失败也要报", () => {
   const el = bannerSandbox({
     period: `2025-09-05 → ${dayOffset(1)}`,
-    sync: { ok: false },
+    sync: { ok: false, mode: "daily", last_run_trigger: "button" },
   });
   assert.equal(el.hidden, false);
   assert.match(el.textContent, /尚无成功记录/);
@@ -322,6 +334,49 @@ test("一切正常：不出现", () => {
   const el = bannerSandbox({
     period: `2025-09-05 → ${dayOffset(1)}`,
     sync: { ok: true, last_success: `${dayOffset(0)}T06:00:00+00:00` },
+  });
+  assert.equal(el.hidden, true);
+});
+
+test("跨午夜的手点失败：23:59 成功、00:01 失败 —— 实际只隔两分钟，不该报红", () => {
+  // 按 UTC 日历天算的话这是「1 天前」，宽限期立刻失效，刚修掉的假阳性就从
+  // 午夜绕了回来。宽限期按真实经过毫秒算，两分钟远不到一个调度周期。
+  const el = bannerSandbox({
+    nowMs: Date.UTC(2026, 8, 6, 0, 1, 0),
+    period: "2025-09-06 → 2026-09-05",
+    sync: {
+      ok: false, mode: "daily", last_run_trigger: "button",
+      last_success: "2026-09-05T23:59:00+00:00", detail: "1001",
+    },
+  });
+  assert.equal(el.hidden, true);
+});
+
+test("调度器当天失败：即使几小时前刚成功过也要报 —— 管子漏了一个周期", () => {
+  // 手点失败可以是节流；调度失败就是这条管子本身没跑成，那正是这个条要抓的。
+  const el = bannerSandbox({
+    nowMs: Date.UTC(2026, 8, 6, 11, 0, 0),
+    period: "2025-09-06 → 2026-09-05",
+    sync: {
+      ok: false, mode: "daily", last_run_trigger: "auto",
+      last_success: "2026-09-06T06:00:00+00:00", detail: "1019",
+    },
+  });
+  assert.equal(el.hidden, false);
+  assert.match(el.className, /bad/);
+  // 不到一天的间隔用小时说，"0 天前" 既难看又没信息。
+  assert.match(el.textContent, /最近一次成功 5 小时前/);
+});
+
+test("weekly 模式：手点失败、上次成功 3 天前 —— 还没到一个周期，不报", () => {
+  // 按天判定的话 3 >= 1 就报了，等于提前大半个周期宣布这条管子坏了。
+  const el = bannerSandbox({
+    nowMs: Date.UTC(2026, 8, 9, 12, 0, 0),
+    period: "2025-09-09 → 2026-09-08",
+    sync: {
+      ok: false, mode: "weekly", last_run_trigger: "button",
+      last_success: "2026-09-06T12:00:00+00:00", detail: "1001",
+    },
   });
   assert.equal(el.hidden, true);
 });

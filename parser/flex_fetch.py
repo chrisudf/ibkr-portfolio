@@ -119,11 +119,18 @@ def _find_tag(body: str, tag: str) -> Optional[str]:
 #     -------------------------------------
 #               696 seconds
 #
-# That is 96 seconds past the 600s budget this file shipped before, which is
-# the whole of the 2026-09-01..05 outage: four scheduled syncs and one button
-# press all died about a minute and a half short of a statement that was
-# going to arrive. Not a broken query, not a lockout — a budget slightly too
-# small, and a 1019 that looks identical either way.
+# That is 96 seconds past the 600s budget this file shipped before. What that
+# measurement establishes, precisely: the old budget was smaller than at least
+# one real generation of this query.
+#
+# It does NOT establish that the 2026-09-01..04 attempts were also 96 seconds
+# short. Those four were cut off by us at 600s and their remaining time was
+# never observed — given the spread below they could have been seconds away or
+# far longer. "The budget was too small" is the best explanation we have for
+# them and it is now known to be possible, but it stays an inference; the
+# 1019 they returned looks identical whether the statement was one minute away
+# or thirty. Worth keeping straight, because if the next outage survives 1800s
+# it means this inference was wrong and the cause is elsewhere.
 #
 # So why 1800 and not, say, 800? Because the spread is the real finding, not
 # the mean. The same query on the same two accounts:
@@ -132,9 +139,9 @@ def _find_tag(body: str, tag: str) -> Optional[str]:
 #     2026-08-31     24s
 #     2026-09-05    696s
 #
-# 24s to 696s is a 29x spread with no visible cause, and the trend across the
-# window is upward. Sizing to the observed maximum plus a bit would just book
-# the next outage; 1800s is ~2.6x the worst seen. The cost of being generous
+# 24s to 696s is a 29x spread with no visible cause, and the three points we
+# have are too few to call a trend. Sizing to the observed maximum plus a bit
+# would just book the next outage; 1800s is ~2.6x the worst seen. The cost of being generous
 # is now close to zero — /api/refresh hands the pass to a background thread,
 # so a long budget occupies no request thread and no browser is waiting on it.
 # The only price is a longer wait on the day IBKR is genuinely stuck, which is

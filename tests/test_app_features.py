@@ -315,10 +315,11 @@ def test_failed_fetch_still_stamps_the_cooldown():
 def test_poll_budget_is_bounded_on_both_sides():
     from parser.flex_fetch import BUDGET_CEILING_SEC, FLEX_BUDGET_SEC
 
-    # Floor: the generation time is measured now — 696s on 2026-09-05, after
-    # four scheduled syncs died at the old 600s budget about ninety seconds
-    # short. A budget at or under that watermark reinstates the outage, so the
-    # floor is the measurement itself with room over it.
+    # Floor: one real generation of this query was measured at 696s on
+    # 2026-09-05. (The 2026-09-01..04 attempts were cut off by us at 600s, so
+    # how much longer they needed is unknown — the floor rests on the measured
+    # run alone.) A budget at or under that watermark is known to be too small
+    # for at least one real statement.
     assert FLEX_BUDGET_SEC > 696
     # Ceiling: the old 900s cap existed because the fetch blocked a request
     # thread. /api/refresh hands the pass to a background thread now, so the
