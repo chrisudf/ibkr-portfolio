@@ -21,7 +21,9 @@ from threading import Lock
 from flask import Flask, jsonify, render_template, request
 
 from parser import parse_ibkr_auto, parse_ibkr_pdf
-from parser.flex_fetch import FlexFetchError, fetch_one, parse_accounts_env
+from parser.flex_fetch import (FLEX_BUDGET_SEC, FLEX_CONFIG_NOTES,
+                               FLEX_MAX_POLLS, FLEX_POLL_INTERVAL,
+                               FlexFetchError, fetch_one, parse_accounts_env)
 from parser.ibkr_flex_csv import describe_sections
 from parser.snapshots import load_snapshots, record_snapshot
 
@@ -44,6 +46,14 @@ _gunicorn_logger = logging.getLogger("gunicorn.error")
 if _gunicorn_logger.handlers:
     app.logger.handlers = _gunicorn_logger.handlers
 app.logger.setLevel(logging.INFO)
+
+# The budget is env-tunable now, so the number that will actually govern
+# tonight's syncs has to be readable without guessing which env reached the
+# container. Clamp notes first — a corrected value is worth a WARNING.
+for _note in FLEX_CONFIG_NOTES:
+    app.logger.warning("[flex-config] %s", _note)
+app.logger.info("[flex-config] poll budget %ss (%s polls x %ss)",
+                FLEX_BUDGET_SEC, FLEX_MAX_POLLS, FLEX_POLL_INTERVAL)
 
 # Minimum gap between /api/refresh attempts (gating is on attempt-start,
 # regardless of success or failure). Prevents button-spam from chewing
@@ -70,7 +80,19 @@ REFRESH_MIN_INTERVAL_SEC = 5 * 60
 # Gunicorn worker (threads share this dict). Adding workers would need a
 # cross-process lock (file lock / redis) instead.
 # last_finished starts at 0.0 so the first refresh after a boot is never held.
-_refresh_state = {"last_finished": 0.0, "in_progress": False}
+_refresh_state = {
+    "last_finished": 0.0,
+    "in_progress": False,
+    "started_at": 0.0,
+    "trigger": "",
+    # Monotonic id per claimed pass. The button keeps the id it started, so a
+    # completed result can be told apart from one left over by an earlier run
+    # (or by the scheduler) — otherwise a page reload replays a stale toast.
+    "run_id": 0,
+    "last_result": None,
+    "last_result_at": "",
+    "last_result_run_id": 0,
+}
 _refresh_lock = Lock()
 
 # Account ids become filenames (uploads/{id}.json) and come from parsed
@@ -351,98 +373,231 @@ def put_position_settings():
     return jsonify(payload)
 
 
-def _run_refresh(trigger: str) -> tuple[dict, int]:
-    """One full IBKR sync pass — shared by the UI button and auto-sync.
+def _pass_budget_sec(specs: list) -> int:
+    """Wall-clock ceiling for a whole pass, not for one query.
 
-    Reads accounts config from the ACCOUNTS env var, fetches every account
-    serially, parses each CSV through parse_ibkr_auto and writes per-account
-    JSON. Returns (payload, http_status); the payload carries a per-account
-    result map so callers can report partial success. Button and scheduler
-    share the same lock and cool-down, so they can never hit IBKR
-    concurrently or in quick succession.
+    _refresh_work fetches specs serially and each fetch_one gets the FULL
+    per-query budget, so two accounts can burn twice FLEX_BUDGET_SEC. The
+    button prints this number as "最长 N"; advertising the per-query figure
+    would promise 45 minutes for a pass that may legitimately run 90.
     """
+    return FLEX_BUDGET_SEC * max(1, len(specs))
+
+
+def _refresh_specs() -> tuple[list, tuple[dict, int] | None]:
+    """Resolve ACCOUNTS into specs, or the (payload, status) to return instead."""
     accounts_env = os.environ.get("ACCOUNTS", "").strip()
     if not accounts_env:
-        return {"error": "ACCOUNTS env var not configured on server"}, 500
-
+        return [], ({"error": "ACCOUNTS env var not configured on server"}, 500)
     specs = parse_accounts_env(accounts_env)
     if not specs:
-        return {"error": "ACCOUNTS env var malformed"}, 500
+        return [], ({"error": "ACCOUNTS env var malformed"}, 500)
+    return specs, None
 
-    # Throttle: refuse if another refresh is in flight or one *started* too
-    # recently (we don't care whether it succeeded — IBKR throttles by
-    # request, not by outcome). Both cases get a "wait N seconds" hint so
-    # the UI can format a friendly message rather than guessing.
+
+def _try_claim_refresh(trigger: str) -> tuple[tuple[dict, int] | None, int]:
+    """Take the single refresh slot, or explain why not.
+
+    Returns (refusal, run_id). When refusal is None the slot is ours and the
+    caller owes exactly one _release_refresh(). Refuse if another pass is in
+    flight or one *finished* too recently — we don't care whether it
+    succeeded, since IBKR throttles by request, not by outcome. Both refusals
+    carry a "wait N seconds" hint so the UI can format a friendly message
+    rather than guessing.
+    """
     now = time.time()
     with _refresh_lock:
         if _refresh_state["in_progress"]:
-            return {"error": "refresh already in progress"}, 429
+            return ({"error": "refresh already in progress",
+                     "run_id": _refresh_state["run_id"]}, 429), 0
         elapsed = now - _refresh_state["last_finished"]
         if elapsed < REFRESH_MIN_INTERVAL_SEC:
             wait = int(REFRESH_MIN_INTERVAL_SEC - elapsed)
-            return {
-                "error": f"too soon — wait {wait}s before refreshing again",
-                "retry_after_sec": wait,
-            }, 429
+            return ({"error": f"too soon — wait {wait}s before refreshing again",
+                     "retry_after_sec": wait}, 429), 0
         _refresh_state["in_progress"] = True
+        _refresh_state["started_at"] = now
+        _refresh_state["trigger"] = trigger
+        _refresh_state["run_id"] += 1
+        return None, _refresh_state["run_id"]
 
-    results: list[dict] = []
-    try:
-        for spec in specs:
-            # tag only — the UI doesn't need query ids and there's no point
-            # echoing config back out of the API.
-            entry = {"tag": spec.tag}
-            try:
-                csv_body = fetch_one(spec)
-                # A refresh you had to wait out a throttle for is worth one log
-                # line: the section list says whether the *query* carries what
-                # a panel needs (Cash Transactions for dividends, say), which
-                # no amount of re-reading the parser can tell you.
-                sections = describe_sections(csv_body)
-                app.logger.info("[%s] fetched %d bytes, sections: %s",
-                                spec.tag, len(csv_body), ", ".join(sections) or "none")
-                payload = parse_ibkr_auto(csv_body)
-                saved, skipped = _save_accounts(payload)
-                if saved:
-                    entry.update({"ok": True, "accounts": saved, "sections": sections})
-                    if skipped:
-                        entry["skipped"] = skipped
-                else:
-                    entry.update({"ok": False, "error": "statement contains no valid account ids",
-                                  "sections": sections})
-            except FlexFetchError as exc:
-                # exc.raw is IBKR's own envelope, token-redacted — the parsed
-                # code/message drop everything IBKR said around them, and that
-                # remainder is the whole point when the code list comes up short.
-                app.logger.warning("[%s] refresh failed: %s | code=%s permanent=%s | raw: %s",
-                                   spec.tag, exc, exc.code or "-", exc.permanent,
-                                   exc.raw or "<empty>")
-                entry.update({"ok": False, "error": str(exc), "code": exc.code,
-                              "permanent": exc.permanent, "raw": exc.raw})
-            except Exception as exc:  # pragma: no cover - surface parse errors
-                app.logger.exception("[%s] parse failed", spec.tag)
-                entry.update({"ok": False, "error": f"parse failed: {exc}"})
-            results.append(entry)
-    finally:
-        with _refresh_lock:
-            _refresh_state["in_progress"] = False
-            # Stamp on the way out, in finally: a fetch that raised still
-            # reached IBKR and still owes the cooldown — arguably more so,
-            # since a timeout leaves a generation running on their side.
+
+def _release_refresh(stamp: bool = True) -> None:
+    """Free the slot and (normally) stamp the cool-down.
+
+    Stamping here rather than at each call site is what makes the guarantee
+    hold for the async path too: whatever happened inside the pass, the gap
+    is owed from the moment it ended. stamp=False is for the one caller that
+    claimed but never reached IBKR (a worker thread that failed to start):
+    no request was made, so no gap is owed.
+    """
+    with _refresh_lock:
+        _refresh_state["in_progress"] = False
+        if stamp:
             _refresh_state["last_finished"] = time.time()
 
+
+def _record_refresh_result(payload: dict, trigger: str) -> None:
+    """Remember a completed pass — for /api/refresh/status and the banner."""
+    with _refresh_lock:
+        _refresh_state["last_result"] = payload
+        _refresh_state["last_result_at"] = datetime.now(timezone.utc).isoformat(
+            timespec="seconds")
+        _refresh_state["last_result_run_id"] = _refresh_state["run_id"]
+    _record_sync_outcome(payload, trigger)
+
+
+def _refresh_work(specs: list, trigger: str) -> tuple[dict, int]:
+    """One full IBKR sync pass over already-claimed specs.
+
+    Fetches every account serially, parses each CSV through parse_ibkr_auto
+    and writes per-account JSON. Returns (payload, http_status); the payload
+    carries a per-account result map so callers can report partial success.
+    Does no claiming of its own — the caller holds the slot — which is what
+    lets the synchronous scheduler and the async button share one body.
+    """
+    results: list[dict] = []
+    for spec in specs:
+        # tag only — the UI doesn't need query ids and there's no point
+        # echoing config back out of the API.
+        entry = {"tag": spec.tag}
+        try:
+            csv_body = fetch_one(spec)
+            # A refresh you had to wait out a throttle for is worth one log
+            # line: the section list says whether the *query* carries what
+            # a panel needs (Cash Transactions for dividends, say), which
+            # no amount of re-reading the parser can tell you.
+            sections = describe_sections(csv_body)
+            app.logger.info("[%s] fetched %d bytes, sections: %s",
+                            spec.tag, len(csv_body), ", ".join(sections) or "none")
+            payload = parse_ibkr_auto(csv_body)
+            saved, skipped = _save_accounts(payload)
+            if saved:
+                entry.update({"ok": True, "accounts": saved, "sections": sections})
+                if skipped:
+                    entry["skipped"] = skipped
+            else:
+                entry.update({"ok": False, "error": "statement contains no valid account ids",
+                              "sections": sections})
+        except FlexFetchError as exc:
+            # exc.raw is IBKR's own envelope, token-redacted — the parsed
+            # code/message drop everything IBKR said around them, and that
+            # remainder is the whole point when the code list comes up short.
+            app.logger.warning("[%s] refresh failed: %s | code=%s permanent=%s | raw: %s",
+                               spec.tag, exc, exc.code or "-", exc.permanent,
+                               exc.raw or "<empty>")
+            entry.update({"ok": False, "error": str(exc), "code": exc.code,
+                          "permanent": exc.permanent, "raw": exc.raw})
+        except Exception as exc:  # pragma: no cover - surface parse errors
+            app.logger.exception("[%s] parse failed", spec.tag)
+            entry.update({"ok": False, "error": f"parse failed: {exc}"})
+        results.append(entry)
+
     any_ok = any(r.get("ok") for r in results)
+    out = {"ok": any_ok, "results": results}
     app.logger.info("[refresh:%s] %s", trigger,
                     "ok" if any_ok else "all accounts failed")
-    return {"ok": any_ok, "results": results}, 200
+    _record_refresh_result(out, trigger)
+    return out, 200
+
+
+def _run_refresh(trigger: str) -> tuple[dict, int]:
+    """One full IBKR sync pass, synchronously — the scheduler's entry point.
+
+    The dashboard button takes the async route (/api/refresh) instead; both
+    go through the same slot, so they can never hit IBKR concurrently or in
+    quick succession.
+    """
+    specs, err = _refresh_specs()
+    if err:
+        return err
+    refusal, _run_id = _try_claim_refresh(trigger)
+    if refusal:
+        return refusal
+    try:
+        return _refresh_work(specs, trigger)
+    finally:
+        # Even a fetch that raised reached IBKR and still owes the gap —
+        # arguably more so, since a timeout leaves a generation running on
+        # their side.
+        _release_refresh()
 
 
 @app.post("/api/refresh")
 def refresh():
-    """On-demand IBKR sync triggered by the dashboard button."""
-    payload, status = _run_refresh("button")
-    return jsonify(payload), status
+    """Start an IBKR sync in the background and return immediately.
 
+    A pass can now outlast any browser's patience (see FLEX_BUDGET_SEC), so
+    blocking the request bought nothing but a spinner that spun for the whole
+    poll budget and a response nobody was still waiting for. Config errors
+    and the throttle are still settled synchronously — those answers are
+    instant and the button should hear them at once — and only the slow part
+    moves to a thread. Progress is read back from /api/refresh/status.
+
+    The thread is deliberately not one of gunicorn's: a pass no longer
+    occupies a request thread at all, so the UI keeps its full pool while a
+    45-minute fetch runs.
+    """
+    specs, err = _refresh_specs()
+    if err:
+        return jsonify(err[0]), err[1]
+    refusal, run_id = _try_claim_refresh("button")
+    if refusal:
+        return jsonify(refusal[0]), refusal[1]
+
+    def worker() -> None:
+        try:
+            _refresh_work(specs, "button")
+        except Exception as exc:  # pragma: no cover - must not strand the slot
+            app.logger.exception("[refresh:button] pass crashed")
+            _record_refresh_result(
+                {"ok": False,
+                 "results": [{"tag": "-", "ok": False,
+                              "error": f"internal error: {exc}"}]},
+                "button")
+        finally:
+            _release_refresh()
+
+    try:
+        threading.Thread(target=worker, daemon=True, name=f"refresh-{run_id}").start()
+    except Exception:
+        # The claim..start gap has no worker finally to lean on: if the thread
+        # never starts (fd/memory pressure), nothing would ever release the
+        # slot, and every later press — and the scheduler — would be refused
+        # "already in progress" until a restart. The synchronous path guards
+        # the same gap with try/finally; this is its async twin. No cool-down
+        # stamped: nothing reached IBKR.
+        app.logger.exception("[refresh:button] worker thread failed to start")
+        _release_refresh(stamp=False)
+        return jsonify({"error": "could not start refresh worker"}), 500
+    return jsonify({"started": True, "run_id": run_id,
+                    "budget_sec": _pass_budget_sec(specs)}), 202
+
+
+@app.get("/api/refresh/status")
+def refresh_status():
+    """Progress of the current (or most recent) sync pass.
+
+    Polled by the button while a pass runs, and read once on page load — so a
+    refresh started before a reload, or one the scheduler began with nobody
+    watching, shows a live spinner instead of a button that looks idle.
+    """
+    with _refresh_lock:
+        st = dict(_refresh_state)
+    # Recomputed rather than remembered: the answer depends only on how many
+    # accounts are configured, and a stale copy would outlive an ACCOUNTS edit.
+    specs, _err = _refresh_specs()
+    out: dict = {"in_progress": st["in_progress"],
+                 "budget_sec": _pass_budget_sec(specs)}
+    if st["in_progress"]:
+        out["run_id"] = st.get("run_id", 0)
+        out["trigger"] = st.get("trigger", "")
+        out["elapsed_sec"] = int(time.time() - (st.get("started_at") or time.time()))
+    if st.get("last_result"):
+        out["last"] = {"run_id": st.get("last_result_run_id", 0),
+                       "at": st.get("last_result_at", ""),
+                       **st["last_result"]}
+    return jsonify(out)
 
 # --- Auto-sync: the in-app replacement for the retired bash+cron path -------
 #
@@ -517,8 +672,86 @@ def _read_sync_state() -> dict:
         return {}
 
 
+# Every read-modify-write of the sync state goes through this. Two writers
+# exist — the scheduler stamping/rolling back its attempt marker, and a button
+# worker recording an outcome — and they are NOT mutually exclusive: the
+# scheduler can be refused (429) by a button pass that is still running and
+# about to write its own result. Without this, either side can read, be
+# overtaken, and write back a whole dict that erases the other's fields.
+_sync_state_lock = Lock()
+
+
 def _write_sync_state(state: dict) -> None:
     _atomic_write_json(SYNC_STATE_FILE, state)
+
+
+def _stamp_sync_attempt(now: datetime) -> dict:
+    """Claim the scheduler's slot for today. Returns the pre-stamp snapshot."""
+    with _sync_state_lock:
+        prev = _read_sync_state()
+        _write_sync_state({**prev, "last_attempt_date": now.date().isoformat(),
+                           "last_attempt": now.isoformat(timespec="seconds")})
+    return prev
+
+
+def _restore_sync_attempt(prev: dict) -> None:
+    """Undo the attempt stamp, keeping any outcome written meanwhile.
+
+    Restoring the whole snapshot would be simpler and wrong: a button worker
+    that finished during our refused attempt has already written ok/detail/
+    last_success, and a verbatim restore would throw that away — including the
+    one field the staleness banner counts from.
+    """
+    with _sync_state_lock:
+        state = _read_sync_state()
+        for key in ("last_attempt_date", "last_attempt"):
+            if key in prev:
+                state[key] = prev[key]
+            else:
+                state.pop(key, None)
+        _write_sync_state(state)
+
+
+def _record_sync_outcome(payload: dict, trigger: str) -> None:
+    """Fold a completed pass into the sync state file.
+
+    Writes the OUTCOME fields only, never last_attempt_date — that one is the
+    scheduler's once-a-day slot marker, and a button press must not eat the
+    day's automatic attempt. It should still move "when did data last actually
+    arrive", though, which is what the staleness banner reads: last_success is
+    the only honest source for "how long have we been flying blind", since the
+    statement's own period end lags the fetch by a couple of days.
+    """
+    results = payload.get("results", [])
+    # payload["ok"] means "at least one spec succeeded" — the right rule for
+    # the partial-success toast, the wrong one to persist as health. One
+    # account failing forever would hide behind another's success: green ✓ in
+    # the header, no banner, and last_success creeping forward the whole time.
+    ok = bool(results) and all(r.get("ok") for r in results)
+    detail = "; ".join(
+        f"{r.get('tag', '?')}: {'ok' if r.get('ok') else (r.get('error') or '?')}"
+        for r in results
+    ) or (payload.get("error") or "")
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with _sync_state_lock:
+        state = _read_sync_state()
+        # Pre-upgrade state files carry ok/last_attempt but no last_success.
+        # Without this, the first failure after a deploy makes the banner
+        # announce "尚无成功记录" about a box that synced fine yesterday.
+        if "last_success" not in state and state.get("ok"):
+            legacy = state.get("last_run_at") or state.get("last_attempt")
+            if legacy:
+                state["last_success"] = legacy
+        state.update({
+            "mode": AUTO_SYNC,
+            "ok": ok,
+            "detail": detail[:500],
+            "last_run_at": now_iso,
+            "last_run_trigger": trigger,
+        })
+        if ok:
+            state["last_success"] = now_iso
+        _write_sync_state(state)
 
 
 def _auto_sync_loop() -> None:
@@ -535,37 +768,36 @@ def _auto_sync_loop() -> None:
                 continue
             # Stamp the attempt BEFORE running: a crash mid-pull must not
             # turn into a retry loop against a throttled endpoint.
-            today = now.date().isoformat()
-            _write_sync_state({**state, "last_attempt_date": today,
-                               "last_attempt": now.isoformat(timespec="seconds")})
+            prev = _stamp_sync_attempt(now)
             payload, status = _run_refresh("auto")
             if status == 429:
                 # Our OWN throttle/lock refused — zero requests reached IBKR,
                 # so this must not consume the day's single attempt (a button
                 # press at 08:57 would otherwise skip a whole daily/weekly
-                # slot). Restore the state VERBATIM; the next 60s tick retries
-                # once the cool-down passes. The one-attempt-per-day rule
-                # guards IBKR quota, and this branch never spent any.
+                # slot). Roll the attempt marker back; the next 60s tick
+                # retries once the cool-down passes. The one-attempt-per-day
+                # rule guards IBKR quota, and this branch never spent any.
                 #
                 # Writing a fresh last_attempt here would be a lie in the
                 # header: ok/detail still describe the PREVIOUS run, so the
                 # top bar would pair a just-now timestamp with an older ✓ and
-                # claim a sync that never reached IBKR. prev_date is implicit
-                # in `state` — no field of it changed.
-                _write_sync_state(state)
+                # claim a sync that never reached IBKR. Only the two attempt
+                # fields are rolled back — whoever refused us is very likely a
+                # button pass still in flight, and its outcome must survive.
+                _restore_sync_attempt(prev)
                 continue
-            ok = status == 200 and bool(payload.get("ok"))
-            detail = "; ".join(
-                f"{r.get('tag', '?')}: {'ok' if r.get('ok') else (r.get('error') or '?')}"
-                for r in payload.get("results", [])
-            ) or (payload.get("error") or "")
-            _write_sync_state({
-                "mode": AUTO_SYNC,
-                "last_attempt_date": today,
-                "last_attempt": now.isoformat(timespec="seconds"),
-                "ok": ok,
-                "detail": detail[:500],
-            })
+            if status != 200:
+                # A pass that never reached _refresh_work (bad ACCOUNTS, say)
+                # recorded nothing, so the header would pair this run's fresh
+                # timestamp with the PREVIOUS run's verdict. Record it here.
+                _record_sync_outcome(payload, "auto")
+            # Otherwise the outcome fields are already in — _refresh_work wrote
+            # them through the same helper the button uses. Re-writing them
+            # here would only give the two copies room to drift; the
+            # attempt-slot fields stamped above stay exactly as they are.
+            state = _read_sync_state()
+            ok = bool(state.get("ok"))
+            detail = state.get("detail", "")
             app.logger.info("[auto-sync] %s: %s", "ok" if ok else "FAILED", detail)
         except Exception:
             app.logger.exception("[auto-sync] loop error")

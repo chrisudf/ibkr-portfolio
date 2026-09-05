@@ -601,13 +601,23 @@ function render(data) {
   let syncLabel = "";
   if (sync && sync.mode && sync.mode !== "off") {
     const cadence = sync.mode === "daily" ? "每日" : "每周";
-    syncLabel = sync.last_attempt
-      ? `自动同步(${cadence}) ${sync.last_attempt.slice(5, 16).replace("T", " ")}Z ${sync.ok ? "✓" : "✗"}`
+    // last_run_at moves for a button press too; last_attempt is the
+    // scheduler's slot marker alone, so preferring it would pair a stale
+    // timestamp with a verdict from a run minutes ago.
+    const ran = sync.last_run_at || sync.last_attempt;
+    // Name the trigger that actually ran. Labelling a button press 自动同步
+    // would turn a manual refresh into proof the scheduler is alive, which is
+    // the single question this line exists to answer.
+    const ranBy = sync.last_run_trigger === "button"
+      ? "手动刷新" : `自动同步(${cadence})`;
+    syncLabel = ran
+      ? `${ranBy} ${ran.slice(5, 16).replace("T", " ")}Z ${sync.ok ? "✓" : "✗"}`
       : `自动同步(${cadence}) 待首跑`;
   }
   const line = $("account-line");
   line.textContent = [masked, period, syncLabel].filter(Boolean).join(" · ") || "已导入";
   line.title = sync && sync.detail ? sync.detail : "";
+  renderStaleBanner(data);
 
   // KPIs
   $("kpi-nav").textContent = fmtMoney(totalNav);
@@ -2741,49 +2751,227 @@ function showToast(kind, title, detail = "", durationMs = 4500) {
   el._timer = setTimeout(() => { el.hidden = true; }, durationMs);
 }
 
+// The server runs a refresh as a background job now: POST /api/refresh
+// returns 202 the moment the pass is claimed, and the pass itself can outlive
+// the tab. So the button's job is to start one and then watch
+// /api/refresh/status. It also adopts a pass it did NOT start — one begun
+// before a reload, or by the nightly scheduler — so the spinner describes the
+// server's state rather than this tab's memory of it.
+let refreshPollTimer = null;
+let trackedRunId = null;
+// Poll generation. The load-time resume and a button press can both start a
+// poll, and clearTimeout only cancels a pending timer — never a request
+// already in flight. An older in_progress response landing after a newer poll
+// saw completion would re-adopt the finished run, put the spinner back, and
+// report the same outcome twice. Every poll takes a ticket; stale tickets drop
+// their response before touching any shared state.
+let refreshPollGen = 0;
+
+function setRefreshBusy(busy, label) {
+  const btn = $("refresh-btn");
+  btn.disabled = busy;
+  btn.classList.toggle("spinning", busy);
+  btn.querySelector(".refresh-label").textContent = busy ? (label || "同步中...") : "刷新 IBKR";
+}
+
+function fmtElapsed(sec) {
+  if (!Number.isFinite(sec) || sec < 0) return "";
+  const m = Math.floor(sec / 60), s = Math.floor(sec % 60);
+  return m ? `${m}分${String(s).padStart(2, "0")}秒` : `${s}秒`;
+}
+
+function reportRefreshOutcome(last) {
+  const ok = (last.results || []).filter(r => r.ok);
+  const failed = (last.results || []).filter(r => !r.ok);
+  const okAccts = ok.flatMap(r => r.accounts || []);
+  if (ok.length && !failed.length) {
+    showToast("success", "已更新", okAccts.join(" + ") || "数据已同步");
+  } else if (ok.length && failed.length) {
+    showToast("warn", "部分成功",
+      `成功: ${okAccts.join(", ")} / 失败: ${failed.map(f => `${f.tag} (${f.error})`).join("; ")}`);
+  } else {
+    showToast("error", "同步失败", (failed[0] || {}).error || "未知错误", 9000);
+  }
+  return ok.length > 0;
+}
+
+async function pollRefreshStatus() {
+  clearTimeout(refreshPollTimer);
+  const gen = ++refreshPollGen;
+  let st;
+  try {
+    const res = await fetch("/api/refresh/status");
+    st = await res.json();
+    if (gen !== refreshPollGen) return;   // superseded while in flight
+  } catch (exc) {
+    if (gen !== refreshPollGen) return;
+    // A dropped poll says nothing about the pass — it is running on the
+    // server either way. Keep watching instead of declaring failure.
+    refreshPollTimer = setTimeout(pollRefreshStatus, 5000);
+    return;
+  }
+  if (st.in_progress) {
+    if (trackedRunId === null) trackedRunId = st.run_id;
+    const who = st.trigger === "auto" ? "自动同步" : "同步中";
+    setRefreshBusy(true, `${who} ${fmtElapsed(st.elapsed_sec)}`);
+    refreshPollTimer = setTimeout(pollRefreshStatus, 3000);
+    return;
+  }
+  setRefreshBusy(false);
+  const last = st.last;
+  // Only speak for a pass this page was actually following — without the id,
+  // a reload would replay the last result as if it had just happened. But the
+  // gate is "not older", not "exactly equal": a tab that slept through its
+  // own run being superseded by the scheduler's next one would otherwise
+  // come back to pre-refresh numbers in silence.
+  const followed = last && trackedRunId !== null && last.run_id >= trackedRunId;
+  trackedRunId = null;
+  if (!followed) return;
+  reportRefreshOutcome(last);
+  // Reload even after a failed pass: it still wrote the sync verdict that the
+  // header ✗ and the staleness banner read, and nothing else refetches it —
+  // the page would keep showing the load-time ✓ next to a broken pipe. The
+  // portfolio files themselves are untouched by a failure, so this is safe.
+  try {
+    await loadPortfolio();
+  } catch (exc) {
+    // The sync's own outcome was just reported; what failed here is only the
+    // page's refetch. Say so — never leave a green 已更新 over stale numbers,
+    // or die as an unhandled rejection nobody sees.
+    showToast("error", "页面数据刷新失败", `${exc} — 请手动刷新页面`, 9000);
+  }
+}
+
 async function refreshFromIBKR() {
   const btn = $("refresh-btn");
   if (btn.disabled) return;
-  btn.disabled = true;
-  btn.classList.add("spinning");
-  const label = btn.querySelector(".refresh-label");
-  const origLabel = label.textContent;
-  label.textContent = "同步中...";
+  setRefreshBusy(true, "同步中...");
   try {
     const res = await fetch("/api/refresh", { method: "POST" });
     const data = await res.json();
     if (res.status === 429) {
+      // Two refusals share the status. "too soon" (retry_after_sec) really is
+      // a wait. "already in progress" means a live pass exists — the server
+      // sends its run_id precisely so this tab can adopt it instead of
+      // sitting idle next to a running sync (and missing its reload when it
+      // lands). Keep the busy state; the poll repaints the label.
+      if (data.run_id && !data.retry_after_sec) {
+        trackedRunId = data.run_id;
+        showToast("info", "已有同步在进行", "正在跟踪它的进度");
+        pollRefreshStatus();
+        return;
+      }
+      setRefreshBusy(false);
       showToast("warn", "请稍后再试", data.error || "刷新过于频繁");
       return;
     }
-    if (!res.ok) {
+    if (res.status !== 202) {
+      setRefreshBusy(false);
       showToast("error", "同步失败", data.error || `HTTP ${res.status}`);
       return;
     }
-    const ok = (data.results || []).filter(r => r.ok);
-    const failed = (data.results || []).filter(r => !r.ok);
-    const okAccts = ok.flatMap(r => r.accounts || []);
-    if (ok.length && !failed.length) {
-      showToast("success", "已更新", okAccts.join(" + ") || "数据已同步");
-    } else if (ok.length && failed.length) {
-      showToast("warn", "部分成功",
-        `成功: ${okAccts.join(", ")} / 失败: ${failed.map(f => `${f.tag} (${f.error})`).join("; ")}`);
-    } else {
-      const first = failed[0] || {};
-      showToast("error", "同步失败", first.error || "未知错误");
-    }
-    if (ok.length) await loadPortfolio();
+    trackedRunId = data.run_id;
+    const budget = fmtElapsed(data.budget_sec || 0);
+    showToast("info", "已开始同步",
+      `后台拉取中${budget ? `，最长 ${budget}` : ""} — 可以关掉页面，回来还能看到进度`);
+    pollRefreshStatus();
   } catch (exc) {
+    setRefreshBusy(false);
     showToast("error", "同步失败", String(exc));
-  } finally {
-    btn.disabled = false;
-    btn.classList.remove("spinning");
-    label.textContent = origLabel;
   }
+}
+
+// Read the server's refresh state once at load. Only adopt a pass that is
+// still running: reporting a finished one here would fire a toast for news
+// the user may have seen hours ago.
+async function resumeRefreshWatch() {
+  try {
+    const st = await (await fetch("/api/refresh/status")).json();
+    if (!st.in_progress) return;
+    // A button press during this fetch already adopted the pass; re-adopting
+    // it here would start a second poll chain against the same run.
+    if (trackedRunId !== null) return;
+    trackedRunId = st.run_id;
+    pollRefreshStatus();
+  } catch (exc) {
+    /* the button still works; nothing to recover */
+  }
+}
+
+// --- Staleness banner -----------------------------------------------------
+// Two different clocks, and the panel used to show neither prominently: how
+// old the NUMBERS are (the statement's own as-of date) and how long the pipe
+// has been broken (last successful sync). Four days of failed syncs showed up
+// only as a small ✗ in the header, which is exactly how they went unnoticed.
+const STALE_AFTER_DAYS = 3;
+
+const ymdFromISO = (str) => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(str || "");
+  return m ? { y: +m[1], m: +m[2], d: +m[3] } : null;
+};
+
+const fmtYMD = (ymd) => ymd
+  ? `${ymd.y}-${String(ymd.m).padStart(2, "0")}-${String(ymd.d).padStart(2, "0")}`
+  : "";
+
+const daysSinceYMD = (ymd) => ymd === null || ymd === undefined
+  ? null
+  : Math.floor((Date.now() - Date.UTC(ymd.y, ymd.m - 1, ymd.d)) / 86400000);
+
+// The oldest as-of across every period in the string, not the first one.
+// Single accounts carry one period; the merged ALL view joins the distinct
+// ones with " / " (see mergeAccounts), and parsePeriodBounds only ever returns
+// the first match — so a freshly-synced account would hide a stale one, while
+// the merged NAV is truncated to the stalest account anyway.
+//
+// Parsing goes through the shared parser rather than a split on the arrow:
+// Activity uploads spell the window "January 1, 2026 - June 30, 2026", and
+// matching only the ISO form is the exact bug parsePeriodBounds exists to stop.
+function oldestPeriodEnd(period) {
+  const ends = String(period || "")
+    .split(" / ")
+    .map(one => {
+      const b = parsePeriodBounds(one);
+      return b ? b[1] : null;
+    })
+    .filter(Boolean);
+  if (!ends.length) return null;
+  const key = (d) => Date.UTC(d.y, d.m - 1, d.d);
+  return ends.reduce((a, b) => (key(a) <= key(b) ? a : b));
+}
+
+function renderStaleBanner(data) {
+  const el = $("stale-banner");
+  if (!el) return;
+  const sync = currentDataRef.sync;
+  const asOf = oldestPeriodEnd((data.statement || {}).Period || "");
+  const dataAge = daysSinceYMD(asOf);
+  const syncAge = daysSinceYMD(ymdFromISO(sync && sync.last_success));
+  const syncFailing = !!(sync && sync.ok === false);
+
+  const parts = [];
+  if (dataAge !== null && dataAge >= STALE_AFTER_DAYS) {
+    parts.push(`数据停留在 ${fmtYMD(asOf)}（${dataAge} 天前）`);
+  }
+  if (syncFailing) {
+    parts.push(syncAge !== null
+      ? `同步失败中 · 最近一次成功 ${syncAge} 天前`
+      : "同步失败中 · 尚无成功记录");
+  }
+  if (!parts.length) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  el.className = "stale-banner" + (syncFailing ? " bad" : "");
+  // textContent, not innerHTML: detail carries IBKR's own error strings.
+  el.textContent = "⚠ " + parts.join("　·　");
+  el.title = (sync && sync.detail) || "";
 }
 
 document.addEventListener("DOMContentLoaded", () => {
   $("refresh-btn").addEventListener("click", refreshFromIBKR);
+  resumeRefreshWatch();
   wirePositionModal();
 
   // Core-holding rules. Like the cluster fetch below, the first render may

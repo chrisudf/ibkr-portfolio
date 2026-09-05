@@ -9,6 +9,7 @@ lockout with nothing visible on the dashboard.
 """
 from __future__ import annotations
 
+import os
 import re
 import time
 import urllib.parse
@@ -105,35 +106,75 @@ def _find_tag(body: str, tag: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
-# 10 minutes of polling, up from the 5 inherited from the retired bash script.
-# Sized against the measured normal, not padded for comfort: the last healthy
-# sync (2026-08-22) started 06:00:08 and had parsed and written both accounts
-# by 06:02 — the whole pass, generation included, inside ~2 minutes. So 5x the
-# normal, with 2x headroom over the two failures below.
+# Poll budget = FLEX_MAX_POLLS * FLEX_POLL_INTERVAL seconds. Both are
+# overridable from the environment so the budget can be moved for a night of
+# diagnosis without rebuilding the image; the defaults below (120 * 5s = 600s)
+# are what ships.
 #
-# Why it needed raising at all: on 2026-08-28/29 six consecutive syncs failed,
-# and the two that got furthest returned 1019 ("Statement generation in
-# progress") after the FULL 300s — IBKR had accepted the request and was still
-# working when we walked away. Whatever slowed it down, 2.5x the normal was no
-# longer enough of a margin.
+# History of the number: 5 minutes inherited from the retired bash script, then
+# 10 after 2026-08-28/29, sized against the measured normal — the last healthy
+# sync (2026-08-22) had parsed and written both accounts inside ~2 minutes.
 #
-# Note this is the SECOND line of defence, not the cure. The cure is that the
-# cooldown now outlasts this budget (see REFRESH_MIN_INTERVAL_SEC): walking
-# away does not stop the generation job on IBKR's side, so the next
-# SendRequest for the same query is answered 1001 ("could not be generated at
-# this time") — the shape of the other four failures. With both budgets at
-# 300s the cooldown expired at the exact moment we gave up, so every timeout
-# planted the refusal that greeted the next attempt, and the failure run
-# sustained itself across two days and three times of day.
+# That is no longer the shape of the problem. On 2026-09-01/02/03 and again on
+# 09-04 every attempt returned 1019 ("Statement generation in progress") for
+# the FULL 600s, and a probe 33 minutes after one of those gave up was refused
+# outright with 1001 — IBKR was still holding the query. So generation now runs
+# well past 10 minutes, and the honest budget is unknown until a run is allowed
+# to finish. Hence the env override: raise it for one scheduled run, read the
+# number off the log, then set the default from evidence.
 #
-# Safe to block this long: the Dockerfile runs gthread, whose heartbeat comes
-# from the accept loop rather than per-request, so a slow refresh cannot trip
-# the worker timeout and other threads keep serving the UI meanwhile. Kept to
-# 10 rather than 15 minutes because this call blocks a request thread, and a
-# budget far above the observed generation time buys nothing but a longer hang
-# on the day IBKR is genuinely stuck.
-FLEX_MAX_POLLS = 120
-FLEX_POLL_INTERVAL = 5.0
+# The old ceiling ("this call blocks a request thread") is gone: /api/refresh
+# now hands the work to a background thread and returns 202 immediately, so a
+# long budget costs a background thread, not the UI. What it still cannot
+# exceed is a sane wall-clock cap — a typo in the env must not wedge a refresh
+# for hours — so the product is clamped to BUDGET_CEILING_SEC.
+BUDGET_CEILING_SEC = 3600
+
+# Clamp notes, drained by app.py at import so a corrected value is visible in
+# the same log stream as the refreshes it will govern (a module-level logger
+# here would propagate to a root that gunicorn leaves handler-less).
+FLEX_CONFIG_NOTES: list[str] = []
+
+
+def _env_num(name: str, default, lo, hi, cast):
+    # Quotes stripped like _parse_sync_hour/_parse_sync_day in app.py:
+    # sync.env.example writes every value quoted, and not every env_file
+    # loader strips the quotes — a quoted override silently falling back to
+    # the default would defeat the diagnosis knob this exists for.
+    raw = os.environ.get(name, "").strip().strip('"').strip("'")
+    if not raw:
+        return default
+    try:
+        value = cast(raw)
+    except ValueError:
+        FLEX_CONFIG_NOTES.append(f"{name}={raw!r} is not a number; using {default}")
+        return default
+    if value != value:
+        # NaN: the one float() accepts that a comparison clamp cannot catch —
+        # it fails lo <= v <= hi into the clamp branch, but min/max pass NaN
+        # through, and int(POLLS * nan) below would crash the IMPORT. Under
+        # restart:unless-stopped that is a boot loop taking the whole
+        # dashboard down; a typo'd env must degrade, never crash.
+        FLEX_CONFIG_NOTES.append(f"{name}={raw!r} is not a number; using {default}")
+        return default
+    if not lo <= value <= hi:
+        clamped = min(max(value, lo), hi)
+        FLEX_CONFIG_NOTES.append(f"{name}={value} out of [{lo}, {hi}]; using {clamped}")
+        return clamped
+    return value
+
+
+FLEX_POLL_INTERVAL = _env_num("FLEX_POLL_INTERVAL", 5.0, 1.0, 60.0, float)
+FLEX_MAX_POLLS = _env_num("FLEX_MAX_POLLS", 120, 1, 1000, int)
+
+if FLEX_MAX_POLLS * FLEX_POLL_INTERVAL > BUDGET_CEILING_SEC:
+    _capped = int(BUDGET_CEILING_SEC // FLEX_POLL_INTERVAL)
+    FLEX_CONFIG_NOTES.append(
+        f"poll budget {int(FLEX_MAX_POLLS * FLEX_POLL_INTERVAL)}s exceeds the "
+        f"{BUDGET_CEILING_SEC}s ceiling; FLEX_MAX_POLLS capped to {_capped}")
+    FLEX_MAX_POLLS = max(1, _capped)
+
+FLEX_BUDGET_SEC = int(FLEX_MAX_POLLS * FLEX_POLL_INTERVAL)
 
 
 def fetch_one(

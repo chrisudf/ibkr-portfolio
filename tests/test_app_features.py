@@ -260,13 +260,16 @@ def test_position_settings_response_shape_is_stable(tmp_path, monkeypatch):
 # but only until someone moved the budget.
 # ---------------------------------------------------------------------------
 
-def test_cooldown_is_measured_from_attempt_end(monkeypatch):
+def test_cooldown_is_measured_from_attempt_end(tmp_path, monkeypatch):
     # However long a fetch runs, the gap owed afterwards is the same.
     import app as app_mod
 
     spec = SimpleNamespace(tag="test", token="tok", query_id="123")
     monkeypatch.setattr(app_mod, "parse_accounts_env", lambda _: [spec])
     monkeypatch.setenv("ACCOUNTS", "tok:123")
+    # A completed pass now records its outcome; keep that off the real
+    # uploads/ so the suite stays side-effect free.
+    monkeypatch.setattr(app_mod, "SYNC_STATE_FILE", tmp_path / ".auto_sync_state.json")
     clock = {"t": 10_000.0}
     monkeypatch.setattr(app_mod.time, "time", lambda: clock["t"])
 
@@ -299,23 +302,29 @@ def test_failed_fetch_still_stamps_the_cooldown():
     import app as app_mod
 
     finally_block = inspect.getsource(app_mod._run_refresh).split("finally:")[-1]
-    assert "last_finished" in finally_block, (
-        "stamp must live in finally, or a raising fetch skips the cooldown"
+    assert "_release_refresh()" in finally_block, (
+        "the release must live in finally, or a raising fetch skips the cooldown"
+    )
+    # And the release is what actually moves the clock — asserting on the
+    # finally alone would pass for a release that forgot to stamp.
+    assert "last_finished" in inspect.getsource(app_mod._release_refresh), (
+        "_release_refresh is what the finally relies on to stamp the cooldown"
     )
 
 
 def test_poll_budget_is_bounded_on_both_sides():
-    from parser.flex_fetch import FLEX_MAX_POLLS, FLEX_POLL_INTERVAL
+    from parser.flex_fetch import BUDGET_CEILING_SEC, FLEX_BUDGET_SEC
 
-    budget = FLEX_MAX_POLLS * FLEX_POLL_INTERVAL
-    # Floor: real statements came back 1019 ("still generating") at 300s twice,
-    # so the budget must stay clear of that watermark.
-    assert budget > 300
-    # Ceiling: this call blocks a request thread, and the last healthy sync
-    # generated in ~2 minutes. A budget far above the observed generation time
-    # buys nothing but a longer hang on the day IBKR is genuinely stuck — the
-    # cooldown, not a bigger budget, is what breaks the 1001 cascade.
-    assert budget <= 900
+    # Floor: real statements came back 1019 ("still generating") past 300s
+    # twice, and past 600s four times across 2026-09-01..04. The shipped
+    # default sits at 600 only because the true generation time is still
+    # unmeasured — it is the last known floor, not a fix.
+    assert FLEX_BUDGET_SEC >= 600
+    # Ceiling: the old 900s cap existed because the fetch blocked a request
+    # thread. /api/refresh hands the pass to a background thread now, so the
+    # only reason left to cap is that a mistyped env must not wedge a refresh
+    # for hours.
+    assert FLEX_BUDGET_SEC <= BUDGET_CEILING_SEC
 
 
 def test_fetch_one_defaults_track_the_module_constants():
@@ -327,3 +336,319 @@ def test_fetch_one_defaults_track_the_module_constants():
     defaults = inspect.signature(flex_fetch.fetch_one).parameters
     assert defaults["max_polls"].default == flex_fetch.FLEX_MAX_POLLS
     assert defaults["poll_interval"].default == flex_fetch.FLEX_POLL_INTERVAL
+
+
+# ---------------------------------------------------------------------------
+# Async refresh. The button used to hold the HTTP request open for the whole
+# poll budget — 10 minutes of spinner for a response nobody was still waiting
+# for. These lock the split: config errors and the throttle stay synchronous,
+# the fetch does not.
+# ---------------------------------------------------------------------------
+
+def test_refresh_returns_immediately_and_reports_progress(tmp_path, monkeypatch):
+    import threading
+    import time as time_mod
+
+    import app as app_mod
+
+    spec = SimpleNamespace(tag="test", token="tok", query_id="123")
+    monkeypatch.setattr(app_mod, "parse_accounts_env", lambda _: [spec])
+    monkeypatch.setenv("ACCOUNTS", "tok:123")
+    monkeypatch.setattr(app_mod, "SYNC_STATE_FILE", tmp_path / ".auto_sync_state.json")
+    app_mod._refresh_state.update({"last_finished": 0.0, "in_progress": False,
+                                   "last_result": None})
+
+    started, release = threading.Event(), threading.Event()
+
+    def blocking_fetch(_spec):
+        started.set()
+        release.wait(5)
+        raise RuntimeError("boom")   # the outcome is not what is under test
+
+    monkeypatch.setattr(app_mod, "fetch_one", blocking_fetch)
+    client = app_mod.app.test_client()
+
+    res = client.post("/api/refresh")
+    assert res.status_code == 202, "the button must not wait out the poll budget"
+    run_id = res.get_json()["run_id"]
+    assert started.wait(5), "the pass should be running in the background"
+
+    st = client.get("/api/refresh/status").get_json()
+    assert st["in_progress"] is True
+    assert st["run_id"] == run_id
+    assert st["trigger"] == "button"
+
+    # A second press while one is in flight is refused, never queued — two
+    # concurrent passes would defeat the point of the single slot.
+    assert client.post("/api/refresh").status_code == 429
+
+    release.set()
+    for _ in range(100):
+        st = client.get("/api/refresh/status").get_json()
+        if not st["in_progress"]:
+            break
+        time_mod.sleep(0.05)
+    assert st["in_progress"] is False
+    # The finished result carries the id the button started with, so a reload
+    # cannot mistake an older pass's outcome for its own.
+    assert st["last"]["run_id"] == run_id
+    assert st["last"]["ok"] is False
+
+
+def test_refresh_config_errors_stay_synchronous(monkeypatch):
+    import app as app_mod
+
+    monkeypatch.setenv("ACCOUNTS", "")
+    app_mod._refresh_state.update({"last_finished": 0.0, "in_progress": False})
+    res = app_mod.app.test_client().post("/api/refresh")
+    # Nothing was started, so this must not come back as an accepted 202 the
+    # UI would then poll forever.
+    assert res.status_code == 500
+    assert "ACCOUNTS" in res.get_json()["error"]
+
+
+def test_failed_thread_start_does_not_strand_the_slot(monkeypatch):
+    import app as app_mod
+
+    spec = SimpleNamespace(tag="test", token="tok", query_id="123")
+    monkeypatch.setattr(app_mod, "parse_accounts_env", lambda _: [spec])
+    monkeypatch.setenv("ACCOUNTS", "tok:123")
+    app_mod._refresh_state.update({"last_finished": 0.0, "in_progress": False})
+
+    class DeadThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(app_mod.threading, "Thread", DeadThread)
+    res = app_mod.app.test_client().post("/api/refresh")
+    assert res.status_code == 500
+    # The slot must come back: the claim..start gap has no worker finally, so
+    # without an explicit release here every later press (and the scheduler)
+    # would be told "already in progress" until the container restarts.
+    assert app_mod._refresh_state["in_progress"] is False
+    # And no cool-down owed — nothing reached IBKR, so the next press must
+    # not be made to wait out REFRESH_MIN_INTERVAL_SEC for a pass that never
+    # existed.
+    assert app_mod._refresh_state["last_finished"] == 0.0
+
+
+def test_button_outcome_does_not_consume_the_scheduler_slot(tmp_path, monkeypatch):
+    import app as app_mod
+
+    path = tmp_path / ".auto_sync_state.json"
+    monkeypatch.setattr(app_mod, "SYNC_STATE_FILE", path)
+    path.write_text(json.dumps({
+        "mode": "daily",
+        "last_attempt_date": "2026-09-04",
+        "last_attempt": "2026-09-04T06:00:00+00:00",
+    }), encoding="utf-8")
+
+    app_mod._record_sync_outcome(
+        {"ok": True, "results": [{"tag": "154914", "ok": True}]}, "button")
+    state = json.loads(path.read_text(encoding="utf-8"))
+    # The day's single automatic attempt is the scheduler's to spend; a button
+    # press at 08:57 must not skip a whole daily slot.
+    assert state["last_attempt_date"] == "2026-09-04"
+    assert state["last_attempt"] == "2026-09-04T06:00:00+00:00"
+    # But "when did data last actually arrive" is trigger-agnostic.
+    assert state["ok"] is True
+    assert state["last_run_trigger"] == "button"
+    first_success = state["last_success"]
+    assert first_success
+
+    app_mod._record_sync_outcome(
+        {"ok": False, "results": [{"tag": "154914", "ok": False, "error": "1019"}]},
+        "auto")
+    state = json.loads(path.read_text(encoding="utf-8"))
+    assert state["ok"] is False
+    # A later failure must not erase the last known-good time — it is the only
+    # thing the staleness banner can count from.
+    assert state["last_success"] == first_success
+
+
+def test_poll_budget_env_override_is_clamped(monkeypatch):
+    import importlib
+
+    from parser import flex_fetch
+
+    monkeypatch.setenv("FLEX_MAX_POLLS", "180")
+    monkeypatch.setenv("FLEX_POLL_INTERVAL", "15")
+    mod = importlib.reload(flex_fetch)
+    assert mod.FLEX_BUDGET_SEC == 2700, "a night of diagnosis needs a movable budget"
+
+    # A mistyped env must degrade to something bounded, not wedge a refresh
+    # for hours or crash the import on a droplet nobody is watching.
+    monkeypatch.setenv("FLEX_MAX_POLLS", "99999")
+    monkeypatch.setenv("FLEX_POLL_INTERVAL", "nonsense")
+    mod = importlib.reload(flex_fetch)
+    assert mod.FLEX_POLL_INTERVAL == 5.0
+    assert mod.FLEX_BUDGET_SEC <= mod.BUDGET_CEILING_SEC
+    assert mod.FLEX_CONFIG_NOTES, "a corrected value has to be visible in the log"
+
+    monkeypatch.delenv("FLEX_MAX_POLLS")
+    monkeypatch.delenv("FLEX_POLL_INTERVAL")
+    mod = importlib.reload(flex_fetch)
+    assert mod.FLEX_BUDGET_SEC == 600, "the shipped default must not move by accident"
+    assert mod.FLEX_CONFIG_NOTES == []
+
+
+def test_poll_budget_env_survives_nan_and_quotes(monkeypatch):
+    import importlib
+
+    from parser import flex_fetch
+
+    # float("nan") passes the cast AND slips through a min/max clamp (every
+    # comparison against NaN is False), so before the explicit check it
+    # reached int(POLLS * nan) and crashed the IMPORT — under
+    # restart:unless-stopped, a boot loop with no dashboard at all. The
+    # repo's own bar (_parse_sync_hour): a typo'd env degrades, never crashes.
+    monkeypatch.setenv("FLEX_POLL_INTERVAL", "nan")
+    mod = importlib.reload(flex_fetch)
+    assert mod.FLEX_POLL_INTERVAL == 5.0
+    assert mod.FLEX_BUDGET_SEC == 600
+    assert mod.FLEX_CONFIG_NOTES, "a corrected value has to be visible in the log"
+
+    # sync.env.example writes every value quoted; if the quotes reach the
+    # process, the override must still take rather than silently falling
+    # back to the default it was set to replace.
+    monkeypatch.setenv("FLEX_MAX_POLLS", '"180"')
+    monkeypatch.setenv("FLEX_POLL_INTERVAL", "'15'")
+    mod = importlib.reload(flex_fetch)
+    assert mod.FLEX_BUDGET_SEC == 2700
+
+    monkeypatch.delenv("FLEX_MAX_POLLS")
+    monkeypatch.delenv("FLEX_POLL_INTERVAL")
+    mod = importlib.reload(flex_fetch)
+    assert mod.FLEX_BUDGET_SEC == 600
+    assert mod.FLEX_CONFIG_NOTES == []
+
+
+# ---------------------------------------------------------------------------
+# Second review round. The sync state file is what the header verdict and the
+# staleness banner both read, so every one of these is a way for a broken pipe
+# to keep looking healthy.
+# ---------------------------------------------------------------------------
+
+def test_partial_success_is_not_persisted_as_healthy(tmp_path, monkeypatch):
+    import app as app_mod
+
+    path = tmp_path / ".auto_sync_state.json"
+    monkeypatch.setattr(app_mod, "SYNC_STATE_FILE", path)
+
+    # payload["ok"] is any-success — right for the partial toast, wrong to
+    # persist. One account failing forever behind another's success would keep
+    # a green ✓ in the header and suppress the banner indefinitely.
+    app_mod._record_sync_outcome({"ok": True, "results": [
+        {"tag": "aaa", "ok": True},
+        {"tag": "bbb", "ok": False, "error": "1019"},
+    ]}, "auto")
+    state = json.loads(path.read_text(encoding="utf-8"))
+    assert state["ok"] is False, "a half-broken pipe is not a healthy one"
+    assert "last_success" not in state, "a partial pass must not advance last_success"
+    assert "bbb" in state["detail"]
+
+    # All-success still counts.
+    app_mod._record_sync_outcome({"ok": True, "results": [
+        {"tag": "aaa", "ok": True},
+        {"tag": "bbb", "ok": True},
+    ]}, "auto")
+    state = json.loads(path.read_text(encoding="utf-8"))
+    assert state["ok"] is True
+    assert state["last_success"]
+
+
+def test_legacy_state_keeps_its_success_time_across_the_upgrade(tmp_path, monkeypatch):
+    import app as app_mod
+
+    path = tmp_path / ".auto_sync_state.json"
+    monkeypatch.setattr(app_mod, "SYNC_STATE_FILE", path)
+    # What a pre-upgrade droplet actually has on disk: a verdict and an attempt
+    # time, no last_success (the field did not exist yet).
+    path.write_text(json.dumps({
+        "mode": "daily",
+        "last_attempt_date": "2026-08-31",
+        "last_attempt": "2026-08-31T06:00:24+00:00",
+        "ok": True,
+        "detail": "154914: ok",
+    }), encoding="utf-8")
+
+    app_mod._record_sync_outcome(
+        {"ok": False, "results": [{"tag": "154914", "ok": False, "error": "1019"}]},
+        "auto")
+    state = json.loads(path.read_text(encoding="utf-8"))
+    assert state["ok"] is False
+    # Without the backfill the banner would announce "尚无成功记录" about a box
+    # that synced fine the day before the deploy.
+    assert state["last_success"] == "2026-08-31T06:00:24+00:00"
+
+
+def test_refused_scheduler_attempt_keeps_a_concurrent_outcome(tmp_path, monkeypatch):
+    import app as app_mod
+
+    path = tmp_path / ".auto_sync_state.json"
+    monkeypatch.setattr(app_mod, "SYNC_STATE_FILE", path)
+    path.write_text(json.dumps({
+        "mode": "daily",
+        "last_attempt_date": "2026-09-03",
+        "last_attempt": "2026-09-03T06:00:00+00:00",
+    }), encoding="utf-8")
+
+    now = datetime(2026, 9, 4, 6, 0, tzinfo=timezone.utc)
+    prev = app_mod._stamp_sync_attempt(now)
+    assert json.loads(path.read_text(encoding="utf-8"))["last_attempt_date"] == "2026-09-04"
+
+    # The refusal almost always comes FROM a button pass still in flight, and
+    # that pass lands its own outcome while we are being turned away.
+    app_mod._record_sync_outcome(
+        {"ok": True, "results": [{"tag": "154914", "ok": True}]}, "button")
+
+    app_mod._restore_sync_attempt(prev)
+    state = json.loads(path.read_text(encoding="utf-8"))
+    # The slot is given back — the day's automatic attempt was never spent.
+    assert state["last_attempt_date"] == "2026-09-03"
+    assert state["last_attempt"] == "2026-09-03T06:00:00+00:00"
+    # ...but a verbatim restore of the pre-stamp snapshot would have erased the
+    # button's result, including the only timestamp the banner counts from.
+    assert state["ok"] is True
+    assert state["last_run_trigger"] == "button"
+    assert state["last_success"]
+
+
+def test_restore_removes_the_marker_when_there_was_none(tmp_path, monkeypatch):
+    import app as app_mod
+
+    path = tmp_path / ".auto_sync_state.json"
+    monkeypatch.setattr(app_mod, "SYNC_STATE_FILE", path)
+    path.write_text(json.dumps({"mode": "daily"}), encoding="utf-8")
+
+    prev = app_mod._stamp_sync_attempt(datetime(2026, 9, 4, 6, 0, tzinfo=timezone.utc))
+    app_mod._restore_sync_attempt(prev)
+    state = json.loads(path.read_text(encoding="utf-8"))
+    # Restoring "" would read as an attempt that happened at the epoch and let
+    # _auto_sync_due compare against a date that never existed.
+    assert "last_attempt_date" not in state
+    assert "last_attempt" not in state
+
+
+def test_advertised_budget_covers_the_whole_pass(monkeypatch):
+    import app as app_mod
+    from parser.flex_fetch import FLEX_BUDGET_SEC
+
+    one = SimpleNamespace(tag="a", token="t", query_id="1")
+    two = SimpleNamespace(tag="b", token="t", query_id="2")
+    # Specs are fetched serially and each gets the FULL per-query budget, so
+    # the button's "最长 N" has to multiply — advertising 45 minutes for a pass
+    # that can legitimately run 90 is how a healthy sync looks hung.
+    assert app_mod._pass_budget_sec([one, two]) == FLEX_BUDGET_SEC * 2
+    assert app_mod._pass_budget_sec([one]) == FLEX_BUDGET_SEC
+    # No accounts configured: report one budget rather than zero.
+    assert app_mod._pass_budget_sec([]) == FLEX_BUDGET_SEC
+
+    monkeypatch.setattr(app_mod, "parse_accounts_env", lambda _: [one, two])
+    monkeypatch.setenv("ACCOUNTS", "t:1 t:2")
+    app_mod._refresh_state.update({"last_finished": 0.0, "in_progress": False})
+    st = app_mod.app.test_client().get("/api/refresh/status").get_json()
+    assert st["budget_sec"] == FLEX_BUDGET_SEC * 2
