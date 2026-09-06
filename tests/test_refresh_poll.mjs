@@ -126,17 +126,28 @@ test("在飞的 pass 被领养：busy label + 续约下一次 poll", async () =>
 });
 
 // ---- refreshFromIBKR 的 429 分支 -------------------------------------------
-function buttonSandbox(response) {
-  const calls = { toasts: [], busy: [], polls: 0 };
+function buttonSandbox({ response, preflight = { manual: { risky: false } },
+                         confirmResult = true, preflightThrows = false }) {
+  const calls = { toasts: [], busy: [], polls: 0, posts: 0, confirms: 0 };
   const stubs = {
     $: () => ({ disabled: false }),
-    fetch: async () => ({ status: response.status, json: async () => response.body }),
+    // GET = 预检，POST = 真正的刷新。分开才测得出预检有没有拦住 POST。
+    fetch: async (url, opts) => {
+      if (!opts || opts.method !== "POST") {
+        if (preflightThrows) throw new TypeError("Failed to fetch");
+        return { status: 200, json: async () => preflight };
+      }
+      calls.posts += 1;
+      return { status: response.status, json: async () => response.body };
+    },
     showToast: (kind, title, detail) => calls.toasts.push({ kind, title, detail: detail || "" }),
     setRefreshBusy: (busy, label) => calls.busy.push({ busy, label }),
     pollRefreshStatus: () => { calls.polls += 1; },
+    confirmManualRefresh: () => { calls.confirms += 1; return confirmResult; },
   };
   const build = new Function("stubs", `
-    const { $, fetch, showToast, setRefreshBusy, pollRefreshStatus } = stubs;
+    const { $, fetch, showToast, setRefreshBusy, pollRefreshStatus,
+            confirmManualRefresh } = stubs;
     let trackedRunId = null;
     ${extract("fmtElapsed")}
     ${extract("refreshFromIBKR")}
@@ -147,7 +158,7 @@ function buttonSandbox(response) {
 
 test("429 already-in-progress：领养在飞的 pass，而不是在一场活同步旁边装 idle", async () => {
   const s = buttonSandbox({
-    status: 429, body: { error: "refresh already in progress", run_id: 42 },
+    response: { status: 429, body: { error: "refresh already in progress", run_id: 42 } },
   });
   await s.run();
   assert.equal(s.tracked(), 42);
@@ -158,7 +169,7 @@ test("429 already-in-progress：领养在飞的 pass，而不是在一场活同�
 
 test("429 too-soon（带 retry_after_sec）：真的要等，不领养", async () => {
   const s = buttonSandbox({
-    status: 429, body: { error: "too soon — wait 120s", retry_after_sec: 120 },
+    response: { status: 429, body: { error: "too soon — wait 120s", retry_after_sec: 120 } },
   });
   await s.run();
   assert.equal(s.tracked(), null);
@@ -379,4 +390,51 @@ test("weekly 模式：手点失败、上次成功 3 天前 —— 还没到一�
     },
   });
   assert.equal(el.hidden, true);
+});
+
+
+// ---- 手点前的配额预检 --------------------------------------------------------
+// IBKR 每天大约只放行一次这个 query 的生成，而调度器已经占了它。手点一次
+// 不只是自己失败 —— 换来的 1001 是花掉的配额，饿死的是下一次自动同步。
+const accepted202 = { status: 202, body: { started: true, run_id: 9, budget_sec: 1800 } };
+
+test("预检说有风险、用户点取消：一个请求都不发出去", async () => {
+  const s = buttonSandbox({
+    response: accepted202,
+    preflight: { manual: { risky: true, since_sec: 3600, next_scheduled: "2026-09-07T06:00:00+00:00" } },
+    confirmResult: false,
+  });
+  await s.run();
+  assert.equal(s.calls.confirms, 1);
+  assert.equal(s.calls.posts, 0, "取消了就不该把配额花出去");
+  assert.equal(s.calls.busy.length, 0, "连按钮都不该进忙碌态");
+});
+
+test("预检说有风险、用户仍然确认：照发 —— 这是提示不是否决", async () => {
+  const s = buttonSandbox({
+    response: accepted202,
+    preflight: { manual: { risky: true, since_sec: 3600, next_scheduled: "2026-09-07T06:00:00+00:00" } },
+    confirmResult: true,
+  });
+  await s.run();
+  assert.equal(s.calls.confirms, 1);
+  assert.equal(s.calls.posts, 1);
+  assert.equal(s.tracked(), 9);
+});
+
+test("预检说没风险：不打扰，直接发", async () => {
+  const s = buttonSandbox({
+    response: accepted202,
+    preflight: { manual: { risky: false, since_sec: 90000 } },
+  });
+  await s.run();
+  assert.equal(s.calls.confirms, 0);
+  assert.equal(s.calls.posts, 1);
+});
+
+test("预检自己挂了：不能因此拦住刷新 —— 它只是建议", async () => {
+  const s = buttonSandbox({ response: accepted202, preflightThrows: true });
+  await s.run();
+  assert.equal(s.calls.confirms, 0);
+  assert.equal(s.calls.posts, 1);
 });

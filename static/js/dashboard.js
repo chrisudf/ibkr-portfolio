@@ -2842,9 +2842,32 @@ async function pollRefreshStatus() {
   }
 }
 
+// Spelled out rather than a bare "are you sure": the cost of pressing on is
+// not this refresh failing, it is tomorrow's scheduled one failing, and that
+// consequence is invisible unless it is said.
+function confirmManualRefresh(m) {
+  const next = m.next_scheduled
+    ? `${m.next_scheduled.slice(5, 16).replace("T", " ")}Z`
+    : "（自动同步未启用）";
+  return window.confirm(
+    `上次向 IBKR 发请求是 ${fmtSince((m.since_sec || 0) * 1000)}。\n\n`
+    + `实测这个 query 大约每 24 小时才放行一次生成，而且是按「上次请求」计时 —— `
+    + `现在刷新很可能直接被拒（1001），并且会占掉下一次自动同步 ${next} 的额度。\n\n`
+    + `仍然要刷新吗？`);
+}
+
 async function refreshFromIBKR() {
   const btn = $("refresh-btn");
   if (btn.disabled) return;
+  // Pre-flight. The window is inferred from observed behaviour, not
+  // documented, so this asks rather than refuses — and a pre-flight that
+  // itself fails must never be what stops a refresh.
+  try {
+    const pre = await (await fetch("/api/refresh/status")).json();
+    if (pre.manual && pre.manual.risky && !confirmManualRefresh(pre.manual)) return;
+  } catch (exc) {
+    /* advisory only */
+  }
   setRefreshBusy(true, "同步中...");
   try {
     const res = await fetch("/api/refresh", { method: "POST" });

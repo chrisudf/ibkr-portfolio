@@ -14,7 +14,7 @@ import re
 import tempfile
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 
@@ -384,6 +384,71 @@ def _pass_budget_sec(specs: list) -> int:
     return FLEX_BUDGET_SEC * max(1, len(specs))
 
 
+# IBKR's per-query throttle is undocumented. Ten observed requests against
+# this deployment's query split cleanly by the gap since the previous REQUEST
+# — not since the previous success:
+#
+#     gap >= 23h22m   accepted (reference code issued) — 6 of 6
+#     gap <= 18h39m   refused with 1001                — 4 of 4
+#
+# The real boundary is somewhere inside that bracket, so this constant is the
+# conservative end of it and the result is a HINT, never a veto: the number is
+# inferred from behaviour, and a rule that hard-blocks on an inference would
+# be wrong exactly when the user most needs to override it.
+#
+# Why it is worth surfacing at all: under a daily schedule the scheduler has
+# already claimed the day's single generation. A manual refresh inside the
+# window does not merely fail on its own — the 1001 it earns is spent quota,
+# and the next SCHEDULED run is the one that starves. 2026-09-05 11:21 (a
+# manual press) is what took out 2026-09-06 06:00.
+IBKR_QUERY_WINDOW_SEC = 23 * 3600
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value or "")
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _next_scheduled_run(now: datetime) -> datetime | None:
+    """When the scheduler will next try, or None when it is switched off."""
+    if AUTO_SYNC not in ("daily", "weekly"):
+        return None
+    at_hour = now.replace(hour=AUTO_SYNC_UTC_HOUR, minute=0, second=0, microsecond=0)
+    if AUTO_SYNC == "daily":
+        return at_hour if at_hour > now else at_hour + timedelta(days=1)
+    target = _WEEKDAY_NUM.get(AUTO_SYNC_UTC_DAY, 5)
+    for ahead in range(1, 9):
+        candidate = at_hour + timedelta(days=ahead - 1)
+        if candidate > now and candidate.weekday() == target:
+            return candidate
+    return None
+
+
+def _manual_refresh_advice(state: dict) -> dict:
+    """Would pressing the button now spend quota the scheduler is about to need?
+
+    Advisory only — see IBKR_QUERY_WINDOW_SEC. "last request" is read from the
+    sync state rather than the in-process clock so a container restart does not
+    silently reset the warning.
+    """
+    last = _parse_iso(state.get("last_run_at"))
+    if last is None:
+        return {"risky": False}
+    since = int((datetime.now(timezone.utc) - last).total_seconds())
+    if since >= IBKR_QUERY_WINDOW_SEC:
+        return {"risky": False, "since_sec": since}
+    nxt = _next_scheduled_run(datetime.now(timezone.utc))
+    return {
+        "risky": True,
+        "since_sec": since,
+        "window_sec": IBKR_QUERY_WINDOW_SEC,
+        "next_scheduled": nxt.isoformat(timespec="seconds") if nxt else "",
+    }
+
+
 def _refresh_specs() -> tuple[list, tuple[dict, int] | None]:
     """Resolve ACCOUNTS into specs, or the (payload, status) to return instead."""
     accounts_env = os.environ.get("ACCOUNTS", "").strip()
@@ -597,6 +662,11 @@ def refresh_status():
         out["last"] = {"run_id": st.get("last_result_run_id", 0),
                        "at": st.get("last_result_at", ""),
                        **st["last_result"]}
+    # Read by the button as a pre-flight: IBKR hands out about one generation
+    # of this query a day and the scheduler already has a claim on it.
+    sync_state = _read_sync_state()
+    out["last_run_at"] = sync_state.get("last_run_at", "")
+    out["manual"] = _manual_refresh_advice(sync_state)
     return jsonify(out)
 
 # --- Auto-sync: the in-app replacement for the retired bash+cron path -------
