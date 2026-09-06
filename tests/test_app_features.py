@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -653,3 +653,67 @@ def test_advertised_budget_covers_the_whole_pass(monkeypatch):
     app_mod._refresh_state.update({"last_finished": 0.0, "in_progress": False})
     st = app_mod.app.test_client().get("/api/refresh/status").get_json()
     assert st["budget_sec"] == FLEX_BUDGET_SEC * 2
+
+
+# ---------------------------------------------------------------------------
+# Manual-refresh quota warning. IBKR allows roughly one generation of the
+# query per day and the scheduler already claims it, so a manual press inside
+# the window spends what tomorrow's scheduled run needs.
+# ---------------------------------------------------------------------------
+
+def test_manual_refresh_advice_flags_a_recent_request(monkeypatch):
+    import app as app_mod
+
+    now = datetime.now(timezone.utc)
+    recent = (now - timedelta(hours=5)).isoformat(timespec="seconds")
+    advice = app_mod._manual_refresh_advice({"last_run_at": recent})
+    assert advice["risky"] is True
+    assert 4 * 3600 < advice["since_sec"] < 6 * 3600
+    assert advice["window_sec"] == app_mod.IBKR_QUERY_WINDOW_SEC
+
+    # Past the window the button is free again.
+    old = (now - timedelta(hours=25)).isoformat(timespec="seconds")
+    assert app_mod._manual_refresh_advice({"last_run_at": old})["risky"] is False
+
+    # Nothing recorded yet (fresh install): no basis to warn about.
+    assert app_mod._manual_refresh_advice({})["risky"] is False
+    # A hand-mangled timestamp must not 500 the status endpoint.
+    assert app_mod._manual_refresh_advice({"last_run_at": "not a date"})["risky"] is False
+
+
+def test_next_scheduled_run(monkeypatch):
+    import app as app_mod
+
+    monkeypatch.setattr(app_mod, "AUTO_SYNC", "daily")
+    monkeypatch.setattr(app_mod, "AUTO_SYNC_UTC_HOUR", 6)
+    before = datetime(2026, 9, 6, 3, 0, tzinfo=timezone.utc)
+    assert app_mod._next_scheduled_run(before) == datetime(2026, 9, 6, 6, 0, tzinfo=timezone.utc)
+    # Past today's hour, the next one is tomorrow — the case that matters,
+    # since the button is usually pressed after a morning failure.
+    after = datetime(2026, 9, 6, 7, 0, tzinfo=timezone.utc)
+    assert app_mod._next_scheduled_run(after) == datetime(2026, 9, 7, 6, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(app_mod, "AUTO_SYNC", "weekly")
+    monkeypatch.setattr(app_mod, "AUTO_SYNC_UTC_DAY", "sat")
+    nxt = app_mod._next_scheduled_run(datetime(2026, 9, 6, 7, 0, tzinfo=timezone.utc))
+    assert nxt.weekday() == 5 and nxt.hour == 6
+
+    monkeypatch.setattr(app_mod, "AUTO_SYNC", "off")
+    assert app_mod._next_scheduled_run(before) is None
+
+
+def test_status_endpoint_carries_the_advice(tmp_path, monkeypatch):
+    import app as app_mod
+
+    path = tmp_path / ".auto_sync_state.json"
+    monkeypatch.setattr(app_mod, "SYNC_STATE_FILE", path)
+    path.write_text(json.dumps({
+        "last_run_at": (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(
+            timespec="seconds"),
+    }), encoding="utf-8")
+    app_mod._refresh_state.update({"last_finished": 0.0, "in_progress": False})
+
+    st = app_mod.app.test_client().get("/api/refresh/status").get_json()
+    # The button pre-flights on this; without it there is nothing to warn from.
+    assert st["manual"]["risky"] is True
+    assert st["last_run_at"]
