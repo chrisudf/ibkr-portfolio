@@ -2926,7 +2926,17 @@ async function resumeRefreshWatch() {
 // old the NUMBERS are (the statement's own as-of date) and how long the pipe
 // has been broken (last successful sync). Four days of failed syncs showed up
 // only as a small ✗ in the header, which is exactly how they went unnoticed.
-const STALE_AFTER_DAYS = 3;
+//
+// The data clock counts TRADING days. The statement's as-of date only ever
+// advances on US market days, so a Friday close is three CALENDAR days old by
+// Monday morning and this banner used to fire every single weekend.
+// 2026-09-14 was one of them: the 06:00Z sync had just succeeded, the fetch
+// came back byte-identical to Saturday's (1,418,217 bytes, same section row
+// counts) because no session had happened in between, and the panel still
+// announced 「数据停留在 2026-09-11（3 天前）」. A banner that cries on a
+// schedule nobody can fix is one people learn to skip — which costs exactly
+// the outage it exists to catch.
+const STALE_AFTER_TRADING_DAYS = 3;
 
 // How long a failure is tolerated before the banner calls it an outage: one
 // scheduled cycle. Measured in elapsed milliseconds, never in calendar days —
@@ -2954,9 +2964,33 @@ const fmtYMD = (ymd) => ymd
   ? `${ymd.y}-${String(ymd.m).padStart(2, "0")}-${String(ymd.d).padStart(2, "0")}`
   : "";
 
-const daysSinceYMD = (ymd) => ymd === null || ymd === undefined
-  ? null
-  : Math.floor((Date.now() - Date.UTC(ymd.y, ymd.m - 1, ymd.d)) / 86400000);
+// Trading days strictly after `ymd`, through today. Counted in UTC to match
+// fmtYMD and the statement's own dates.
+//
+// Weekends only — deliberately no holiday calendar. Shipping one means
+// maintaining one every year, and the threshold already absorbs a single
+// holiday on its own: Labor Day leaves Tuesday morning at 2 trading days,
+// Thanksgiving leaves Friday at 2, a Christmas Friday leaves Monday at 2. It
+// takes a holiday AND a genuinely missed cycle to reach 3 — and at that point
+// the banner is right to speak up.
+const tradingDaysSinceYMD = (ymd) => {
+  if (ymd === null || ymd === undefined) return null;
+  const DAY = 86400000;
+  const start = Date.UTC(ymd.y, ymd.m - 1, ymd.d);
+  if (!Number.isFinite(start)) return null;
+  // Whole UTC days, so the count ticks at midnight instead of drifting with
+  // whatever hour the page happens to be left open.
+  const today = Math.floor(Date.now() / DAY) * DAY;
+  // A corrupt period must not turn a render into a hang; ten years of days is
+  // far past anything this panel can legitimately be showing.
+  const span = Math.min(Math.max(Math.round((today - start) / DAY), 0), 3660);
+  let n = 0;
+  for (let i = 1; i <= span; i += 1) {
+    const dow = new Date(start + i * DAY).getUTCDay();
+    if (dow !== 0 && dow !== 6) n += 1;
+  }
+  return n;
+};
 
 // The oldest as-of across every period in the string, not the first one.
 // Single accounts carry one period; the merged ALL view joins the distinct
@@ -2985,7 +3019,7 @@ function renderStaleBanner(data) {
   if (!el) return;
   const sync = currentDataRef.sync;
   const asOf = oldestPeriodEnd((data.statement || {}).Period || "");
-  const dataAge = daysSinceYMD(asOf);
+  const dataAge = tradingDaysSinceYMD(asOf);
   const sinceSuccess = sinceLastSuccessMs(sync);
   // A failed run is news when the pipe is broken, not merely when the last
   // attempt happened to fail. Two different situations:
@@ -3006,8 +3040,8 @@ function renderStaleBanner(data) {
   );
 
   const parts = [];
-  if (dataAge !== null && dataAge >= STALE_AFTER_DAYS) {
-    parts.push(`数据停留在 ${fmtYMD(asOf)}（${dataAge} 天前）`);
+  if (dataAge !== null && dataAge >= STALE_AFTER_TRADING_DAYS) {
+    parts.push(`数据停留在 ${fmtYMD(asOf)}（${dataAge} 个交易日前）`);
   }
   if (syncFailing) {
     parts.push(sinceSuccess !== null
