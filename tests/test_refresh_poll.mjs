@@ -261,7 +261,7 @@ test("合并视图取最旧的 as-of —— 新账号不该把陈旧的那个挡
 // renderStaleBanner 不纯（$ / currentDataRef），所以整块连同它依赖的日期助手
 // 一起塞进 new Function，只把 $ 和 currentDataRef 换成可观测的 stub。
 function extractBannerBlock() {
-  const start = src.indexOf("const STALE_AFTER_DAYS = 3;");
+  const start = src.indexOf("const STALE_AFTER_TRADING_DAYS = 3;");
   const fnStart = src.indexOf("function renderStaleBanner(data) {");
   if (start < 0 || fnStart < 0) throw new Error("cannot locate the banner block");
   // 收尾用正则找行首的 } —— Windows 检出下工作区是 CRLF，字面量 "\n}\n" 永远
@@ -388,6 +388,55 @@ test("weekly 模式：手点失败、上次成功 3 天前 —— 还没到一�
       ok: false, mode: "weekly", last_run_trigger: "button",
       last_success: "2026-09-06T12:00:00+00:00", detail: "1001",
     },
+  });
+  assert.equal(el.hidden, true);
+});
+
+
+test("周一早上、数据停在上周五：不报 —— 周末不产生交易日", () => {
+  // 2026-09-14 的真实情形，也是这条改动的由来：06:00Z 调度同步刚成功，
+  // 拓回来的报表和周六那次逐字节相同（中间没有任何一场交易），面板却还在
+  // 喊「数据停留在 2026-09-11（3 天前）」。按日历天算，每个周末都会这样。
+  const el = bannerSandbox({
+    nowMs: Date.UTC(2026, 8, 14, 7, 0, 0),   // 周一
+    period: "2025-09-12 → 2026-09-11",        // 上周五收盘
+    sync: { ok: true, mode: "daily", last_run_trigger: "auto",
+            last_success: "2026-09-14T06:00:57+00:00" },
+  });
+  assert.equal(el.hidden, true);
+});
+
+test("周二早上、数据仍停在上周五：2 个交易日，还不到线", () => {
+  const el = bannerSandbox({
+    nowMs: Date.UTC(2026, 8, 15, 7, 0, 0),
+    period: "2025-09-12 → 2026-09-11",
+    sync: { ok: true, mode: "daily", last_run_trigger: "auto",
+            last_success: "2026-09-15T06:00:00+00:00" },
+  });
+  assert.equal(el.hidden, true);
+});
+
+test("周三早上、数据还停在上周五：3 个交易日 —— 这才该报", () => {
+  // 同步一直在成功、数据却不往前走，正是这半句要抓的东西。
+  const el = bannerSandbox({
+    nowMs: Date.UTC(2026, 8, 16, 7, 0, 0),
+    period: "2025-09-12 → 2026-09-11",
+    sync: { ok: true, mode: "daily", last_run_trigger: "auto",
+            last_success: "2026-09-16T06:00:00+00:00" },
+  });
+  assert.equal(el.hidden, false);
+  assert.match(el.textContent, /数据停留在 2026-09-11（3 个交易日前）/);
+  assert.doesNotMatch(el.className, /bad/);
+});
+
+test("单个节假被阈值吸收：不专门维护节假日表", () => {
+  // 2026-09-07 是美国劳动节，休市，报表停在 09-04（周五）。到周二早上只过了
+  // 「劳动节 + 周二」两个工作日，没到 3 —— 这就是不上节假日日历的理由。
+  const el = bannerSandbox({
+    nowMs: Date.UTC(2026, 8, 8, 7, 0, 0),
+    period: "2025-09-05 → 2026-09-04",
+    sync: { ok: true, mode: "daily", last_run_trigger: "auto",
+            last_success: "2026-09-08T06:00:00+00:00" },
   });
   assert.equal(el.hidden, true);
 });
