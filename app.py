@@ -14,7 +14,7 @@ import re
 import tempfile
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 
@@ -24,6 +24,7 @@ from parser import parse_ibkr_auto, parse_ibkr_pdf
 from parser.flex_fetch import (FLEX_BUDGET_SEC, FLEX_CONFIG_NOTES,
                                FLEX_MAX_POLLS, FLEX_POLL_INTERVAL,
                                FlexFetchError, fetch_one, parse_accounts_env)
+from parser.dataroma import fetch_all as fetch_all_13f
 from parser.ibkr_flex_csv import describe_sections
 from parser.snapshots import load_snapshots, record_snapshot
 
@@ -371,6 +372,111 @@ def put_position_settings():
     }
     _atomic_write_json(POSITION_SETTINGS_FILE, payload, indent=2)
     return jsonify(payload)
+
+
+# ---------------------------------------------------------------------------
+# 13F superinvestor overlay
+#
+# Separate from the IBKR sync in every way that matters: a different source, a
+# different cadence (quarterly, not daily), and no quota to burn — Dataroma is
+# a public page with no throttle, so the "don't press refresh" rule that
+# governs /api/refresh does not apply here. The cache is still a file rather
+# than a per-request fetch because a full pass is ~83 managers plus
+# continuation pages, i.e. 90-150 seconds, which no page load should wear.
+# ---------------------------------------------------------------------------
+
+DATAROMA_CACHE = UPLOAD_DIR / ".dataroma_cache.json"
+
+_dataroma_lock = Lock()
+_dataroma_state: dict = {"in_progress": False, "done": 0, "total": 0,
+                         "started_at": None, "error": None, "finished_at": None}
+
+
+def _read_dataroma() -> dict | None:
+    try:
+        with DATAROMA_CACHE.open(encoding="utf-8") as fh:
+            return json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def _dataroma_work() -> None:
+    """One full scrape, then publish atomically. Runs off the request thread."""
+    def progress(done: int, total: int, _code: str) -> None:
+        with _dataroma_lock:
+            _dataroma_state["done"] = done
+            _dataroma_state["total"] = total
+
+    try:
+        data = fetch_all_13f(progress=progress)
+        _atomic_write_json(DATAROMA_CACHE, data)
+        with _dataroma_lock:
+            _dataroma_state["error"] = None
+        app.logger.info("[13f] %s: %d rows across %d managers",
+                        data.get("quarter"), data.get("row_count", 0),
+                        len(data.get("managers", [])))
+    except Exception as exc:  # noqa: BLE001 - surfaced to the UI verbatim
+        app.logger.exception("[13f] scrape failed")
+        with _dataroma_lock:
+            _dataroma_state["error"] = str(exc)
+    finally:
+        with _dataroma_lock:
+            _dataroma_state["in_progress"] = False
+            _dataroma_state["finished_at"] = time.time()
+
+
+@app.get("/api/superinvestors")
+def superinvestors():
+    """Cached 13F flows, or an empty envelope telling the UI to offer a fetch.
+
+    `stale` is quarter-based, not age-based: a cache fetched five months ago
+    is perfectly current right up until the next filing deadline passes, and
+    nagging about its age in the meantime would train the user to ignore the
+    banner that matters.
+    """
+    # Sent whole, all ~690KB of it. Trimming each ticker's actor list to the
+    # few the panel renders was tried and reverted: Caddy already gzips
+    # (`encode gzip`), which takes the body to ~104KB, and the trim only moved
+    # that to ~99KB — 5KB is not worth a projection layer that can silently
+    # drop the wrong side of a ticker.
+    data = _read_dataroma()
+    if data is None:
+        return jsonify({"empty": True})
+    due = data.get("next_due")
+    data["stale"] = bool(due and date.today().isoformat() >= due)
+    return jsonify(data)
+
+
+@app.post("/api/superinvestors/refresh")
+def superinvestors_refresh():
+    with _dataroma_lock:
+        if _dataroma_state["in_progress"]:
+            return jsonify({"error": "already in progress"}), 409
+        _dataroma_state.update({"in_progress": True, "done": 0, "total": 0,
+                                "started_at": time.time(), "error": None,
+                                "finished_at": None})
+    try:
+        threading.Thread(target=_dataroma_work, daemon=True, name="13f-scrape").start()
+    except Exception:
+        # Same claim..start gap the IBKR refresh guards: without this the slot
+        # would stay held for the life of the process and every later press
+        # would 409 with nothing actually running.
+        app.logger.exception("[13f] worker thread failed to start")
+        with _dataroma_lock:
+            _dataroma_state["in_progress"] = False
+        return jsonify({"error": "could not start 13F worker"}), 500
+    return jsonify({"started": True}), 202
+
+
+@app.get("/api/superinvestors/status")
+def superinvestors_status():
+    with _dataroma_lock:
+        st = dict(_dataroma_state)
+    out = {"in_progress": st["in_progress"], "done": st["done"],
+           "total": st["total"], "error": st["error"]}
+    if st["in_progress"] and st["started_at"]:
+        out["elapsed_sec"] = int(time.time() - st["started_at"])
+    return jsonify(out)
 
 
 def _pass_budget_sec(specs: list) -> int:

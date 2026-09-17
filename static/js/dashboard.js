@@ -721,6 +721,10 @@ function render(data) {
 
   // Realized rankings
   renderRankings(performance.by_symbol);
+
+  // 13F overlay (cache loads async from /api/superinvestors; the panel
+  // re-renders once it arrives, same pattern as clusters.json)
+  renderSuperinvestors();
 }
 
 /* ---------------------------------------------------------------------------
@@ -3116,6 +3120,36 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   attachSorters(currentDataRef);
+
+  document.querySelectorAll("#f13-mode button").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll("#f13-mode button").forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      f13Mode = btn.dataset.mode;
+      // Each view has its own meaningful default order; carrying an override
+      // across a switch would land you in a view sorted by a question you
+      // asked of a different table.
+      f13Sort = null;
+      renderSuperinvestors();
+    });
+  });
+
+  // Delegated: the 13F header is rebuilt on every render, so per-th listeners
+  // would be dropped the first time anything re-renders.
+  $("f13-head").addEventListener("click", (e) => {
+    const th = e.target.closest("th[data-f13sort]");
+    if (!th) return;
+    const key = th.dataset.f13sort;
+    const firstDir = key === "sym" ? "asc" : "desc";
+    f13Sort = (f13Sort && f13Sort.key === key)
+      ? { key, dir: f13Sort.dir === "asc" ? "desc" : "asc" }
+      : { key, dir: firstDir };
+    renderSuperinvestors();
+  });
+
+  // 13F cache: quarterly data, so it is fetched once per page load and never
+  // polled. A missing cache renders a fetch button rather than an error.
+  load13F();
 
   document.querySelectorAll("#rank-mode button").forEach(btn => {
     btn.addEventListener("click", () => {
