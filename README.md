@@ -20,7 +20,15 @@
 ### 关于「13F 对照」的口径
 
 数据是 [Dataroma](https://www.dataroma.com/m/managers.php) 整理的 **Form 13F-HR**，
-服务端抓完存在 `uploads/.dataroma_cache.json`，面板右上角「重抓」触发。
+服务端抓完存在 `uploads/.dataroma_cache.json`，面板右上角「重抓」触发，也可以命令行跑：
+
+```bash
+.venv/Scripts/python.exe scripts/fetch_dataroma.py   # Windows
+python3 scripts/fetch_dataroma.py                    # droplet
+```
+
+**不耗配额** —— Dataroma 是公开页面，没有每日生成限制，多跑一次只是不礼貌，不会有副作用。
+这跟 IBKR 那条同步链完全无关，「别手点刷新」那条规矩在这里不适用。一次约 90–150 秒。
 
 **更新节奏是跳变，不是渗出。** 13F 每季一报，**季末后 45 天**截止，落在周末或联邦假日
 顺延到下一个工作日。EDGAR 上核过：Berkshire、Lone Pine、Southeastern、Bridgewater 报

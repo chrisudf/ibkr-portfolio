@@ -1,3 +1,42 @@
+# 本地测试数据怎么更新
+
+面板上的数据分两类，来源和风险完全不同。
+
+## 1. 13F 缓存（`uploads/.dataroma_cache.json`）—— 随便跑
+
+```bash
+.venv/Scripts/python.exe scripts/fetch_dataroma.py
+```
+
+不耗任何配额，一次约 90–150 秒。面板上的「重抓」按钮走的是同一条代码路径。
+季度数据，下一次真正变化要等 13F 截止日（面板上写着日期）。
+
+## 2. IBKR 账户数据（`uploads/U*.json`）—— ⚠ 别在本地点「刷新 IBKR」
+
+**`scripts/sync.env` 里有真 token，本地跑起来「刷新 IBKR」按钮是能打通的 ——
+这正是问题所在。** IBKR 对一个 Flex query 约 24 小时只放行一次生成，按「上一次
+**请求**」计时。本地点一次，饿死的是 droplet 第二天 06:00 UTC 那次调度，而且
+你在本地什么也看不出来（换回的 `1001` 就是花掉的配额）。
+
+（`AUTO_SYNC` 默认 `off` 且 `sync.env` 没设，所以**本地启动本身不会**触发调度，
+只有手点按钮会。）
+
+**正确做法：从 droplet 把文件拷下来**，完全不碰 IBKR，拿到的还是线上一模一样的状态。
+uploads 是 docker 具名卷 `app_data`，挂在容器的 `/app/uploads`：
+
+```bash
+for f in U17456181.json U17456181.snapshots.jsonl          U22846783.json U22846783.snapshots.jsonl .position_settings.json; do
+  ssh deploy@167.71.193.42     "cd /opt/ibkr-portfolio/deploy && docker compose exec -T app cat /app/uploads/$f"     > "uploads/$f"
+done
+```
+
+`exec -T cat` 而不是 `docker compose cp`：不在 droplet 上落中间文件，也就不会忘了删。
+
+**退路**：从 IBKR 网页版导出 Activity Statement，用面板上的「上传 CSV / PDF」传进去。
+慢一点，但同样不碰 Flex 配额。
+
+---
+
 # 自动同步 IBKR 报表
 
 > **⚠ bash + cron 路径已弃用。** 自动同步现在由 app 内置调度器完成：在
