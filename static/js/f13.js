@@ -40,6 +40,23 @@ const F13_CLASS_OF = (() => {
   return map;
 })();
 
+// Tickers that showed up this quarter through a corporate action rather than
+// anyone's decision. They are indistinguishable from a real new position in
+// the data — same "Buy", same share count — so they silently top the consensus
+// list: FDXF was the single most-bought name in Q2 2026 and means nothing.
+//
+// Hand-kept, because every heuristic over-fires. "buy>=2 and no other
+// activity" catches FDXF — and also catches SPCX, which is SpaceX, a position
+// five managers actually took. There is no rule that separates those two; you
+// have to know. Add a line when you see one, that is the whole maintenance
+// story. Only the 机构在买 view is filtered — if you HOLD one of these, you
+// still want to see it.
+const F13_CORPORATE_ACTIONS = {
+  FDXF: "FDX 分拆",
+  SUNB: "Ashtead 迁册更名",
+  MRSH: "Marsh 更名",
+};
+
 let f13Mode = "holdings";
 
 const f13Fmt = {
@@ -136,11 +153,16 @@ function f13RowsGaps(flows, exposures) {
     for (const t of (F13_CLASS_OF[sym] || [sym])) held.add(t);
   }
   const out = [];
+  const skipped = [];
   for (const [tk, f] of Object.entries(flows)) {
     if (held.has(tk) || f.buy < 2) continue;
+    if (F13_CORPORATE_ACTIONS[tk]) { skipped.push(tk); continue; }
     out.push({ sym: tk, exposure: 0, flow: { ...f, net_heads: 2 * f.buy + f.add - 2 * f.sell - f.reduce } });
   }
   out.sort((a, b) => b.flow.buy - a.flow.buy || b.flow.net_heads - a.flow.net_heads);
+  // The names actually removed this quarter, not the whole list — a note
+  // that says "removed 1" and then prints three tickers reads as a bug.
+  f13RowsGaps.skipped = skipped;
   return out.slice(0, 25);
 }
 
@@ -164,23 +186,65 @@ function f13UncoveredRow(uncovered) {
 
 /* --- render ------------------------------------------------------------- */
 
+const F13_SORTABLE = 'class="num sortable" data-f13sort';
 const F13_HEADS = {
-  holdings: `<tr><th>标的</th><th class="num">你的敞口</th>
-      <th class="num f13-counts-h">建/加/减/清</th><th class="num">机构净股数</th>
-      <th class="num">净人头</th><th>主要动作方</th></tr>`,
-  exits: `<tr><th>标的</th><th class="num">你的敞口</th>
-      <th class="num f13-counts-h">建/加/减/清</th><th class="num">机构净股数</th>
-      <th class="num">净人头</th><th>主要卖方</th></tr>`,
-  gaps: `<tr><th>标的</th><th>公司</th>
-      <th class="num f13-counts-h">建/加/减/清</th><th class="num">机构净股数</th>
-      <th class="num">净人头</th><th>主要买方</th></tr>`,
+  holdings: `<tr><th class="sortable" data-f13sort="sym">标的</th>
+      <th ${F13_SORTABLE}="exposure">你的敞口</th>
+      <th class="num f13-counts-h">建/加/减/清</th>
+      <th ${F13_SORTABLE}="net_shares">机构净股数</th>
+      <th ${F13_SORTABLE}="net_heads">净人头</th><th>主要动作方</th></tr>`,
+  exits: `<tr><th class="sortable" data-f13sort="sym">标的</th>
+      <th ${F13_SORTABLE}="exposure">你的敞口</th>
+      <th class="num f13-counts-h">建/加/减/清</th>
+      <th ${F13_SORTABLE}="net_shares">机构净股数</th>
+      <th ${F13_SORTABLE}="net_heads">净人头</th><th>主要卖方</th></tr>`,
+  gaps: `<tr><th class="sortable" data-f13sort="sym">标的</th><th>公司</th>
+      <th ${F13_SORTABLE}="buy">建/加/减/清</th>
+      <th ${F13_SORTABLE}="net_shares">机构净股数</th>
+      <th ${F13_SORTABLE}="net_heads">净人头</th><th>主要买方</th></tr>`,
 };
 
+// null = whatever order the view itself produced. Each view already sorts on
+// the thing it exists to show (your book by size, exits by damage, gaps by
+// conviction), so an override is a question the reader asked, not a default
+// worth persisting — it resets when you switch views.
+let f13Sort = null;
+
+const F13_SORT_VAL = {
+  sym: (r) => r.sym,
+  exposure: (r) => r.exposure,
+  net_shares: (r) => r.flow.net_shares,
+  net_heads: (r) => r.flow.net_heads,
+  buy: (r) => r.flow.buy,
+};
+
+function f13ApplySort(rows) {
+  if (!f13Sort) return rows;
+  const val = F13_SORT_VAL[f13Sort.key];
+  if (!val) return rows;
+  const dir = f13Sort.dir === "asc" ? 1 : -1;
+  return rows.slice().sort((a, b) => {
+    const x = val(a), y = val(b);
+    if (typeof x === "string") return x.localeCompare(y) * dir;
+    return (x - y) * dir;
+  });
+}
+
 const F13_NOTES = {
-  holdings: "你持有的每个标的（正股或期权），按你的敞口从大到小。「机构净股数」= 本季建仓+加仓的股数 − 减仓+清仓的股数。",
+  holdings: "你持有的每个标的（正股或期权），默认按你的敞口从大到小 —— 点表头可以改排序。「机构净股数」= 本季建仓+加仓的股数 − 减仓+清仓的股数。",
   exits: "你还拿着、但机构本季净卖出的标的，按卖得最狠的排在最前。",
   gaps: "至少 2 家机构本季全新建仓、而你零敞口的标的（前 25）。",
 };
+
+function f13GapsNote() {
+  const skipped = f13RowsGaps.skipped || [];
+  if (!skipped.length) return "";
+  const names = skipped
+    .map(tk => `${esc(tk)}（${esc(F13_CORPORATE_ACTIONS[tk])}）`).join("、");
+  return ` 已剔除 ${skipped.length} 只公司行为造成的伪建仓：${names} ——
+    它们在数据里跟真建仓长得一模一样（同样的 Buy、同样的股数），名单在
+    <code>F13_CORPORATE_ACTIONS</code> 手工维护。`;
+}
 
 function renderSuperinvestors() {
   const body = $("f13-body"), head = $("f13-head");
@@ -223,10 +287,15 @@ function renderSuperinvestors() {
   const scale = rows.reduce((m, r) => Math.max(m, Math.abs(r.flow.net_shares)), 0);
 
   head.innerHTML = F13_HEADS[f13Mode];
+  if (f13Sort) {
+    const th = head.querySelector(`th[data-f13sort="${f13Sort.key}"]`);
+    if (th) th.insertAdjacentHTML("beforeend",
+      ` <span class="f13-sort-ind">${f13Sort.dir === "asc" ? "▲" : "▼"}</span>`);
+  }
   if (!rows.length && !uncovered.length) {
     body.innerHTML = `<tr><td colspan="6" class="f13-empty">没有符合的标的</td></tr>`;
   } else {
-    body.innerHTML = rows.map(r => {
+    body.innerHTML = f13ApplySort(rows).map(r => {
       const f = r.flow;
       // The badge names only the OTHER classes — repeating the row's own
       // ticker inside it reads as "GOOGGOOG+GOOGL".
@@ -255,7 +324,7 @@ function renderSuperinvestors() {
     + ` <button id="f13-fetch" class="link-btn" type="button">重抓</button>`;
   $("f13-fetch").addEventListener("click", fetch13F);
 
-  foot.innerHTML = F13_NOTES[f13Mode] + " " + F13_FOOT_BASE
+  foot.innerHTML = F13_NOTES[f13Mode] + (f13Mode === "gaps" ? f13GapsNote() : "") + " " + F13_FOOT_BASE
     + (behind.length ? `<br><b>${behind.length} 位管理人还没报本季</b>（${behind.map(m => esc(m.name.split(" - ")[0])).join("、")}），
        他们的旧数据已从统计中剔除，不是按上季当本季算。` : "");
 }

@@ -599,6 +599,7 @@ body.modal-open { overflow: hidden; }
    information than a trim, so they get the solid fill and the weight; add /
    reduce stay quiet. */
 .f13-counts, .f13-counts-h { white-space: nowrap; }
+.f13-sort-ind { color: var(--accent); font-size: 10px; }
 
 .f13-chip {
   display: inline-block;
