@@ -7,6 +7,9 @@
   <link rel="stylesheet" href="/static/css/style.css" />
   <script src="https://d3js.org/d3.v7.min.js" defer></script>
   <script src="/static/js/dashboard.js" defer></script>
+  <!-- 13F overlay: separate file, and deferred AFTER dashboard.js because it
+       uses its helpers ($, esc, fmtMoney, currentDataRef, showToast). -->
+  <script src="/static/js/f13.js" defer></script>
 </head>
 <body>
   <header class="topbar">
@@ -156,6 +159,26 @@
           （不报超上限）。<b>核心持仓</b>不参与判定，只是热力图上的白圈和这张表的排序优先级 ——
           下限既然是填出来的，再拿一个勾选框把它关掉只会让人填了数字却等不到提醒。
           规则在右上角「核心持仓」里改，存在服务器上（<code>uploads/.position_settings.json</code>）。</div>
+      </section>
+
+      <!-- 13F superinvestor overlay -->
+      <section class="panel" id="f13-panel">
+        <div class="panel-head">
+          <h2>13F 对照</h2>
+          <div class="seg-toggle" id="f13-mode">
+            <button data-mode="holdings" class="active">你的持仓</button>
+            <button data-mode="gaps">机构在买 · 你没有</button>
+            <button data-mode="exits">机构在清 · 你持有</button>
+          </div>
+        </div>
+        <div class="panel-note" id="f13-note" style="margin-bottom:12px"></div>
+        <div class="table-wrap">
+          <table class="holdings">
+            <thead id="f13-head"></thead>
+            <tbody id="f13-body"></tbody>
+          </table>
+        </div>
+        <div class="margin-foot" id="f13-foot"></div>
       </section>
 
       <!-- Allocation bar -->
