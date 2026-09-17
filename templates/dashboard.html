@@ -161,26 +161,6 @@
           规则在右上角「核心持仓」里改，存在服务器上（<code>uploads/.position_settings.json</code>）。</div>
       </section>
 
-      <!-- 13F superinvestor overlay -->
-      <section class="panel" id="f13-panel">
-        <div class="panel-head">
-          <h2>13F 对照</h2>
-          <div class="seg-toggle" id="f13-mode">
-            <button data-mode="holdings" class="active">你的持仓</button>
-            <button data-mode="gaps">机构在买 · 你没有</button>
-            <button data-mode="exits">机构在清 · 你持有</button>
-          </div>
-        </div>
-        <div class="panel-note" id="f13-note" style="margin-bottom:12px"></div>
-        <div class="table-wrap">
-          <table class="holdings">
-            <thead id="f13-head"></thead>
-            <tbody id="f13-body"></tbody>
-          </table>
-        </div>
-        <div class="margin-foot" id="f13-foot"></div>
-      </section>
-
       <!-- Allocation bar -->
       <section class="panel">
         <div class="panel-head">
@@ -376,6 +356,26 @@
             </table>
           </div>
         </div>
+      </section>
+
+      <!-- 13F superinvestor overlay -->
+      <section class="panel" id="f13-panel">
+        <div class="panel-head">
+          <h2>13F 对照</h2>
+          <div class="seg-toggle" id="f13-mode">
+            <button data-mode="holdings" class="active">你的持仓</button>
+            <button data-mode="gaps">机构在买 · 你没有</button>
+            <button data-mode="exits">机构在清 · 你持有</button>
+          </div>
+        </div>
+        <div class="panel-note" id="f13-note" style="margin-bottom:12px"></div>
+        <div class="table-wrap">
+          <table class="holdings">
+            <thead id="f13-head"></thead>
+            <tbody id="f13-body"></tbody>
+          </table>
+        </div>
+        <div class="margin-foot" id="f13-foot"></div>
       </section>
 
       <!-- Realized perf -->

@@ -144,6 +144,24 @@ function f13RowsGaps(flows, exposures) {
   return out.slice(0, 25);
 }
 
+// One line for everything 13F cannot see, listed largest exposure first so
+// the names worth knowing about sit at the front of the sentence.
+function f13UncoveredRow(uncovered) {
+  if (!uncovered.length) return "";
+  const total = uncovered.reduce((s, r) => s + r.exposure, 0);
+  const names = uncovered
+    .slice()
+    .sort((a, b) => b.exposure - a.exposure)
+    .map(r => esc(r.sym))
+    .join("、");
+  return `<tr class="f13-uncovered">
+    <td><b>13F 未覆盖</b></td>
+    <td class="num">${fmtMoney(total)}</td>
+    <td colspan="4"><span class="f13-uncovered-names">${names}</span>
+      <span class="muted">共 ${uncovered.length} 只 —— 13F 只报美股多头，
+      这些标的不在申报范围内，是这张表看不到，不是没人要</span></td></tr>`;
+}
+
 /* --- render ------------------------------------------------------------- */
 
 const F13_HEADS = {
@@ -189,14 +207,23 @@ function renderSuperinvestors() {
   for (const m of cache.managers || []) mgrNames[m.code] = m.name;
   const exposures = currentExposures();
 
-  const rows = f13Mode === "gaps" ? f13RowsGaps(flows, exposures)
+  const all = f13Mode === "gaps" ? f13RowsGaps(flows, exposures)
     : f13Mode === "exits" ? f13RowsExits(flows, exposures, mgrNames)
     : f13RowsHoldings(flows, exposures, mgrNames);
 
-  const scale = rows.reduce((m, r) => Math.max(m, r.flow ? Math.abs(r.flow.net_shares) : 0), 0);
+  // Tickers 13F cannot see get one collapsed line at the bottom instead of a
+  // row each. They carry no comparison — a row per ticker spent a third of the
+  // table repeating the same sentence and pushed the names that DO have flow
+  // off the screen. The roster still has to name them, though: silently dropping
+  // a position would make the panel look like a complete view of the book
+  // when it is a view of the covered part.
+  const rows = all.filter(r => r.flow);
+  const uncovered = all.filter(r => !r.flow);
+
+  const scale = rows.reduce((m, r) => Math.max(m, Math.abs(r.flow.net_shares)), 0);
 
   head.innerHTML = F13_HEADS[f13Mode];
-  if (!rows.length) {
+  if (!rows.length && !uncovered.length) {
     body.innerHTML = `<tr><td colspan="6" class="f13-empty">没有符合的标的</td></tr>`;
   } else {
     body.innerHTML = rows.map(r => {
@@ -207,10 +234,6 @@ function renderSuperinvestors() {
       const name = `<b>${esc(r.sym)}</b>` + (alsoIn.length
         ? `<span class="f13-merged" title="同一家公司的另一股份类别，流向已合并">+${esc(alsoIn.join("+"))}</span>`
         : "");
-      if (!f) {
-        return `<tr class="f13-uncovered"><td>${name}</td><td class="num">${fmtMoney(r.exposure)}</td>
-          <td class="num" colspan="4"><span class="muted">13F 未覆盖 —— 不是没人要，是这张表看不到</span></td></tr>`;
-      }
       const first = f13Mode === "gaps"
         ? `<td>${name}</td><td class="co">${esc(f.company || "")}</td>`
         : `<td>${name}</td><td class="num">${fmtMoney(r.exposure)}</td>`;
@@ -220,7 +243,7 @@ function renderSuperinvestors() {
         <td class="num ${f.net_shares >= 0 ? "up" : "down"}">${f13Fmt.shares(f.net_shares)} ${f13Bar(f.net_shares, scale)}</td>
         <td class="num ${f.net_heads >= 0 ? "up" : "down"}">${f13Fmt.heads(f.net_heads)}</td>
         <td>${who}</td></tr>`;
-    }).join("");
+    }).join("") + f13UncoveredRow(uncovered);
   }
 
   const filed = (cache.managers || []).filter(m => m.quarter === cache.quarter).length;

@@ -656,9 +656,22 @@ body.modal-open { overflow: hidden; }
 
 .f13-empty { padding: 22px 12px; text-align: center; color: var(--text-dim); }
 .f13-empty .ghost-btn { margin: 0 8px; }
-/* A ticker 13F cannot see is dimmed, not hidden: it still belongs in the
-   roster of your positions, it just has nothing to compare against. */
-.f13-uncovered td { opacity: .62; }
+
+/* Everything 13F cannot see collapses into one closing line. Dimmed and
+   separated from the data rows, but not hidden: these positions still belong
+   to the book, and dropping them would make the panel look like a complete
+   view when it is a view of the covered part. */
+.f13-uncovered td {
+  color: var(--text-dim);
+  border-top: 1px solid var(--border);
+  border-bottom: 0;
+  background: rgba(255, 255, 255, .02);
+}
+.f13-uncovered-names {
+  color: var(--text);
+  font-weight: 500;
+  margin-right: 8px;
+}
 
 .holdings td.co { color: var(--text-dim); font-size: 12.5px; }
 
