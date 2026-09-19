@@ -392,11 +392,16 @@ ul.rank .sym { font-weight: 600; }
    also give the list one flush right edge instead of a ragged one. */
 .wk-row {
   display: grid;
-  /* The last track is sized for the longest real trailer, 「+17.9% · 减仓 27%」
-     (99px measured). At 84px it overflowed its own box and, being right-aligned
-     and nowrap, spilled LEFT over the split's text rather than clipping. The
-     width comes out of the bar (1fr), which has it to spare. */
-  grid-template-columns: 64px 1fr 76px 152px 116px;
+  /* The last track carries the whole trailer: price move, position tag, and
+     the tooltip glyph. Sized to the worst ordinary case rather than to today's
+     rows — 「-117.9% · 加仓 250%ⓘ」 measures 124px, and a plain doubling
+     (「+17.9% · 加仓 100%ⓘ」) already wants 121px. Getting this wrong is worse
+     here than elsewhere: .wk-meta is right-aligned with an ellipsis, so the
+     FIRST thing a too-narrow track throws away is the glyph — the one part of
+     the row that cannot be recovered by reading harder. (At the original 84px
+     it did not even clip: nowrap right-aligned text spilled LEFT, printing
+     over the split column.) The width comes out of the bar, which has it. */
+  grid-template-columns: 64px 1fr 76px 152px 132px;
   gap: 10px; align-items: center; padding: 5px 0; font-size: 13px;
 }
 .wk-bar { height: 10px; background: var(--panel-2); border-radius: 5px; overflow: hidden; }
@@ -423,6 +428,19 @@ ul.rank .sym { font-weight: 600; }
   font-size: 12px; text-align: right; white-space: nowrap;
   overflow: hidden; text-overflow: ellipsis;
 }
+/* The handle for the share-count tooltip. A native tooltip costs a second of
+   held stillness, so it has to be obvious what is worth holding still on:
+   the glyph, the help cursor and the hover brighten are all there to say
+   "there is more here", which plain text in the trailer never did. */
+/* Padding rather than margin for most of the gap: the glyph is 11x15, and a
+   tooltip that only appears after a second of stillness needs a target the
+   pointer can rest in without sliding off. This buys ~19x19 of hit area
+   without moving the glyph. */
+.wk-tip {
+  cursor: help; margin-left: 2px; padding: 2px 3px; font-size: 11px;
+  color: var(--text-faint); transition: color 0.15s;
+}
+.wk-tip:hover { color: var(--accent); }
 /* Below 800px .dual-list is already one column, which the fixed tracks fit.
    Under 600px they do not — side by side they squeeze the bar to nothing and
    push the row off-screen. Keep the bar on line one and drop the split to a
