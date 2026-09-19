@@ -1239,12 +1239,28 @@ function splitLabel(r) {
   return "";
 }
 
+// 清仓 is the one tag that reports an EVENT rather than a state, and the one a
+// reader goes looking for by name ("did today's sale land in these numbers?").
+// As 12px grey text sharing a slot with the price move it read as neither, and
+// the narrow-screen rule in the stylesheet dropped that slot outright — so on
+// a phone the sale was invisible. It gets the badge every other panel already
+// gives a closed position.
+const CLOSED_TAG = "清仓";
+
 function positionTag(r) {
   if (r.splitLike) return "";  // share counts changed unit, not conviction
-  if (r.qtyBase > 1e-9 && r.qtyNow <= 1e-9) return "清仓";
+  if (r.qtyBase > 1e-9 && r.qtyNow <= 1e-9) return CLOSED_TAG;
   if (r.qtyBase <= 1e-9 && r.qtyNow > 1e-9) return "新建";
-  if (r.qtyNow > r.qtyBase + 1e-9) return "加仓";
-  if (r.qtyNow < r.qtyBase - 1e-9) return "减仓";
+  // 「减仓」says shares left, not whether a tenth or a half of the position
+  // did — and those are a trim and a change of mind. Measured against the
+  // baseline count, so it reads "减了 37%", never "剩 37%". 新建 above stays
+  // bare on purpose: a position built from zero has no denominator to be a
+  // percentage OF. Whole percent (a trim is chunky; the decimal is noise) and
+  // suppressed under 0.5%, where 「减仓 0%」 says less than 「减仓」 alone.
+  const moved = Math.abs(r.qtyNow / r.qtyBase - 1);
+  const size = moved >= 0.005 ? ` ${Math.round(moved * 100)}%` : "";
+  if (r.qtyNow > r.qtyBase + 1e-9) return `加仓${size}`;
+  if (r.qtyNow < r.qtyBase - 1e-9) return `减仓${size}`;
   return "";
 }
 
@@ -1373,16 +1389,26 @@ function renderWeekly(data, accounts, selected) {
   const maxAbs = Math.max(...rows.map(r => Math.abs(r.total)), 1);
   const bar = (r) => {
     const tag = positionTag(r);
+    const closed = tag === CLOSED_TAG;
     const px = r.pxPct != null
       ? `${r.pxPct >= 0 ? "+" : ""}${fmtPct(r.pxPct, 1)}` : "";
-    const meta = [px, tag].filter(Boolean).join(" · ");
+    // A closed row carries no price move — weeklyDiff has no current close to
+    // compare against — so in practice the badge stands alone and the separator
+    // never renders. The join stays anyway rather than hard-coding that.
+    const meta = [px, closed ? `<span class="tag tag-flow-out">已清仓</span>` : tag]
+      .filter(Boolean).join(" · ");
+    // The percentage says how much of the position moved; the tooltip says of
+    // what. 37% off 42 shares and 37% off 4 are the same number and not the
+    // same event, and the row has no room to print both.
+    const tip = tag && !closed && r.qtyBase > 1e-9 && r.qtyNow > 1e-9
+      ? ` title="持仓 ${fmtNum(r.qtyBase, 2)} → ${fmtNum(r.qtyNow, 2)} 股"` : "";
     return `<div class="wk-row">
       <span class="wk-sym"><b>${r.u}</b></span>
       <div class="wk-bar"><div class="wk-fill ${r.total >= 0 ? "pos" : "neg"}"
         style="width:${Math.max(3, Math.abs(r.total) / maxAbs * 100)}%"></div></div>
       <span class="wk-val ${r.total >= 0 ? "up" : "down"}">${r.total >= 0 ? "+" : ""}${fmtMoney(r.total, 0)}</span>
       <span class="wk-split muted">${splitLabel(r)}</span>
-      <span class="wk-meta muted">${meta}</span>
+      <span class="wk-meta muted${tag ? " has-tag" : ""}"${tip}>${meta}</span>
     </div>`;
   };
   winnersEl.innerHTML = winners.map(bar).join("") || '<div class="muted">无</div>';

@@ -392,7 +392,11 @@ ul.rank .sym { font-weight: 600; }
    also give the list one flush right edge instead of a ragged one. */
 .wk-row {
   display: grid;
-  grid-template-columns: 64px 1fr 76px 152px 84px;
+  /* The last track is sized for the longest real trailer, 「+17.9% · 减仓 27%」
+     (99px measured). At 84px it overflowed its own box and, being right-aligned
+     and nowrap, spilled LEFT over the split's text rather than clipping. The
+     width comes out of the bar (1fr), which has it to spare. */
+  grid-template-columns: 64px 1fr 76px 152px 116px;
   gap: 10px; align-items: center; padding: 5px 0; font-size: 13px;
 }
 .wk-bar { height: 10px; background: var(--panel-2); border-radius: 5px; overflow: hidden; }
@@ -411,17 +415,32 @@ ul.rank .sym { font-weight: 600; }
   font-size: 11px; text-align: left; white-space: nowrap;
   font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis;
 }
-.wk-meta { font-size: 12px; text-align: right; white-space: nowrap; }
+/* Ellipsis guards the case the track above is not sized for — a three-digit
+   加仓 on a leveraged name — never the normal row. Same treatment .wk-split
+   already gets, for the same reason: clipping inside the box beats printing
+   over the cell next door. */
+.wk-meta {
+  font-size: 12px; text-align: right; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}
 /* Below 800px .dual-list is already one column, which the fixed tracks fit.
    Under 600px they do not — side by side they squeeze the bar to nothing and
    push the row off-screen. Keep the bar on line one and drop the split to a
-   line of its own under it; the price/position trailer is the one thing that
-   goes, being the only part the row states twice (the bar already carries
-   direction and size). An empty split collapses its row to zero height. */
+   line of its own under it; the price move is the thing that goes, being the
+   only part the row states twice (the bar already carries direction and size).
+   An empty split collapses its row to zero height. */
 @media (max-width: 600px) {
   .wk-row { grid-template-columns: 52px 1fr 72px; gap: 8px; row-gap: 2px; }
   .wk-meta { display: none; }
   .wk-split { grid-column: 2 / 4; }
+  /* — except when the trailer carries a POSITION event (新建/加仓/减仓/清仓),
+     the one part of it the row says nowhere else. The cut above is about
+     dropping what the bar already tells you; shares arriving or leaving is
+     not that. Such a row keeps its whole trailer on the line under the bar,
+     price move included: 「+17.9% · 减仓 37%」 is two different measurements
+     of two different things, and showing one without the other on the narrow
+     screen would leave the phone holding the half that can be misread. */
+  .wk-meta.has-tag { display: block; grid-column: 2 / 4; text-align: left; }
 }
 
 /* Core holdings & position caps */
