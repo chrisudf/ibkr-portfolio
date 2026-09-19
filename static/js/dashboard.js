@@ -2797,9 +2797,26 @@ let trackedRunId = null;
 // their response before touching any shared state.
 let refreshPollGen = 0;
 
+// An instance without ALLOW_MANUAL_REFRESH does not own the day's IBKR
+// generation (the reasoning is in app.py). Latched from /api/refresh/status so
+// the button is inert on arrival rather than inert on press, and read back
+// inside setRefreshBusy so that no later "pass finished, hand the button back"
+// path can quietly undo it.
+let refreshLocked = false;
+const REFRESH_LOCK_MSG =
+  "这个实例未启用手动刷新 —— 同一个 Flex query 每天大约只放行一次生成，"
+  + "额度归计划同步。要在某个实例上开启，设 ALLOW_MANUAL_REFRESH=1。";
+
+function lockRefreshButton(reason) {
+  refreshLocked = true;
+  const btn = $("refresh-btn");
+  btn.disabled = true;
+  btn.title = reason || REFRESH_LOCK_MSG;
+}
+
 function setRefreshBusy(busy, label) {
   const btn = $("refresh-btn");
-  btn.disabled = busy;
+  btn.disabled = busy || refreshLocked;
   btn.classList.toggle("spinning", busy);
   btn.querySelector(".refresh-label").textContent = busy ? (label || "同步中...") : "刷新 IBKR";
 }
@@ -2840,6 +2857,10 @@ async function pollRefreshStatus() {
     refreshPollTimer = setTimeout(pollRefreshStatus, 5000);
     return;
   }
+  // Before the in_progress branch: an instance can be watching the scheduler's
+  // own pass and still not be allowed to start one, and the lock must survive
+  // that pass finishing.
+  if (st.manual_allowed === false) lockRefreshButton(REFRESH_LOCK_MSG);
   if (st.in_progress) {
     if (trackedRunId === null) trackedRunId = st.run_id;
     const who = st.trigger === "auto" ? "自动同步" : "同步中";
@@ -2902,6 +2923,15 @@ async function refreshFromIBKR() {
   try {
     const res = await fetch("/api/refresh", { method: "POST" });
     const data = await res.json();
+    if (res.status === 409) {
+      // The server owns this answer. Reaching it means the page loaded before
+      // the flag was read (or against an older build), so latch it now — the
+      // press must not be repeatable.
+      lockRefreshButton(data.detail || data.error);
+      setRefreshBusy(false);
+      showToast("warn", "手动刷新未启用", data.detail || data.error || REFRESH_LOCK_MSG, 12000);
+      return;
+    }
     if (res.status === 429) {
       // Two refusals share the status. "too soon" (retry_after_sec) really is
       // a wait. "already in progress" means a live pass exists — the server
@@ -2940,6 +2970,11 @@ async function refreshFromIBKR() {
 async function resumeRefreshWatch() {
   try {
     const st = await (await fetch("/api/refresh/status")).json();
+    // Ahead of the early return, which is the whole point: whether this
+    // instance may press does not depend on a pass happening to be running,
+    // and "nothing running" is both the common case and the one where the
+    // button sits there looking pressable.
+    if (st.manual_allowed === false) lockRefreshButton(REFRESH_LOCK_MSG);
     if (!st.in_progress) return;
     // A button press during this fetch already adopted the pass; re-adopting
     // it here would start a second poll chain against the same run.

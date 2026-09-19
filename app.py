@@ -509,6 +509,36 @@ def _pass_budget_sec(specs: list) -> int:
 # manual press) is what took out 2026-09-06 06:00.
 IBKR_QUERY_WINDOW_SEC = 23 * 3600
 
+# Who owns the day's generation, decided by configuration rather than guessed.
+#
+# The advice above is a hint, and a hint is the right shape for "you are about
+# to spend tomorrow's quota" — the user can see the whole picture and the code
+# cannot. It is the wrong shape for a second copy of this app. A checkout run
+# on a laptop is the same code with the same secrets pointed at the same Flex
+# query (scripts/sync.env is shared with the container on purpose), so its
+# button is not a second button — it is the same one, wired to the same single
+# daily generation, minus every signal that would tell the person pressing it
+# that the droplet already pulled three hours ago. 2026-09-19 08:59 UTC is what
+# that costs: a press on a dev instance, 2h58m after the scheduled pull, spent
+# the day on a 1001.
+#
+# Nothing in the process can tell the two apart, because there is nothing to
+# tell apart — so ownership is declared, not detected, and it fails closed. The
+# instance that holds the quota says so in its env; a copy inherits the
+# credentials and not the claim.
+def _env_flag(name: str) -> bool:
+    """True for 1/true/yes/on, quotes tolerated.
+
+    env_file values arrive quoted ("1") — the same reason flex_fetch strips
+    them before use — and an instance that meant to turn a flag on must not be
+    left off by its own quoting.
+    """
+    raw = os.environ.get(name, "").strip().strip('"').strip("'").lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+ALLOW_MANUAL_REFRESH = _env_flag("ALLOW_MANUAL_REFRESH")
+
 
 def _parse_iso(value: str | None) -> datetime | None:
     try:
@@ -709,6 +739,17 @@ def refresh():
     occupies a request thread at all, so the UI keeps its full pool while a
     45-minute fetch runs.
     """
+    # Ahead of the config check on purpose: an instance that does not own the
+    # quota should say so even when its ACCOUNTS is fine, because a working
+    # config is exactly what makes a dev copy dangerous.
+    if not ALLOW_MANUAL_REFRESH:
+        return jsonify({
+            "error": "manual refresh is not enabled on this instance",
+            "detail": "这个实例没有被授予 IBKR 配额。同一个 Flex query 每天大约"
+                      "只放行一次生成，而开发副本与生产共用同一套凭据 —— 在这里"
+                      "点一次，花掉的是计划同步的额度。要在某个实例上开启，"
+                      "在它的环境里设 ALLOW_MANUAL_REFRESH=1。",
+        }), 409
     specs, err = _refresh_specs()
     if err:
         return jsonify(err[0]), err[1]
@@ -773,6 +814,9 @@ def refresh_status():
     sync_state = _read_sync_state()
     out["last_run_at"] = sync_state.get("last_run_at", "")
     out["manual"] = _manual_refresh_advice(sync_state)
+    # So the button can be dead on arrival rather than dead on press: a dev
+    # copy should look inert, not look ready and then 409.
+    out["manual_allowed"] = ALLOW_MANUAL_REFRESH
     return jsonify(out)
 
 # --- Auto-sync: the in-app replacement for the retired bash+cron path -------
