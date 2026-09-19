@@ -1114,6 +1114,11 @@ function renderMargin(data, accounts) {
 
 const SNAP_MIN_GAP = 5, SNAP_TARGET_GAP = 7, SNAP_MAX_GAP = 16;
 
+// "Realized P&L did not move", in dollars. Half a cent, not zero: the figure
+// is a rolling cumulative sum, so it carries float noise that must not read as
+// a trade. Anything a real fill contributes clears this by orders of magnitude.
+const REALIZED_EPS = 0.005;
+
 // The live payload reduced to the exact shape the server snapshots.
 function liveSnapshot(data) {
   const hist = data.nav_history || [];
@@ -1159,8 +1164,13 @@ function weeklyDiff(current, snapshots) {
   // along the other axis, stock vs option. Two independent decompositions of
   // one number — sPnl + oPnl === pnlU + pnlR by construction, which is what
   // lets the row print a breakdown without re-deriving the total.
+  // sRealized is the stock leg's realized delta on its own, kept apart from
+  // both decompositions because it answers a different question: did shares
+  // actually change hands. pnlR would not do — it folds in the options, and an
+  // expiring put moves it without a single share being traded.
   const R = (u) => rows[u] || (rows[u] = {
-    u, pnlU: 0, pnlR: 0, sPnl: 0, oPnl: 0, pxPct: null, qtyNow: 0, qtyBase: 0,
+    u, pnlU: 0, pnlR: 0, sPnl: 0, oPnl: 0, sRealized: 0,
+    pxPct: null, qtyNow: 0, qtyBase: 0,
   });
   // P&L per underlying: stock rows key by their own symbol, option rows by
   // the underlying pulled from the contract description.
@@ -1175,8 +1185,10 @@ function weeklyDiff(current, snapshots) {
     if (CASH_EQUIVALENTS.has(u)) continue;  // SGOV drift is not a "mover"
     const r = R(u);
     r.pnlR += now[0] - was[0];
-    if (kind === "S") r.sPnl += now[0] - was[0];
-    else r.oPnl += (now[0] - was[0]) + (now[1] - was[1]);
+    if (kind === "S") {
+      r.sPnl += now[0] - was[0];
+      r.sRealized += now[0] - was[0];
+    } else r.oPnl += (now[0] - was[0]) + (now[1] - was[1]);
     // Stocks take ΔU from the position maps below, NOT from perf: a stock
     // held at the baseline but absent from that statement's MTM section
     // would otherwise default to 0 and book its entire LIFETIME unrealized
@@ -1202,9 +1214,29 @@ function weeklyDiff(current, snapshots) {
       // A split between the two snapshots changes the share-count unit:
       // qty and price move in reciprocal proportion while the value stays
       // continuous. "-75% · 加仓" would be doubly wrong, so suppress both.
+      //
+      // The reciprocal test alone is not enough to conclude "split", because
+      // an ordinary trim can satisfy it by coincidence: sell 16% of a name
+      // that happened to rise 18% that week, and the two ratios land within
+      // the tolerance of each other. CONL on 2026-09-18 did exactly that
+      // (610 → 510 shares against 5.32 → 6.27, ratios 1.46% apart) and the
+      // panel silently swallowed the 减仓 label in that account AND, through
+      // the merge below, in the household view. Value continuity does not
+      // rescue it either: −1.5%, because the trim and the rally cancelled.
+      //
+      // So ask what a split cannot fake. It re-denominates a position that is
+      // already yours — nothing is bought, nothing is sold, and realized P&L
+      // therefore cannot move. CONL's moved by $102.03. That is a trade.
+      //
+      // Known gap, left uncovered on purpose: a BUY realizes nothing either,
+      // so doubling a position in the same week its price halves still reads
+      // as a 2:1 split. That needs a coincidence between two things the user
+      // controls separately, where the trim case only needs a volatile name
+      // and an ordinary sell — the difference between rare and recurring.
       if (r.qtyBase > 0 && r.qtyNow > 0) {
         const qr = r.qtyNow / r.qtyBase, pr = was[1] / now[1];
-        if (Math.abs(qr - 1) > 0.05 && Math.abs(qr / pr - 1) < 0.02) {
+        if (Math.abs(qr - 1) > 0.05 && Math.abs(qr / pr - 1) < 0.02
+            && Math.abs(r.sRealized) < REALIZED_EPS) {
           r.pxPct = null;
           r.splitLike = true;
         }
