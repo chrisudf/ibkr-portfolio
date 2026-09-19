@@ -219,9 +219,25 @@ set -a && . scripts/sync.env && set +a && python app.py
 `sync.env` 的格式见 `scripts/sync.env.example`，配置说明见
 [`scripts/README.md`](scripts/README.md)。
 
-打开 <http://127.0.0.1:5050/>，点右上角刷新按钮拉取，或上传你的 IBKR 报表。
+打开 <http://127.0.0.1:5050/>，上传你的 IBKR 报表。
 
-> 只想上传文件、不用刷新按钮的话，`python app.py` 依然可用 —— 只是刷新按钮会报上面那个错。
+> **本地实例的刷新按钮默认锁死**（返回 409），哪怕 `sync.env` 已经加载 ——
+> 恰恰因为它加载的就是生产那一套凭据。同一个 Flex query 每天大约只放行一次
+> 生成，而计划同步已经占住了它：在本地点一次，饿死的是部署实例第二天早上
+> 那一次。2026-09-19 就这么丢过一次（本地按钮，距计划拉取 2 小时 58 分，
+> 换回一个 1001）。
+>
+> 按钮由 `ALLOW_MANUAL_REFRESH=1` 解锁，**只应该设在跑计划同步的那个实例上**。
+> 本地想看最新数据，从部署实例把 `uploads/*.json` 和 `*.snapshots.jsonl`
+> 拷下来就行 —— 不花配额：
+>
+> ```bash
+> for f in U1234567.json U1234567.snapshots.jsonl; do
+>   ssh root@your-droplet "cd /opt/ibkr-portfolio/deploy && docker compose exec -T app cat /app/uploads/$f" > uploads/$f
+> done
+> ```
+
+> 只想上传文件的话，`python app.py` 依然可用 —— 只是刷新按钮会报上面那个错。
 
 ## 测试
 

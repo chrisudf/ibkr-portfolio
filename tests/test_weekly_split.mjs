@@ -140,3 +140,97 @@ test("合并视图的累加器要带上两个新桶，否则 ALL 视图拆分恒
 test("渲染必须走 splitLabel（源码级 tripwire，防被改回单一数字）", () => {
   assert.match(src, /<span class="wk-split muted">\$\{splitLabel\(r\)\}<\/span>/);
 });
+
+/* --- 清仓徽章 --------------------------------------------------------------
+ * 「清仓」一直在算、也一直在印，只是印成了跟涨跌幅同款的 12px 灰字，窄屏还把
+ * 那一整列隐了 —— 于是「今天卖光了」这件事在手机上根本不存在。下面三条锁的是
+ * 「看得见」，不是「算得对」。
+ */
+const { positionTag } = new Function(
+  `${extractConst(/const CLOSED_TAG = [^;]+;/, "CLOSED_TAG")}\n`
+  + `${extract("positionTag")}\nreturn { positionTag };`)();
+
+// 一条真实形状的清仓：MSTR 基线 12 股、浮盈 2790，窗口内卖光，已实现从 0 跑到
+// 3412。本周切片因此是 3412 − 2790 = 622 —— 是这一周的贡献，不是全程收益。
+const CLOSED_LIVE = {
+  date: "2026-09-18", nav: 100000,
+  stocks: { APP: [10, 308.11, 3081, +500] },
+  perf: { APP: [0, 0, "S"], MSTR: [3412, 0, "S"] },
+};
+const CLOSED_BASE = {
+  date: "2026-09-11", nav: 97000,
+  stocks: { APP: [10, 298.87, 2989, +408], MSTR: [12, 330.00, 3960, +2790] },
+  perf: { APP: [0, 0, "S"], MSTR: [0, 0, "S"] },
+};
+
+test("清仓行：标签认得出来，但没有涨跌幅可印（徽章独占那一格）", () => {
+  const r = Object.fromEntries(
+    weeklyDiff(CLOSED_LIVE, [CLOSED_BASE]).rows.map(x => [x.u, x])).MSTR;
+  assert.equal(positionTag(r), "清仓");
+  // 卖光之后没有「现价」可比，pxPct 只能是 null。所以徽章永远独占 wk-meta，
+  // 不会排出「+10.8% · [已清仓]」这种两件事挤一格 —— 窄屏也就不用为它让位。
+  assert.equal(r.pxPct, null);
+  assert.ok(Math.abs(r.total - 622) < 1e-6, `total=${r.total}`);
+});
+
+test("清仓渲染成徽章，不是灰字（源码级 tripwire）", () => {
+  assert.match(src, /closed \? `<span class="tag tag-flow-out">已清仓<\/span>`/);
+  // 徽章在不在还不够：窄屏豁免认的是这个类名，丢了就又回到手机上看不见。
+  // 挂的是 tag 不是 closed —— 加仓/减仓/新建 同样要活过窄屏那刀。
+  assert.match(src, /class="wk-meta muted\$\{tag \? " has-tag" : ""\}"/);
+});
+
+/* --- 仓位变动幅度 ----------------------------------------------------------
+ * 「减仓」只说了股票走了，没说走了一成还是一半 —— 而这两件事一个是修剪、一个
+ * 是改主意。百分比按基线股数算，读作「减了 37%」，不是「剩 37%」。
+ */
+const pos = (qtyBase, qtyNow, extra = {}) =>
+  positionTag({ qtyBase, qtyNow, ...extra });
+
+test("减仓/加仓带上幅度，按基线股数算", () => {
+  assert.equal(pos(42, 26.46), "减仓 37%");   // 走掉 37%
+  assert.equal(pos(10, 15), "加仓 50%");      // 多了一半
+  assert.equal(pos(10, 20), "加仓 100%");     // 翻倍 = 加了 100%，不是 200%
+});
+
+test("没有分母的不印百分比：新建从零开始", () => {
+  assert.equal(pos(0, 10), "新建");
+  assert.equal(pos(0, 10000), "新建");
+});
+
+test("清仓仍然只给徽章 —— 幅度恒等于 100%，印出来是废话", () => {
+  assert.equal(pos(42, 0), "清仓");
+});
+
+test("零点几个百分点的抖动不印「减仓 0%」", () => {
+  assert.equal(pos(100, 100.2), "加仓");      // +0.2% → 只留词
+  assert.equal(pos(100, 99.8), "减仓");
+  assert.equal(pos(100, 99.4), "减仓 1%");    // 0.6% → 进位到 1%，开始印
+});
+
+test("拆股改的是股数的单位，不是仓位 —— 一个字都不该说", () => {
+  assert.equal(pos(12, 36, { splitLike: true }), "");
+});
+
+test("纯期权行（两边都是零股）既不报标签也不产生 NaN", () => {
+  const t = pos(0, 0);
+  assert.equal(t, "");
+  assert.ok(!/NaN/.test(t));
+});
+
+test("幅度的分母写进 title —— 37% 掉 42 股和掉 4 股不是一回事", () => {
+  assert.match(src, /title="持仓 \$\{fmtNum\(r\.qtyBase, 2\)\} → \$\{fmtNum\(r\.qtyNow, 2\)\} 股"/);
+  // 清仓行没有「现在多少股」可写，别给它挂一个 → 0.00 的提示。
+  assert.match(src, /const tip = tag && !closed && r\.qtyBase > 1e-9 && r\.qtyNow > 1e-9/);
+});
+
+test("窄屏豁免：整列隐藏时清仓徽章必须留下来", () => {
+  const css = readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)),
+              "..", "static", "css", "style.css"), "utf8");
+  // style.css 里有三个 600px 断点块，按 .wk-row 定位到周复盘那一个。
+  const m = css.match(/\.wk-row \{ grid-template-columns: 52px[\s\S]*?\n\}/);
+  assert.ok(m, "cannot find the narrow-screen .wk-row block");
+  assert.match(m[0], /\.wk-meta \{ display: none; \}/);
+  assert.match(m[0], /\.wk-meta\.has-tag \{ display: block;/);
+});

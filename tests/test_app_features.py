@@ -356,6 +356,7 @@ def test_refresh_returns_immediately_and_reports_progress(tmp_path, monkeypatch)
     monkeypatch.setattr(app_mod, "parse_accounts_env", lambda _: [spec])
     monkeypatch.setenv("ACCOUNTS", "tok:123")
     monkeypatch.setattr(app_mod, "SYNC_STATE_FILE", tmp_path / ".auto_sync_state.json")
+    monkeypatch.setattr(app_mod, "ALLOW_MANUAL_REFRESH", True)
     app_mod._refresh_state.update({"last_finished": 0.0, "in_progress": False,
                                    "last_result": None})
 
@@ -400,6 +401,7 @@ def test_refresh_config_errors_stay_synchronous(monkeypatch):
     import app as app_mod
 
     monkeypatch.setenv("ACCOUNTS", "")
+    monkeypatch.setattr(app_mod, "ALLOW_MANUAL_REFRESH", True)
     app_mod._refresh_state.update({"last_finished": 0.0, "in_progress": False})
     res = app_mod.app.test_client().post("/api/refresh")
     # Nothing was started, so this must not come back as an accepted 202 the
@@ -414,6 +416,7 @@ def test_failed_thread_start_does_not_strand_the_slot(monkeypatch):
     spec = SimpleNamespace(tag="test", token="tok", query_id="123")
     monkeypatch.setattr(app_mod, "parse_accounts_env", lambda _: [spec])
     monkeypatch.setenv("ACCOUNTS", "tok:123")
+    monkeypatch.setattr(app_mod, "ALLOW_MANUAL_REFRESH", True)
     app_mod._refresh_state.update({"last_finished": 0.0, "in_progress": False})
 
     class DeadThread:
@@ -717,3 +720,75 @@ def test_status_endpoint_carries_the_advice(tmp_path, monkeypatch):
     # The button pre-flights on this; without it there is nothing to warn from.
     assert st["manual"]["risky"] is True
     assert st["last_run_at"]
+
+
+# ---------------------------------------------------------------------------
+# Quota ownership. The advice above is a hint, which is the right shape for a
+# person who can see the whole picture. A second copy of the app sees none of
+# it — same code, same sync.env, same Flex query — so its button is not a
+# second button, it is the same one. Ownership is declared in the environment
+# and fails closed.
+# ---------------------------------------------------------------------------
+
+def test_refresh_is_refused_when_the_instance_does_not_own_the_quota(monkeypatch):
+    import app as app_mod
+
+    spec = SimpleNamespace(tag="test", token="tok", query_id="123")
+    monkeypatch.setattr(app_mod, "parse_accounts_env", lambda _: [spec])
+    monkeypatch.setenv("ACCOUNTS", "tok:123")
+    monkeypatch.setattr(app_mod, "ALLOW_MANUAL_REFRESH", False)
+    app_mod._refresh_state.update({"last_finished": 0.0, "in_progress": False})
+
+    def must_not_run(_spec):   # pragma: no cover - the point is that it is not
+        raise AssertionError("a locked instance reached IBKR")
+
+    monkeypatch.setattr(app_mod, "fetch_one", must_not_run)
+
+    res = app_mod.app.test_client().post("/api/refresh")
+    assert res.status_code == 409
+    # The message has to name the way out, or the next person hunts for it.
+    assert "ALLOW_MANUAL_REFRESH" in res.get_json()["detail"]
+    # Refusing must not take the slot. The scheduler claims through the same
+    # lock, so a refusal that held it would trade this problem for a worse one.
+    assert app_mod._refresh_state["in_progress"] is False
+    assert app_mod._refresh_state["last_finished"] == 0.0
+
+
+def test_the_lock_answers_before_config_errors(monkeypatch):
+    import app as app_mod
+
+    # A *working* config is exactly what makes a second copy dangerous, so the
+    # lock goes first. A 500 here would tell a dev instance that its ACCOUNTS
+    # is the only thing between it and the button.
+    monkeypatch.setenv("ACCOUNTS", "")
+    monkeypatch.setattr(app_mod, "ALLOW_MANUAL_REFRESH", False)
+    app_mod._refresh_state.update({"last_finished": 0.0, "in_progress": False})
+    assert app_mod.app.test_client().post("/api/refresh").status_code == 409
+
+
+def test_status_tells_the_button_whether_it_may_press(tmp_path, monkeypatch):
+    import app as app_mod
+
+    # Without this the button looks ready and only finds out on press — which
+    # is the same click the user already made, just with a nicer error.
+    monkeypatch.setattr(app_mod, "SYNC_STATE_FILE", tmp_path / "state.json")
+    app_mod._refresh_state.update({"last_finished": 0.0, "in_progress": False})
+    client = app_mod.app.test_client()
+
+    monkeypatch.setattr(app_mod, "ALLOW_MANUAL_REFRESH", False)
+    assert client.get("/api/refresh/status").get_json()["manual_allowed"] is False
+    monkeypatch.setattr(app_mod, "ALLOW_MANUAL_REFRESH", True)
+    assert client.get("/api/refresh/status").get_json()["manual_allowed"] is True
+
+
+def test_env_flag_tolerates_the_quotes_env_files_ship(monkeypatch):
+    import app as app_mod
+
+    for raw in ['"1"', "1", "true", "TRUE", "on", "'yes'", " 1 "]:
+        monkeypatch.setenv("SOME_FLAG", raw)
+        assert app_mod._env_flag("SOME_FLAG") is True, raw
+    for raw in ["", "0", "no", "off", '""', "maybe"]:
+        monkeypatch.setenv("SOME_FLAG", raw)
+        assert app_mod._env_flag("SOME_FLAG") is False, raw
+    monkeypatch.delenv("SOME_FLAG", raising=False)
+    assert app_mod._env_flag("SOME_FLAG") is False
