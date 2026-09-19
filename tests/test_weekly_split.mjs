@@ -34,6 +34,7 @@ const consts = [
   extractConst(/const DAY_MS = [^;]+;/, "DAY_MS"),
   extractConst(/const SNAP_MIN_GAP = [^;]+;/, "SNAP_* gaps"),
   extractConst(/const SPLIT_MIN = [^;]+;/, "SPLIT_MIN"),
+  extractConst(/const REALIZED_EPS = [^;]+;/, "REALIZED_EPS"),
 ].join("\n");
 
 const { weeklyDiff, splitLabel } = new Function(
@@ -216,6 +217,73 @@ test("纯期权行（两边都是零股）既不报标签也不产生 NaN", () =
   const t = pos(0, 0);
   assert.equal(t, "");
   assert.ok(!/NaN/.test(t));
+});
+
+/* --- 减仓 vs 拆股 ----------------------------------------------------------
+ * 「股数比 ≈ 价格比的倒数」这个判据本身分不出二者：一个波动大的票，卖掉一成
+ * 半、同期涨一成八，两个比值就能撞进容差里。真正分得开的是已实现盈亏 ——
+ * 拆股只是给同一笔仓位换计价单位，没有买也没有卖，动不了它。
+ */
+function diffOne(sym, base, now) {
+  const snap = (date, s) => ({
+    date, nav: 100000,
+    stocks: { [sym]: [s.qty, s.px, s.qty * s.px, s.unreal] },
+    perf: { [sym]: [s.realized, 0, "S"], ...(s.opt || {}) },
+  });
+  const d = weeklyDiff(snap("2026-09-18", now), [snap("2026-09-11", base)]);
+  return d.rows.find(r => r.u === sym);
+}
+
+test("误判现场复现：CONL 减了 100 股，不是拆股", () => {
+  // U228***83 在 2026-09-18 那一周的真实数字。510/610 = 0.8361，而价格比的
+  // 倒数 5.32/6.27 = 0.8485 —— 只差 1.46%，旧判据据此把整行噤声。
+  const r = diffOne("CONL",
+    { qty: 610, px: 5.32, unreal: 3.40,   realized: -841.86 },
+    { qty: 510, px: 6.27, unreal: 664.90, realized: -943.89 });
+  assert.ok(!r.splitLike, "卖出 100 股被当成了拆股");
+  assert.ok(Math.abs(r.pxPct - 0.178571) < 1e-5, `pxPct=${r.pxPct}`);
+  assert.equal(positionTag(r), "减仓 16%");
+  // 顺带钉住这一行的总额，和当时截图上的 +$559 对得上：
+  // 浮盈 +661.50 与已实现 −102.03 相抵。
+  assert.ok(Math.abs(r.total - 559.47) < 1e-6, `total=${r.total}`);
+});
+
+test("真拆股仍然认得出来 —— 已实现纹丝不动", () => {
+  // 1 拆 2：股数翻倍、价格腰斩、没有任何成交。
+  const r = diffOne("XYZ",
+    { qty: 100, px: 50, unreal: 500, realized: 0 },
+    { qty: 200, px: 25, unreal: 800, realized: 0 });
+  assert.equal(r.splitLike, true);
+  assert.equal(r.pxPct, null, "拆股不该印 −50%");
+  assert.equal(positionTag(r), "", "拆股不该印「加仓 100%」");
+});
+
+test("反向拆股同理（10 合 1）", () => {
+  const r = diffOne("XYZ",
+    { qty: 200, px: 5,  unreal: 300, realized: 0 },
+    { qty: 20,  px: 50, unreal: 600, realized: 0 });
+  assert.equal(r.splitLike, true);
+  assert.equal(positionTag(r), "");
+});
+
+test("否决权只归正股：期权腿的已实现不算数", () => {
+  // 同一个标的上有一条到期的 put 实现了 +$400。股票一股没动过手，
+  // 所以这仍然是拆股 —— 判据读的是 sRealized，不是把期权拌进去的 pnlR。
+  const r = diffOne("XYZ",
+    { qty: 100, px: 50, unreal: 500, realized: 0, opt: { "XYZ 17JUL26 40 P": [0, 0, "O"] } },
+    { qty: 200, px: 25, unreal: 800, realized: 0, opt: { "XYZ 17JUL26 40 P": [400, 0, "O"] } });
+  assert.equal(r.splitLike, true, "期权的已实现不该否掉拆股判定");
+  assert.equal(positionTag(r), "");
+});
+
+test("已知缺口：买入不实现盈亏，所以「翻倍 + 腰斩」仍会被当成拆股", () => {
+  // 加仓一倍、同期价格正好腰斩、且没有卖出 —— 快照里没有任何字段能把它和
+  // 1 拆 2 分开。留作已知限制：它要两件互相独立的事撞在一起，而减仓那个只
+  // 需要一个波动大的票加一次普通卖出。改掉这个行为时，这条会先响。
+  const r = diffOne("XYZ",
+    { qty: 100, px: 50, unreal: 500, realized: 0 },
+    { qty: 200, px: 25, unreal: 800, realized: 0 });
+  assert.equal(r.splitLike, true);
 });
 
 test("幅度的分母写进 title —— 37% 掉 42 股和掉 4 股不是一回事", () => {
