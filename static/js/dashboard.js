@@ -1427,20 +1427,27 @@ function renderWeekly(data, accounts, selected) {
     // A closed row carries no price move — weeklyDiff has no current close to
     // compare against — so in practice the badge stands alone and the separator
     // never renders. The join stays anyway rather than hard-coding that.
-    const meta = [px, closed ? `<span class="tag tag-flow-out">已清仓</span>` : tag]
-      .filter(Boolean).join(" · ");
     // The percentage says how much of the position moved; the tooltip says of
     // what. 37% off 42 shares and 37% off 4 are the same number and not the
     // same event, and the row has no room to print both.
+    //
+    // The tooltip hangs off its own glyph rather than the whole trailer. A
+    // native tooltip only appears after about a second of stillness, and
+    // nobody holds a mouse still on text that gives no sign of rewarding it —
+    // carrying the title on the trailer meant the share counts were, in
+    // practice, not there. The glyph is the sign.
     const tip = tag && !closed && r.qtyBase > 1e-9 && r.qtyNow > 1e-9
-      ? ` title="持仓 ${fmtNum(r.qtyBase, 2)} → ${fmtNum(r.qtyNow, 2)} 股"` : "";
+      ? `<span class="wk-tip" title="持仓 ${fmtNum(r.qtyBase, 2)} → ${fmtNum(r.qtyNow, 2)} 股">ⓘ</span>`
+      : "";
+    const meta = [px, closed ? `<span class="tag tag-flow-out">已清仓</span>` : tag]
+      .filter(Boolean).join(" · ") + tip;
     return `<div class="wk-row">
       <span class="wk-sym"><b>${r.u}</b></span>
       <div class="wk-bar"><div class="wk-fill ${r.total >= 0 ? "pos" : "neg"}"
         style="width:${Math.max(3, Math.abs(r.total) / maxAbs * 100)}%"></div></div>
       <span class="wk-val ${r.total >= 0 ? "up" : "down"}">${r.total >= 0 ? "+" : ""}${fmtMoney(r.total, 0)}</span>
       <span class="wk-split muted">${splitLabel(r)}</span>
-      <span class="wk-meta muted${tag ? " has-tag" : ""}"${tip}>${meta}</span>
+      <span class="wk-meta muted${tag ? " has-tag" : ""}">${meta}</span>
     </div>`;
   };
   winnersEl.innerHTML = winners.map(bar).join("") || '<div class="muted">无</div>';

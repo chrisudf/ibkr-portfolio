@@ -286,10 +286,15 @@ test("已知缺口：买入不实现盈亏，所以「翻倍 + 腰斩」仍会�
   assert.equal(r.splitLike, true);
 });
 
-test("幅度的分母写进 title —— 37% 掉 42 股和掉 4 股不是一回事", () => {
-  assert.match(src, /title="持仓 \$\{fmtNum\(r\.qtyBase, 2\)\} → \$\{fmtNum\(r\.qtyNow, 2\)\} 股"/);
-  // 清仓行没有「现在多少股」可写，别给它挂一个 → 0.00 的提示。
+test("幅度的分母挂在 ⓘ 上 —— 37% 掉 42 股和掉 4 股不是一回事", () => {
+  assert.match(src,
+    /<span class="wk-tip" title="持仓 \$\{fmtNum\(r\.qtyBase, 2\)\} → \$\{fmtNum\(r\.qtyNow, 2\)\} 股">ⓘ<\/span>/);
+  // 清仓行没有「现在多少股」可写，别给它挂一个 → 0.00 股的提示。
   assert.match(src, /const tip = tag && !closed && r\.qtyBase > 1e-9 && r\.qtyNow > 1e-9/);
+  // 挂回整条 trailer 就等于没有：原生 tooltip 要静止悬停约一秒，而一段不给
+  // 任何暗示的文字没人会停在上面 —— 实测就是这样错过的。钉住那个把手。
+  assert.doesNotMatch(src, /class="wk-meta muted\$\{tag \? " has-tag" : ""\}"\$\{tip\}/);
+  assert.match(src, /class="wk-meta muted\$\{tag \? " has-tag" : ""\}">/);
 });
 
 test("窄屏豁免：整列隐藏时清仓徽章必须留下来", () => {
