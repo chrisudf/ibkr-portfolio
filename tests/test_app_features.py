@@ -273,7 +273,7 @@ def test_cooldown_is_measured_from_attempt_end(tmp_path, monkeypatch):
     clock = {"t": 10_000.0}
     monkeypatch.setattr(app_mod.time, "time", lambda: clock["t"])
 
-    def slow_failing_fetch(_spec):
+    def slow_failing_fetch(_spec, **_kw):
         # Burns far more than one cooldown before failing.
         clock["t"] += 10 * app_mod.REFRESH_MIN_INTERVAL_SEC
         raise RuntimeError("boom")
@@ -337,6 +337,172 @@ def test_fetch_one_defaults_track_the_module_constants():
     defaults = inspect.signature(flex_fetch.fetch_one).parameters
     assert defaults["max_polls"].default == flex_fetch.FLEX_MAX_POLLS
     assert defaults["poll_interval"].default == flex_fetch.FLEX_POLL_INTERVAL
+    assert defaults["max_poll_retries"].default == flex_fetch.FLEX_MAX_POLL_RETRIES
+
+
+# ---------------------------------------------------------------------------
+# Transport errors on the GetStatement poll. 2026-09-22 06:12:09 UTC: one
+# "[Errno 104] Connection reset by peer" on poll ~45 of 240 ended a run that
+# was holding a live reference code with 2900s of budget left — and because
+# IBKR's ~24h allowance is anchored on the SendRequest that had already
+# succeeded, there was no second attempt that day. The reset said nothing
+# about the statement; the code treated it as a verdict on it.
+
+
+def _flex_stub(monkeypatch, get_responses):
+    """Drive fetch_one through a scripted GetStatement sequence.
+
+    Each entry is either a string body or an exception instance to raise.
+    Returns the list of URLs actually requested, so a test can prove that a
+    retry re-polled rather than re-requested.
+    """
+    from parser import flex_fetch
+
+    calls = []
+    pending = list(get_responses)
+
+    def fake_get(url, timeout=30.0):
+        calls.append(url)
+        if "SendRequest" in url:
+            return "<Status>Success</Status><ReferenceCode>987654</ReferenceCode>"
+        nxt = pending.pop(0)
+        if isinstance(nxt, BaseException):
+            raise nxt
+        return nxt
+
+    monkeypatch.setattr(flex_fetch, "_http_get", fake_get)
+    monkeypatch.setattr(flex_fetch.time, "sleep", lambda *_: None)
+    return calls
+
+
+IN_PROGRESS = "<FlexStatementResponse><Status>Warn</Status><ErrorCode>1019</ErrorCode><ErrorMessage>Statement generation in progress</ErrorMessage></FlexStatementResponse>"
+CSV_BODY = ("Statement,Header,Field Name,Field Value" + chr(10)
+            + "Statement,Data,Period,2026-09-21")
+
+
+def test_transient_reset_mid_poll_does_not_kill_the_run(monkeypatch):
+    from parser import flex_fetch
+
+    spec = flex_fetch.AccountSpec(token="SECRET123", query_id="154914")
+    calls = _flex_stub(monkeypatch, [
+        IN_PROGRESS,
+        OSError("[Errno 104] Connection reset by peer"),
+        IN_PROGRESS,
+        CSV_BODY,
+    ])
+    seen = []
+
+    body = flex_fetch.fetch_one(spec, max_polls=10, poll_interval=0,
+                                max_poll_retries=5, on_retry=seen.append)
+
+    assert body == CSV_BODY, "a reset is not a verdict on the statement"
+    # The quota is spent on SendRequest, so the one thing a retry must never
+    # do is issue a second one. Exactly one, no matter how many resets.
+    assert sum("SendRequest" in u for u in calls) == 1
+    assert seen, "a ridden-out reset must still reach the log"
+    assert "SECRET123" not in " ".join(seen), "the token rides in every URL"
+
+
+def test_sustained_network_failure_still_gives_up_and_is_labelled(monkeypatch):
+    import pytest
+
+    from parser import flex_fetch
+
+    spec = flex_fetch.AccountSpec(token="SECRET123", query_id="154914")
+    _flex_stub(monkeypatch, [OSError("connection reset by peer")] * 20)
+
+    with pytest.raises(flex_fetch.FlexFetchError) as excinfo:
+        flex_fetch.fetch_one(spec, max_polls=10, poll_interval=0, max_poll_retries=3)
+
+    # code="" is what made this failure mode unreadable in the logs the first
+    # time: it printed as `code=-`, identical to a parse bug. A transport
+    # failure is now its own named category, distinct from 1019 and 1001.
+    assert excinfo.value.code == "network"
+    assert not excinfo.value.permanent
+    assert "SECRET123" not in str(excinfo.value)
+
+
+def test_retry_budget_is_consecutive_not_cumulative(monkeypatch):
+    import pytest
+
+    from parser import flex_fetch
+
+    spec = flex_fetch.AccountSpec(token="SECRET123", query_id="154914")
+    # Nine blips scattered across the run, never two in a row, with only 2
+    # retries allowed. Cumulative counting would call this dead on the third
+    # one; the network was fine all along, just lossy — which is the expected
+    # weather across 240 independent HTTPS polls.
+    scattered = []
+    for _ in range(9):
+        scattered += [OSError("reset"), IN_PROGRESS]
+    _flex_stub(monkeypatch, scattered + [CSV_BODY])
+
+    body = flex_fetch.fetch_one(spec, max_polls=40, poll_interval=0, max_poll_retries=2)
+    assert body == CSV_BODY
+
+
+def test_send_request_is_never_retried(monkeypatch):
+    import pytest
+
+    from parser import flex_fetch
+
+    spec = flex_fetch.AccountSpec(token="SECRET123", query_id="154914")
+    calls = []
+
+    def fake_get(url, timeout=30.0):
+        calls.append(url)
+        raise OSError("[Errno 104] Connection reset by peer")
+
+    monkeypatch.setattr(flex_fetch, "_http_get", fake_get)
+    monkeypatch.setattr(flex_fetch.time, "sleep", lambda *_: None)
+
+    with pytest.raises(flex_fetch.FlexFetchError) as excinfo:
+        flex_fetch.fetch_one(spec, max_polls=10, poll_interval=0, max_poll_retries=5)
+
+    # The asymmetry that makes the poll retry safe is exactly what makes this
+    # one unsafe: a request that reaches IBKR counts against the ~24h
+    # allowance even when the reply never reaches us, so a blind retry here
+    # can spend two days of quota on one sync.
+    assert len(calls) == 1
+    assert "SendRequest" in calls[0]
+    assert "SendRequest" in str(excinfo.value)
+
+
+def test_zero_retries_restores_fail_fast(monkeypatch):
+    import pytest
+
+    from parser import flex_fetch
+
+    spec = flex_fetch.AccountSpec(token="SECRET123", query_id="154914")
+    calls = _flex_stub(monkeypatch, [OSError("reset"), CSV_BODY])
+
+    with pytest.raises(flex_fetch.FlexFetchError):
+        flex_fetch.fetch_one(spec, max_polls=10, poll_interval=0, max_poll_retries=0)
+
+    # The escape hatch has to actually escape: one SendRequest, one poll, out.
+    assert len(calls) == 2
+
+
+def test_ibkr_error_codes_are_not_retried(monkeypatch):
+    import pytest
+
+    from parser import flex_fetch
+
+    spec = flex_fetch.AccountSpec(token="SECRET123", query_id="154914")
+    refused = ("<FlexStatementResponse><Status>Fail</Status><ErrorCode>1001</ErrorCode>"
+               "<ErrorMessage>Statement could not be generated at this time."
+               "</ErrorMessage></FlexStatementResponse>")
+    calls = _flex_stub(monkeypatch, [refused, CSV_BODY])
+
+    with pytest.raises(flex_fetch.FlexFetchError) as excinfo:
+        flex_fetch.fetch_one(spec, max_polls=10, poll_interval=0, max_poll_retries=5)
+
+    # An envelope with a code is IBKR answering, not the wire dropping. The
+    # retry must not blur the two: 1001 means the generation was never queued,
+    # and re-polling a reference code that has nothing behind it just spends
+    # the budget to arrive at the same answer.
+    assert excinfo.value.code == "1001"
+    assert len(calls) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +528,7 @@ def test_refresh_returns_immediately_and_reports_progress(tmp_path, monkeypatch)
 
     started, release = threading.Event(), threading.Event()
 
-    def blocking_fetch(_spec):
+    def blocking_fetch(_spec, **_kw):
         started.set()
         release.wait(5)
         raise RuntimeError("boom")   # the outcome is not what is under test
@@ -476,6 +642,8 @@ def test_button_outcome_does_not_consume_the_scheduler_slot(tmp_path, monkeypatc
 def test_poll_budget_env_override_is_clamped(monkeypatch):
     import importlib
 
+    import pytest
+
     from parser import flex_fetch
 
     monkeypatch.setenv("FLEX_MAX_POLLS", "180")
@@ -501,6 +669,8 @@ def test_poll_budget_env_override_is_clamped(monkeypatch):
 
 def test_poll_budget_env_survives_nan_and_quotes(monkeypatch):
     import importlib
+
+    import pytest
 
     from parser import flex_fetch
 
@@ -739,7 +909,7 @@ def test_refresh_is_refused_when_the_instance_does_not_own_the_quota(monkeypatch
     monkeypatch.setattr(app_mod, "ALLOW_MANUAL_REFRESH", False)
     app_mod._refresh_state.update({"last_finished": 0.0, "in_progress": False})
 
-    def must_not_run(_spec):   # pragma: no cover - the point is that it is not
+    def must_not_run(_spec, **_kw):   # pragma: no cover - the point is that it is not
         raise AssertionError("a locked instance reached IBKR")
 
     monkeypatch.setattr(app_mod, "fetch_one", must_not_run)

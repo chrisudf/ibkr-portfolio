@@ -15,7 +15,7 @@ import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Iterator, Optional
+from typing import Callable, Iterator, Optional
 
 API_BASE = "https://gdcdyn.interactivebrokers.com/Universal/servlet/FlexStatementService"
 
@@ -195,6 +195,21 @@ def _env_num(name: str, default, lo, hi, cast):
 FLEX_POLL_INTERVAL = _env_num("FLEX_POLL_INTERVAL", 15.0, 1.0, 60.0, float)
 FLEX_MAX_POLLS = _env_num("FLEX_MAX_POLLS", 120, 1, 1000, int)
 
+# How many CONSECUTIVE transport failures on GetStatement to ride out before
+# declaring the run dead. Measured need: 2026-09-22 06:12:09 UTC, poll ~45 of
+# 240, "[Errno 104] Connection reset by peer" — one reset, and a run holding a
+# live reference code with 2900s of budget left was thrown away, along with
+# the day's quota (see the asymmetry note in fetch_one).
+#
+# Consecutive, not cumulative, and that is the whole design. A genuinely dead
+# network fails every attempt; scattered blips across a 240-poll run are the
+# expected weather at this budget and must not add up to a false death. The
+# counter resets on any poll that comes back.
+#
+# 0 restores the old fail-on-first-error behaviour, which is the escape hatch
+# if this ever turns out to be masking something that should have been loud.
+FLEX_MAX_POLL_RETRIES = _env_num("FLEX_MAX_POLL_RETRIES", 5, 0, 50, int)
+
 if FLEX_MAX_POLLS * FLEX_POLL_INTERVAL > BUDGET_CEILING_SEC:
     _capped = int(BUDGET_CEILING_SEC // FLEX_POLL_INTERVAL)
     FLEX_CONFIG_NOTES.append(
@@ -210,6 +225,8 @@ def fetch_one(
     *,
     max_polls: int = FLEX_MAX_POLLS,
     poll_interval: float = FLEX_POLL_INTERVAL,
+    max_poll_retries: int = FLEX_MAX_POLL_RETRIES,
+    on_retry: Optional[Callable[[str], None]] = None,
 ) -> str:
     """Block until IBKR delivers the CSV for this query, or raise.
 
@@ -219,6 +236,11 @@ def fetch_one(
     """
     # --- Step 1: queue the report ---------------------------------------------
     send_url = f"{API_BASE}.SendRequest?{urllib.parse.urlencode({'t': spec.token, 'q': spec.query_id, 'v': 3})}"
+    # Deliberately NOT retried, unlike the GetStatement poll below. IBKR's
+    # ~24h-per-query allowance is anchored on the *request*, and a request that
+    # reaches them counts even when the reply never reaches us — so a blind
+    # retry here can spend two days of quota on one sync. A failed SendRequest
+    # is the cheap failure: nothing was generated, so tomorrow 06:00 is intact.
     try:
         send_resp = _http_get(send_url, timeout=30)
     except Exception as exc:  # network blip
@@ -245,16 +267,39 @@ def fetch_one(
     # First poll fires immediately — small queries are often ready by the
     # time SendRequest returns the reference code. Subsequent iterations
     # sleep between attempts.
+    #
+    # Re-polling here is FREE: the reference code is already in hand, so every
+    # GetStatement is a read against a generation IBKR has already accepted,
+    # not a new request against the ~24h allowance. That asymmetry is why this
+    # loop rides out transport errors and SendRequest above does not.
     get_url = f"{API_BASE}.GetStatement?{urllib.parse.urlencode({'t': spec.token, 'q': ref, 'v': 3})}"
     body = ""  # so the give-up branch below can report the last thing we saw
+    consecutive_errors = 0
+    total_errors = 0
     for attempt in range(max_polls):
         if attempt > 0:
             time.sleep(poll_interval)
         try:
             body = _http_get(get_url, timeout=60)
         except Exception as exc:
-            raise FlexFetchError(
-                redact(f"network error on GetStatement: {exc}", spec.token)) from exc
+            # Transport-level failure: no IBKR envelope, no error code, nothing
+            # said about the statement. It carries no information about whether
+            # generation succeeded, so the only wrong move is to conclude
+            # anything from it. Burn a poll and look again.
+            consecutive_errors += 1
+            total_errors += 1
+            if consecutive_errors > max_poll_retries:
+                raise FlexFetchError(
+                    redact(f"network error on GetStatement, {consecutive_errors} in a row "
+                           f"at poll {attempt + 1}/{max_polls}: {exc}", spec.token),
+                    code="network",
+                ) from exc
+            if on_retry:
+                on_retry(redact(
+                    f"network error on GetStatement at poll {attempt + 1}/{max_polls}, "
+                    f"retry {consecutive_errors}/{max_poll_retries}: {exc}", spec.token))
+            continue
+        consecutive_errors = 0
         # IBKR's "still generating" status comes back as an XML envelope
         # carrying the literal phrase, sometimes with ErrorCode 1019.
         if "Statement generation in progress" in body:
@@ -272,8 +317,14 @@ def fetch_one(
         # Anything else is the raw CSV body.
         return body
 
+    # Still censored data — ">budget", never a measurement of how long this
+    # statement actually needed. The error count rides along because a run that
+    # spent polls on retries had less of its budget left for waiting, and the
+    # next person reading "timeout" deserves to know the budget was not spent
+    # the way the number implies.
+    limped = f" ({total_errors} network error(s) retried)" if total_errors else ""
     raise FlexFetchError(
-        f"IBKR still generating after {int(max_polls * poll_interval)}s — try again later",
+        f"IBKR still generating after {int(max_polls * poll_interval)}s{limped} — try again later",
         code="timeout",
         raw=_snippet(body, spec.token),
     )

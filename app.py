@@ -22,8 +22,9 @@ from flask import Flask, jsonify, render_template, request
 
 from parser import parse_ibkr_auto, parse_ibkr_pdf
 from parser.flex_fetch import (FLEX_BUDGET_SEC, FLEX_CONFIG_NOTES,
-                               FLEX_MAX_POLLS, FLEX_POLL_INTERVAL,
-                               FlexFetchError, fetch_one, parse_accounts_env)
+                               FLEX_MAX_POLL_RETRIES, FLEX_MAX_POLLS,
+                               FLEX_POLL_INTERVAL, FlexFetchError, fetch_one,
+                               parse_accounts_env)
 from parser.dataroma import fetch_all as fetch_all_13f
 from parser.ibkr_flex_csv import describe_sections
 from parser.snapshots import load_snapshots, record_snapshot
@@ -53,8 +54,10 @@ app.logger.setLevel(logging.INFO)
 # container. Clamp notes first — a corrected value is worth a WARNING.
 for _note in FLEX_CONFIG_NOTES:
     app.logger.warning("[flex-config] %s", _note)
-app.logger.info("[flex-config] poll budget %ss (%s polls x %ss)",
-                FLEX_BUDGET_SEC, FLEX_MAX_POLLS, FLEX_POLL_INTERVAL)
+app.logger.info("[flex-config] poll budget %ss (%s polls x %ss), "
+                "%s consecutive network retries per poll",
+                FLEX_BUDGET_SEC, FLEX_MAX_POLLS, FLEX_POLL_INTERVAL,
+                FLEX_MAX_POLL_RETRIES)
 
 # Minimum gap between /api/refresh attempts (gating is on attempt-start,
 # regardless of success or failure). Prevents button-spam from chewing
@@ -663,7 +666,15 @@ def _refresh_work(specs: list, trigger: str) -> tuple[dict, int]:
         # echoing config back out of the API.
         entry = {"tag": spec.tag}
         try:
-            csv_body = fetch_one(spec)
+            # A ridden-out reset is not a non-event — it is the difference
+            # between today's data and a burnt day of quota, and this callback
+            # is the only place it is ever recorded. A silent retry would make
+            # the failure that motivated it invisible in exactly the logs
+            # where it was first diagnosed.
+            csv_body = fetch_one(
+                spec,
+                on_retry=lambda msg, _tag=spec.tag: app.logger.warning("[%s] %s", _tag, msg),
+            )
             # A refresh you had to wait out a throttle for is worth one log
             # line: the section list says whether the *query* carries what
             # a panel needs (Cash Transactions for dividends, say), which
