@@ -122,6 +122,9 @@ body {
   border-left: 3px solid var(--amber);
 }
 .stale-banner.bad { border-left-color: var(--red); }
+/* A pass in flight is not a warning — amber would keep the page looking like
+   something is wrong for the 39 minutes it takes to be right. */
+.stale-banner.busy { border-left-color: var(--accent); }
 
 main { padding: 28px 32px 80px; max-width: 1400px; margin: 0 auto; }
 

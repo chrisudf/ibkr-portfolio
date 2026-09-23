@@ -2836,6 +2836,41 @@ let trackedRunId = null;
 // their response before touching any shared state.
 let refreshPollGen = 0;
 
+// What the STALENESS BANNER needs to know about a running pass. The button
+// already knew — pollRefreshStatus has adopted scheduler-started passes since
+// the async refresh landed — but the banner never asked, and the two spoke
+// over each other: on 2026-09-23 the 06:00Z pass took 39 minutes (06:00:46 →
+// 06:39:55), and for that whole window the button read 「自动同步 22分」 while
+// the banner underneath it read 「同步失败中 · 最近一次成功 2 天前」 in red.
+// Both from the same page, at the same moment, about the same pass.
+//
+// The banner was not wrong about its own inputs: the scheduler stamps the
+// attempt BEFORE running (app.py, so a crash cannot become a retry loop) and
+// writes ok/detail only at the end, so mid-pass the state file genuinely
+// holds today's attempt next to YESTERDAY's verdict. The bug is reading a
+// verdict as current while its successor is still being decided.
+//
+// This was survivable while a pass took 20 seconds. At 39 minutes it is a
+// daily window in which the panel tells whoever looks that the thing they are
+// waiting for has already failed.
+const refreshInFlight = { active: false, trigger: "", elapsedSec: 0 };
+
+// Only re-render on a CHANGE of the in-flight fact or a new whole minute.
+// pollRefreshStatus ticks every 3s and the banner is rebuilt from scratch each
+// time it is called; repainting it twenty times a minute to show the same
+// string would be churn with a cursor flickering over the title tooltip.
+function noteRefreshInFlight(active, trigger, elapsedSec) {
+  const was = refreshInFlight.active;
+  const wasMin = Math.floor((refreshInFlight.elapsedSec || 0) / 60);
+  refreshInFlight.active = !!active;
+  refreshInFlight.trigger = trigger || "";
+  refreshInFlight.elapsedSec = Number.isFinite(elapsedSec) ? elapsedSec : 0;
+  if (was !== refreshInFlight.active
+      || Math.floor(refreshInFlight.elapsedSec / 60) !== wasMin) {
+    renderStaleBanner();
+  }
+}
+
 // An instance without ALLOW_MANUAL_REFRESH does not own the day's IBKR
 // generation (the reasoning is in app.py). Latched from /api/refresh/status so
 // the button is inert on arrival rather than inert on press, and read back
@@ -2904,10 +2939,15 @@ async function pollRefreshStatus() {
     if (trackedRunId === null) trackedRunId = st.run_id;
     const who = st.trigger === "auto" ? "自动同步" : "同步中";
     setRefreshBusy(true, `${who} ${fmtElapsed(st.elapsed_sec)}`);
+    noteRefreshInFlight(true, st.trigger, st.elapsed_sec);
     refreshPollTimer = setTimeout(pollRefreshStatus, 3000);
     return;
   }
   setRefreshBusy(false);
+  // Before the `followed` gate below, which returns early for a pass this tab
+  // never adopted: the banner must stop claiming a pass is running the moment
+  // the server says it is not, whoever started it.
+  noteRefreshInFlight(false);
   const last = st.last;
   // Only speak for a pass this page was actually following — without the id,
   // a reload would replay the last result as if it had just happened. But the
@@ -3015,6 +3055,10 @@ async function resumeRefreshWatch() {
     // button sits there looking pressable.
     if (st.manual_allowed === false) lockRefreshButton(REFRESH_LOCK_MSG);
     if (!st.in_progress) return;
+    // Ahead of the trackedRunId guard below: that one is about not starting a
+    // second poll chain, and it must not also decide whether the banner gets
+    // to know. Landing on the page mid-pass is the exact case this is for.
+    noteRefreshInFlight(true, st.trigger, st.elapsed_sec);
     // A button press during this fetch already adopted the pass; re-adopting
     // it here would start a second poll chain against the same run.
     if (trackedRunId !== null) return;
@@ -3118,9 +3162,13 @@ function oldestPeriodEnd(period) {
   return ends.reduce((a, b) => (key(a) <= key(b) ? a : b));
 }
 
-function renderStaleBanner(data) {
+function renderStaleBanner(data = currentDataRef.data) {
   const el = $("stale-banner");
   if (!el) return;
+  // The refresh poller calls this with no payload of its own, and it can fire
+  // before the first load lands (or after one that threw). Nothing to say
+  // about data that isn't here yet.
+  if (!data) { el.hidden = true; return; }
   const sync = currentDataRef.sync;
   const asOf = oldestPeriodEnd((data.statement || {}).Period || "");
   const dataAge = tradingDaysSinceYMD(asOf);
@@ -3137,7 +3185,17 @@ function renderStaleBanner(data) {
   // button's own toast had already said so. Painting the page red there is how
   // a banner earns the right to be ignored — which costs exactly the outage
   // this one exists to catch. Never having succeeded still counts as failing.
-  const syncFailing = !!(sync && sync.ok === false) && (
+  // A pass that is RUNNING outranks the verdict of the one before it. The
+  // state file cannot express "deciding" — it holds today's attempt stamp
+  // beside yesterday's ok/detail for the whole 39 minutes — so this is the
+  // only place that distinction can be drawn, and the server already publishes
+  // the fact via /api/refresh/status.
+  //
+  // Note what is NOT suppressed: the data-age line below. "The numbers on
+  // screen are three trading days old" stays true while a pass runs, and it is
+  // the half of the banner a running sync does not answer.
+  const running = refreshInFlight.active;
+  const syncFailing = !running && !!(sync && sync.ok === false) && (
     sync.last_run_trigger !== "button"
     || sinceSuccess === null
     || sinceSuccess >= syncGraceMs(sync.mode)
@@ -3146,6 +3204,14 @@ function renderStaleBanner(data) {
   const parts = [];
   if (dataAge !== null && dataAge >= STALE_AFTER_TRADING_DAYS) {
     parts.push(`数据停留在 ${fmtYMD(asOf)}（${dataAge} 个交易日前）`);
+  }
+  if (running) {
+    // Name the trigger for the same reason the header line does: a pass the
+    // scheduler started is evidence the unattended pipe is alive, and calling
+    // a button press 自动同步 would forge exactly that evidence.
+    const who = refreshInFlight.trigger === "auto" ? "自动同步" : "手动同步";
+    const ran = fmtElapsed(refreshInFlight.elapsedSec);
+    parts.push(`${who}进行中${ran ? ` · 已运行 ${ran}` : ""}`);
   }
   if (syncFailing) {
     parts.push(sinceSuccess !== null
@@ -3157,10 +3223,18 @@ function renderStaleBanner(data) {
     return;
   }
   el.hidden = false;
-  el.className = "stale-banner" + (syncFailing ? " bad" : "");
+  el.className = "stale-banner"
+    + (syncFailing ? " bad" : (running ? " busy" : ""));
+  // ⟳ only when waiting is the whole message. With a stale-data line next to
+  // it there is still something wrong, and the icon should not soften that.
+  const icon = running && parts.length === 1 ? "⟳" : "⚠";
   // textContent, not innerHTML: detail carries IBKR's own error strings.
-  el.textContent = "⚠ " + parts.join("　·　");
-  el.title = (sync && sync.detail) || "";
+  el.textContent = `${icon} ${parts.join("　·　")}`;
+  // While a pass runs, detail describes the PREVIOUS one. Keeping it is worth
+  // more than dropping it, but unlabelled it is the same wrong answer in
+  // smaller type.
+  const detail = (sync && sync.detail) || "";
+  el.title = running && detail ? `上一次同步：${detail}` : detail;
 }
 
 document.addEventListener("DOMContentLoaded", () => {
