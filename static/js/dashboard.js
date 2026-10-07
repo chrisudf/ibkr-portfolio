@@ -1170,15 +1170,20 @@ function pickBaseline(snapshots, curDate) {
 // (80 P, not 26.67 P), and the next day spelled it back. The realized
 // figure travels with the contract to the cent, so a vanished row whose
 // amount reappears on a NEW row of the same underlying is a rename: keep
-// both, and they net to zero as before.
+// both, and they net to zero as before. A renamed row is still the same
+// closed contract — same asset kind, still no unrealized — so only rows
+// like that may vouch; a new position that happens to match the amount
+// must not swallow the aged-out profit (PR #24 review).
 function agedOutKeys(curPerf, basePerf) {
   const under = (k, kind) => (kind === "S" ? k : optionUnderlying(k));
-  const born = Object.keys(curPerf).filter(k => !(k in basePerf));
+  const born = Object.keys(curPerf).filter(k => !(k in basePerf)
+    && Math.abs(curPerf[k][1]) < REALIZED_EPS);
   const out = new Set();
   for (const [k, was] of Object.entries(basePerf)) {
     if (k in curPerf || Math.abs(was[1]) >= REALIZED_EPS) continue;
     const u = under(k, was[2]);
-    const i = born.findIndex(b => under(b, curPerf[b][2]) === u
+    const i = born.findIndex(b => curPerf[b][2] === was[2]
+      && under(b, was[2]) === u
       && Math.abs(curPerf[b][0] - was[0]) < REALIZED_EPS);
     if (i >= 0) born.splice(i, 1);  // each new row can vouch for one rename
     else out.add(k);
