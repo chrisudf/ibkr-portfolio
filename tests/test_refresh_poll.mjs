@@ -30,11 +30,26 @@ function extract(name) {
   return m[0];
 }
 
+// 单行的顶层 const —— refreshInFlight 那种对象字面量，extractConst() 认的是
+// 以行首 `};` 收尾的多行写法，接不住它。
+function extractLine(name) {
+  const m = src.match(new RegExp(`^const ${name} = [^;]+;`, "m"));
+  if (!m) throw new Error(`cannot extract const ${name} from dashboard.js`);
+  return m[0];
+}
+
+// pollRefreshStatus 会把「在跑 / 没跑」报给告警条（noteRefreshInFlight，
+// PR #23）。这两段用真的，只把它最后调的 renderStaleBanner 换成计数 stub。
+// 沙箱里少了它们，pollRefreshStatus 一走到那一行就是 ReferenceError ——
+// #23 之后这里 8 条测试就是这么全挂的。
+const inFlightPrelude = () =>
+  `${extractLine("refreshInFlight")}\n${extract("noteRefreshInFlight")}`;
+
 // ---- pollRefreshStatus 的沙箱 ----------------------------------------------
 // reportRefreshOutcome 用真的（它是播报口径本身），showToast/loadPortfolio/
 // setRefreshBusy 记录调用，fetch 喂一份固定的 /api/refresh/status 应答。
 function pollSandbox({ status, tracked, loadRejects = false }) {
-  const calls = { toasts: [], loads: 0, busy: [], timers: 0 };
+  const calls = { toasts: [], loads: 0, busy: [], timers: 0, banner: 0 };
   const stubs = {
     fetch: async () => ({ json: async () => status }),
     showToast: (kind, title, detail) => calls.toasts.push({ kind, title, detail: detail || "" }),
@@ -45,17 +60,20 @@ function pollSandbox({ status, tracked, loadRejects = false }) {
     setRefreshBusy: (busy, label) => calls.busy.push({ busy, label }),
     setTimeout: () => { calls.timers += 1; return 0; },
     clearTimeout: () => {},
+    renderStaleBanner: () => { calls.banner += 1; },
   };
   const build = new Function("stubs", `
     const { fetch, showToast, loadPortfolio, setRefreshBusy,
-            setTimeout, clearTimeout } = stubs;
+            setTimeout, clearTimeout, renderStaleBanner } = stubs;
     let refreshPollTimer = null;
     let trackedRunId = ${JSON.stringify(tracked)};
     let refreshPollGen = 0;
+    ${inFlightPrelude()}
     ${extract("fmtElapsed")}
     ${extract("reportRefreshOutcome")}
     ${extract("pollRefreshStatus")}
-    return { run: pollRefreshStatus, tracked: () => trackedRunId };
+    return { run: pollRefreshStatus, tracked: () => trackedRunId,
+             inFlight: refreshInFlight };
   `);
   return { ...build(stubs), calls };
 }
@@ -125,6 +143,41 @@ test("在飞的 pass 被领养：busy label + 续约下一次 poll", async () =>
   assert.match(busy.label, /自动同步/);
 });
 
+test("在飞的 pass 也告诉告警条：进行中、谁起的、跑了多久", async () => {
+  const s = pollSandbox({
+    status: { in_progress: true, run_id: 5, trigger: "auto", elapsed_sec: 1332 },
+    tracked: null,
+  });
+  await s.run();
+  assert.deepEqual({ ...s.inFlight }, { active: true, trigger: "auto", elapsedSec: 1332 });
+  assert.equal(s.calls.banner, 1);
+});
+
+test("服务器说不在跑了：告警条立刻撤掉「进行中」—— 哪怕这个 tab 没跟这一趟", async () => {
+  // noteRefreshInFlight(false) 在 followed 门之前。调度器起、这个页面没领养
+  // 的那一趟结束时，横幅不能一直挂着「自动同步进行中」。
+  const s = pollSandbox({ status: okPass(7), tracked: null });
+  Object.assign(s.inFlight, { active: true, trigger: "auto", elapsedSec: 2349 });
+  await s.run();
+  assert.equal(s.inFlight.active, false);
+  assert.equal(s.calls.banner, 1);
+  assert.equal(s.calls.loads, 0, "没跟的 run 仍然不重取");
+});
+
+test("告警条只在翻转或跨整分钟时重绘 —— 轮询 3 秒一次，别让它跟着抖", () => {
+  let renders = 0;
+  const { note, state } = new Function("renderStaleBanner", `
+    ${inFlightPrelude()}
+    return { note: noteRefreshInFlight, state: refreshInFlight };
+  `)(() => { renders += 1; });
+  note(true, "auto", 34);  assert.equal(renders, 1, "没跑 → 在跑");
+  note(true, "auto", 37);  assert.equal(renders, 1, "同一分钟内");
+  note(true, "auto", 61);  assert.equal(renders, 2, "跨进第 1 分钟");
+  note(false);             assert.equal(renders, 3, "在跑 → 没跑");
+  note(false);             assert.equal(renders, 3, "一直没跑");
+  assert.equal(state.elapsedSec, 0, "没给耗时就归零，不留上一趟的读数");
+});
+
 // ---- refreshFromIBKR 的 429 分支 -------------------------------------------
 function buttonSandbox({ response, preflight = { manual: { risky: false } },
                          confirmResult = true, preflightThrows = false }) {
@@ -184,7 +237,7 @@ test("429 too-soon（带 retry_after_sec）：真的要等，不领养", async (
 // 的 resume 和一次按钮点击可以各自起一条 poll 链，晚到的那份 in_progress 会把
 // 已经结束的 run 重新领养回来。
 function racePollSandbox({ responses, tracked }) {
-  const calls = { toasts: [], loads: 0, busy: [], timers: 0 };
+  const calls = { toasts: [], loads: 0, busy: [], timers: 0, banner: 0 };
   let n = 0;
   const stubs = {
     fetch: async () => {
@@ -197,17 +250,20 @@ function racePollSandbox({ responses, tracked }) {
     setRefreshBusy: (busy, label) => calls.busy.push({ busy, label }),
     setTimeout: () => { calls.timers += 1; return 0; },
     clearTimeout: () => {},
+    renderStaleBanner: () => { calls.banner += 1; },
   };
   const build = new Function("stubs", `
     const { fetch, showToast, loadPortfolio, setRefreshBusy,
-            setTimeout, clearTimeout } = stubs;
+            setTimeout, clearTimeout, renderStaleBanner } = stubs;
     let refreshPollTimer = null;
     let trackedRunId = ${JSON.stringify(tracked)};
     let refreshPollGen = 0;
+    ${inFlightPrelude()}
     ${extract("fmtElapsed")}
     ${extract("reportRefreshOutcome")}
     ${extract("pollRefreshStatus")}
-    return { run: pollRefreshStatus, tracked: () => trackedRunId };
+    return { run: pollRefreshStatus, tracked: () => trackedRunId,
+             inFlight: refreshInFlight };
   `);
   return { ...build(stubs), calls };
 }
@@ -230,6 +286,8 @@ test("晚到的 in_progress 应答被丢掉：不复活 spinner，也不把完�
   assert.equal(s.calls.toasts.filter((t) => t.title === "已更新").length, 1);
   // 晚到的 in_progress 不得把按钮重新按成忙碌，也不得把 trackedRunId 改回去。
   assert.equal(s.calls.busy.at(-1).busy, false);
+  // 告警条同理：晚到的那份不该把「进行中」挂回去。
+  assert.equal(s.inFlight.active, false);
   assert.equal(s.tracked(), null);
 });
 
@@ -258,11 +316,13 @@ test("合并视图取最旧的 as-of —— 新账号不该把陈旧的那个挡
 
 
 // ---- 告警条 ----------------------------------------------------------------
-// renderStaleBanner 不纯（$ / currentDataRef），所以整块连同它依赖的日期助手
-// 一起塞进 new Function，只把 $ 和 currentDataRef 换成可观测的 stub。
+// renderStaleBanner 不纯（$ / currentDataRef / refreshInFlight），所以整块连同
+// 它依赖的日期助手一起塞进 new Function，只把这三样换成可观测的 stub。
 function extractBannerBlock() {
   const start = src.indexOf("const STALE_AFTER_TRADING_DAYS = 3;");
-  const fnStart = src.indexOf("function renderStaleBanner(data) {");
+  // 按函数名找，不按整行签名找：#23 给它加了默认参数
+  // `(data = currentDataRef.data)`，整行字面量一改，12 条测试全挂在这里。
+  const fnStart = src.search(/^function renderStaleBanner\(/m);
   if (start < 0 || fnStart < 0) throw new Error("cannot locate the banner block");
   // 收尾用正则找行首的 } —— Windows 检出下工作区是 CRLF，字面量 "\n}\n" 永远
   // 找不到。上面 extract()/extractConst() 里的 [\s\S]*? 恰好能吃掉 \r，所以它
@@ -275,7 +335,7 @@ function extractBannerBlock() {
 // 相对今天算，避开对 Date.now 打桩。UTC 口径和 daysSinceYMD 一致。
 const dayOffset = (n) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
 
-function bannerSandbox({ sync, period, nowMs }) {
+function bannerSandbox({ sync, period, nowMs, inFlight, noData = false }) {
   const el = { hidden: null, className: "", textContent: "", title: "" };
   // 冻结时钟才能测跨午夜：只有 now/parse/UTC 被用到。
   const Real = Date;
@@ -283,14 +343,19 @@ function bannerSandbox({ sync, period, nowMs }) {
     function (...a) { return new Real(...a); },
     { now: () => nowMs, parse: Real.parse, UTC: Real.UTC });
   const build = new Function("stubs", `
-    const { $, currentDataRef, Date } = stubs;
+    const { $, currentDataRef, Date, refreshInFlight } = stubs;
+    ${extract("fmtElapsed")}
     ${extractConst("MONTH_NUM")}
     ${extractConst("parsePeriodBounds")}
     ${extractBannerBlock()}
     return renderStaleBanner;
   `);
-  build({ $: () => el, currentDataRef: { sync }, Date: clock })(
-    { statement: { Period: period } });
+  const render = build({
+    $: () => el, currentDataRef: { sync }, Date: clock,
+    refreshInFlight: { active: false, trigger: "", elapsedSec: 0, ...inFlight },
+  });
+  // noData：轮询在首屏数据落地前就会调它，不带参数，走 currentDataRef.data 默认值。
+  if (noData) render(); else render({ statement: { Period: period } });
   return el;
 }
 
@@ -308,11 +373,15 @@ test("当天同步成功、随后手点失败：不报红 —— 数据是新的
 });
 
 test("失败且已经跨过一个调度周期：报红 —— 这才是断更", () => {
+  // 冻结时钟。原来按 dayOffset(5) + 「T06:00」拼成功时刻，在 06:00 UTC 之前
+  // 跑就只过了 4 天 23 小时，读成「4 天前」—— 每天布里斯班 10:00–16:00 必挂。
+  // 横幅那 12 条挂着的那两周，这一条的钟点病也一起藏着。
   const el = bannerSandbox({
-    period: `2025-09-05 → ${dayOffset(8)}`,
+    nowMs: Date.UTC(2026, 8, 16, 7, 0, 0),
+    period: "2025-09-09 → 2026-09-08",
     sync: {
       ok: false, mode: "daily", last_run_trigger: "auto",
-      last_success: `${dayOffset(5)}T06:00:00+00:00`, detail: "1019",
+      last_success: "2026-09-11T06:00:00+00:00", detail: "1019",
     },
   });
   assert.equal(el.hidden, false);
@@ -437,6 +506,71 @@ test("单个节假被阈值吸收：不专门维护节假日表", () => {
     period: "2025-09-05 → 2026-09-04",
     sync: { ok: true, mode: "daily", last_run_trigger: "auto",
             last_success: "2026-09-08T06:00:00+00:00" },
+  });
+  assert.equal(el.hidden, true);
+});
+
+
+// ---- 同步进行中 ---------------------------------------------------------------
+// 2026-09-23 的计划同步跑了 39 分钟。整段时间里状态文件是「今天的尝试戳 +
+// 昨天的结论」，横幅照念就是红色的「同步失败中」，而同一页面上的按钮写着
+// 「自动同步 22分」。在跑的那一趟要压过上一趟的结论。
+const failedYesterday = {
+  ok: false, mode: "daily", last_run_trigger: "auto",
+  last_success: `${dayOffset(2)}T06:39:55+00:00`, detail: "1019",
+};
+
+test("在跑 + 上一趟失败：压掉失败结论，只说进行中", () => {
+  const el = bannerSandbox({
+    period: `2025-09-05 → ${dayOffset(1)}`,
+    sync: failedYesterday,
+    inFlight: { active: true, trigger: "auto", elapsedSec: 1332 },
+  });
+  assert.equal(el.hidden, false);
+  assert.equal(el.className, "stale-banner busy");
+  assert.equal(el.textContent, "⟳ 自动同步进行中 · 已运行 22分12秒");
+  // 旧 detail 留着，但标明是上一趟的 —— 不标就是换个字号的同一个错答案。
+  assert.equal(el.title, "上一次同步：1019");
+});
+
+test("同一组输入、没在跑：照样报红 —— 压掉的只是「在跑时」", () => {
+  const el = bannerSandbox({
+    period: `2025-09-05 → ${dayOffset(1)}`,
+    sync: failedYesterday,
+  });
+  assert.match(el.className, /bad/);
+  assert.match(el.textContent, /同步失败中/);
+  assert.equal(el.title, "1019");
+});
+
+test("在跑 + 数据陈旧：两句都说，图标是 ⚠ 不是 ⟳，但不涂失败色", () => {
+  // 数据旧这一半在同步期间依然为真，而且正是同步还没回答的那一半。
+  const el = bannerSandbox({
+    nowMs: Date.UTC(2026, 8, 16, 7, 0, 0),
+    period: "2025-09-12 → 2026-09-11",
+    sync: { ok: true, mode: "daily", last_run_trigger: "auto",
+            last_success: "2026-09-15T06:00:00+00:00" },
+    inFlight: { active: true, trigger: "auto", elapsedSec: 600 },
+  });
+  assert.equal(el.className, "stale-banner busy");
+  assert.match(el.textContent, /^⚠ /);
+  assert.match(el.textContent, /数据停留在 2026-09-11（3 个交易日前）/);
+  assert.match(el.textContent, /自动同步进行中 · 已运行 10分00秒/);
+});
+
+test("手点起的那一趟叫「手动同步」—— 说成自动就是伪造「调度器还活着」", () => {
+  const el = bannerSandbox({
+    period: `2025-09-05 → ${dayOffset(1)}`,
+    sync: { ok: true, last_success: `${dayOffset(0)}T06:00:00+00:00` },
+    inFlight: { active: true, trigger: "button", elapsedSec: 45 },
+  });
+  assert.equal(el.textContent, "⟳ 手动同步进行中 · 已运行 45秒");
+});
+
+test("首屏数据还没到就被轮询调用：什么都不说", () => {
+  const el = bannerSandbox({
+    sync: failedYesterday, noData: true,
+    inFlight: { active: true, trigger: "auto", elapsedSec: 60 },
   });
   assert.equal(el.hidden, true);
 });
