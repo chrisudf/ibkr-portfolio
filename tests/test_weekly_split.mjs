@@ -37,10 +37,10 @@ const consts = [
   extractConst(/const REALIZED_EPS = [^;]+;/, "REALIZED_EPS"),
 ].join("\n");
 
-const { weeklyDiff, splitLabel } = new Function(
+const { weeklyDiff, splitLabel, agedOutKeys } = new Function(
   `${consts}\n${extract("pickBaseline")}\n${extract("optionUnderlying")}\n`
-  + `${extract("weeklyDiff")}\n${extract("splitLabel")}\n`
-  + "return { weeklyDiff, splitLabel };")();
+  + `${extract("agedOutKeys")}\n${extract("weeklyDiff")}\n${extract("splitLabel")}\n`
+  + "return { weeklyDiff, splitLabel, agedOutKeys };")();
 
 // 一份贴着真实形状的账本：
 //   MSFT  正股 + 一条期权腿    → 两侧都实质贡献
@@ -306,4 +306,100 @@ test("窄屏豁免：整列隐藏时清仓徽章必须留下来", () => {
   assert.ok(m, "cannot find the narrow-screen .wk-row block");
   assert.match(m[0], /\.wk-meta \{ display: none; \}/);
   assert.match(m[0], /\.wk-meta\.has-tag \{ display: block;/);
+});
+
+/* --- 滑出滚动窗口 ----------------------------------------------------------
+ * 已实现是 IBKR 报表期间（滚动 365 天）里的累计。一年前平掉的合约整行掉出
+ * 报表，diff 就把它当年赚的全部记成「本周亏损」—— 2026-10-05 的 AMD：账上
+ * 没有一股、没有一张期权，却进了输家 Top 5。
+ */
+function diffPerf(basePerf, livePerf, stocks = {}) {
+  const snap = (date, perf) => ({ date, nav: 100000, stocks, perf });
+  return weeklyDiff(snap("2026-10-05", livePerf), [snap("2026-09-28", basePerf)]);
+}
+const rowOf = (d, u) => d.rows.find(r => r.u === u);
+
+test("现场复现：AMD 一年前平掉的 put 滑出窗口，不该进输家榜", () => {
+  // U174***81 的真实数字：约 2025-10-02 平仓 +$94.79，10-02 起的报表里整行消失。
+  const d = diffPerf(
+    { "AMD 10OCT25 135 P": [94.79066, 0, "O"] },
+    {});
+  assert.equal(rowOf(d, "AMD"), undefined, "滑出窗口被记成了 −$95");
+});
+
+test("同一标的的其他腿照常计入 —— NVDA 赢家不再被少算 $134", () => {
+  // 同一天滑出的还有 NVDA 10OCT25 160 P（+$133.90）。它不该从这一周真实的
+  // 期权浮盈变化里扣掉。
+  const d = diffPerf(
+    { "NVDA 10OCT25 160 P": [133.89816, 0, "O"], "NVDA 16OCT26 170 P": [0, 50, "O"] },
+    { "NVDA 16OCT26 170 P": [0, 300, "O"] });
+  assert.ok(Math.abs(rowOf(d, "NVDA").total - 250) < 1e-6, `total=${rowOf(d, "NVDA").total}`);
+});
+
+test("改名不是滑出：NVDL 80 P ↔ 26.67 P 金额一分不差，两边相抵为零", () => {
+  // 2026-09-24 那份报表把复权后的 NVDL put 写成了拆股前的行权价，次日又改了
+  // 回来。只按「整行消失」剔除的话，旧名被剔掉、新名的 −$38.93 却当成本周新
+  // 成交照记 —— 修一个假输家，造一个新的。两个方向都要成立。
+  const adj = { "NVDL 17JUL26 26.67 P": [-38.931234, 0, "O"] };
+  const raw = { "NVDL 17JUL26 80 P": [-38.931234, 0, "O"] };
+  for (const [base, live] of [[adj, raw], [raw, adj]]) {
+    assert.equal(agedOutKeys(live, base).size, 0);
+    const r = rowOf(diffPerf(base, live), "NVDL");
+    assert.ok(!r || Math.abs(r.total) < 1e-6, `total=${r && r.total}`);
+  }
+});
+
+test("一个新行只能替一次改名作证", () => {
+  // 两条同金额的旧行消失、只冒出一条新行：配上一对，另一条照样算滑出。
+  const out = agedOutKeys(
+    { "XYZ 16OCT26 9 P": [40, 0, "O"] },
+    { "XYZ 10OCT25 30 P": [40, 0, "O"], "XYZ 17OCT25 30 P": [40, 0, "O"] });
+  assert.equal(out.size, 1);
+});
+
+test("别的标的上的同额新行不算改名", () => {
+  const out = agedOutKeys(
+    { "MSFT 16OCT26 400 P": [94.79066, 0, "O"] },
+    { "AMD 10OCT25 135 P": [94.79066, 0, "O"] });
+  assert.deepEqual([...out], ["AMD 10OCT25 135 P"]);
+});
+
+test("还开着的新仓不能替改名作证 —— 金额撞上了也不行", () => {
+  // 改名后的行仍是同一张已平合约：浮动为零。一张本周新开、部分平仓、已实现
+  // 碰巧同额的合约还挂着浮动，它要是被配走，滑出的 +$94.79 就又回来了。
+  const out = agedOutKeys(
+    { "AMD 16OCT26 150 P": [94.79066, -30, "O"] },
+    { "AMD 10OCT25 135 P": [94.79066, 0, "O"] });
+  assert.deepEqual([...out], ["AMD 10OCT25 135 P"]);
+});
+
+test("资产类别不同不算改名：期权行不能替正股行作证", () => {
+  // 正股键是 ticker 本身、期权键取标的，两者落在同一个 u 上；改名不会把
+  // 正股变成期权。
+  const out = agedOutKeys(
+    { "AMD 16OCT26 150 P": [94.79066, 0, "O"] },
+    { AMD: [94.79066, 0, "S"] });
+  assert.deepEqual([...out], ["AMD"]);
+});
+
+test("真亏损不能被当成滑出吞掉：行还在，已实现往下走就是成交", () => {
+  // 基线时浮亏 −120 的 put，本周以 −300 平仓 —— 这一周多亏了 180。
+  const d = diffPerf(
+    { "COIN 16OCT26 300 P": [0, -120, "O"] },
+    { "COIN 16OCT26 300 P": [-300, 0, "O"] });
+  assert.ok(Math.abs(rowOf(d, "COIN").total - (-180)) < 1e-6);
+});
+
+test("基线时还开着的腿整行消失不归它管 —— 那是数据缺口，不是滑出", () => {
+  // 一张开着的合约在 365 天窗口里不可能凭空消失（平掉会留下已实现）。真碰上
+  // 了就是报表本身缺行，剔除规则不替它做主，行为保持原样。
+  assert.equal(agedOutKeys({}, { "XYZ 16OCT26 40 P": [0, -80, "O"] }).size, 0);
+});
+
+test("已知缺口：还在交易的正股，一年前那笔卖出滑出窗口时查不出来", () => {
+  // 行一直在（这一年里还有别的成交），只是累计值往下掉了一截 —— 快照里没有
+  // 逐笔成交，分不出「滑出」和「本周亏损卖出」。面板脚注照旧承认这一点。
+  // 改掉这个行为时，这条会先响。
+  const d = diffPerf({ NVDA: [500, 0, "S"] }, { NVDA: [366.10, 0, "S"] });
+  assert.ok(Math.abs(rowOf(d, "NVDA").total - (-133.9)) < 1e-6);
 });
