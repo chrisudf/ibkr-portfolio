@@ -1108,8 +1108,9 @@ function renderMargin(data, accounts) {
  * (uploads/{acct}.snapshots.jsonl, attached to the payload as `snapshots`).
  * The recap diffs the live book against the snapshot closest to seven days
  * back. P&L per underlying = Δunrealized (position-based, clean) +
- * Δrealized (rolling-window cumulative — a trade dropping off the window's
- * far end can distort it, which the panel footnote admits).
+ * Δrealized (rolling-window cumulative — a closed contract whose whole row
+ * ages out of the window is caught by agedOutKeys; a year-old fill on a
+ * symbol that still trades is not, which the panel footnote admits).
  * ------------------------------------------------------------------------- */
 
 const SNAP_MIN_GAP = 5, SNAP_TARGET_GAP = 7, SNAP_MAX_GAP = 16;
@@ -1156,6 +1157,35 @@ function pickBaseline(snapshots, curDate) {
   return best;
 }
 
+// Perf rows that left the book without a trade. Realized P&L is a rolling
+// 365-day sum, so a contract closed a year ago drops out of the statement
+// whole — and the diff would book its entire profit as this week's loss.
+// AMD on 2026-10-05: a put closed around 2025-10-02 for +$94.79 aged out,
+// and a name with no shares and no open options landed in 输家 Top 5.
+//
+// A trade cannot make a row vanish — closing one ADDS realized to it — so a
+// row present at the baseline, closed there (no unrealized), and absent now
+// has aged out. One exception, also seen live: IBKR renames contracts. The
+// 2026-09-24 statement spelled an adjusted NVDL put by its pre-split strike
+// (80 P, not 26.67 P), and the next day spelled it back. The realized
+// figure travels with the contract to the cent, so a vanished row whose
+// amount reappears on a NEW row of the same underlying is a rename: keep
+// both, and they net to zero as before.
+function agedOutKeys(curPerf, basePerf) {
+  const under = (k, kind) => (kind === "S" ? k : optionUnderlying(k));
+  const born = Object.keys(curPerf).filter(k => !(k in basePerf));
+  const out = new Set();
+  for (const [k, was] of Object.entries(basePerf)) {
+    if (k in curPerf || Math.abs(was[1]) >= REALIZED_EPS) continue;
+    const u = under(k, was[2]);
+    const i = born.findIndex(b => under(b, curPerf[b][2]) === u
+      && Math.abs(curPerf[b][0] - was[0]) < REALIZED_EPS);
+    if (i >= 0) born.splice(i, 1);  // each new row can vouch for one rename
+    else out.add(k);
+  }
+  return out;
+}
+
 function weeklyDiff(current, snapshots) {
   const base = pickBaseline(snapshots, current.date);
   if (!base) return null;
@@ -1177,7 +1207,9 @@ function weeklyDiff(current, snapshots) {
   const keys = new Set([
     ...Object.keys(current.perf || {}), ...Object.keys(base.snap.perf || {}),
   ]);
+  const agedOut = agedOutKeys(current.perf || {}, base.snap.perf || {});
   for (const k of keys) {
+    if (agedOut.has(k)) continue;  // not a trade — see agedOutKeys
     const now = (current.perf || {})[k] || [0, 0, null];
     const was = (base.snap.perf || {})[k] || [0, 0, null];
     const kind = now[2] || was[2] || "O";
