@@ -26,8 +26,8 @@
 uploads 是 docker 具名卷 `app_data`，挂在容器的 `/app/uploads`：
 
 ```bash
-for f in U17456181.json U17456181.snapshots.jsonl          U22846783.json U22846783.snapshots.jsonl .position_settings.json; do
-  ssh deploy@167.71.193.42     "cd /opt/ibkr-portfolio/deploy && docker compose exec -T app cat /app/uploads/$f"     > "uploads/$f"
+for f in U1234567.json U1234567.snapshots.jsonl          U7654321.json U7654321.snapshots.jsonl .position_settings.json; do
+  ssh deploy@your-server     "cd /opt/ibkr-portfolio/deploy && docker compose exec -T app cat /app/uploads/$f"     > "uploads/$f"
 done
 ```
 

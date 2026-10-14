@@ -243,7 +243,7 @@ baseline 稳了再加 web 通道，否则两条链路同时排查更累。
   - 读 token、query IDs 从 docker env（`env_file: ../scripts/sync.env`）
   - 串行处理每个账号（避免 IBKR 把你当 spam）
   - 同步等待结果（典型 5–30 秒）
-  - 返回 `{ok: true, accounts: ["U17456181", "U22846783"]}` 或
+  - 返回 `{ok: true, accounts: ["U1234567", "U7654321"]}` 或
     `{error: "1001 throttled, try again in 5 min"}`
 - 容器化：`deploy/docker-compose.yml` 加一行
   ```yaml

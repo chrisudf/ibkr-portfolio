@@ -32,7 +32,7 @@ from parser.snapshots import load_snapshots, record_snapshot
 BASE_DIR = Path(__file__).parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
-# Per-account state files: uploads/U17456181.json etc.
+# Per-account state files: uploads/U1234567.json etc.
 # Legacy single-file (last_portfolio.json) is still read for backward compat.
 LEGACY_STATE_FILE = UPLOAD_DIR / "last_portfolio.json"
 
@@ -1034,18 +1034,28 @@ def _auto_sync_loop() -> None:
             app.logger.exception("[auto-sync] loop error")
 
 
+# `python app.py` runs with the Werkzeug debugger + reloader OFF unless
+# FLASK_DEBUG is set (same truthiness rule as `flask run`). The debugger's
+# in-browser console executes arbitrary Python, so flipping host to 0.0.0.0
+# must not quietly publish it to the LAN.
+_flask_debug = os.environ.get("FLASK_DEBUG", "").strip().lower()
+DEV_DEBUG = bool(_flask_debug) and _flask_debug not in ("0", "false", "no")
+
+
 if AUTO_SYNC in ("daily", "weekly"):
     # Started at import so an unattended droplet syncs without anyone
     # opening the page. Under the flask dev reloader the module imports in
     # TWO processes, and _refresh_lock is per-process memory — the parent's
     # scheduler could fetch concurrently with a button press served by the
     # child. Only the serving process (WERKZEUG_RUN_MAIN=true) may start
-    # the thread; under gunicorn (module imported, __name__ != "__main__",
+    # the thread; without the reloader (DEV_DEBUG off) there is only one
+    # process. Under gunicorn (module imported, __name__ != "__main__",
     # single worker per Dockerfile) production gets exactly one.
-    if os.environ.get("WERKZEUG_RUN_MAIN") == "true" or __name__ != "__main__":
+    if (os.environ.get("WERKZEUG_RUN_MAIN") == "true" or __name__ != "__main__"
+            or not DEV_DEBUG):
         threading.Thread(target=_auto_sync_loop, daemon=True, name="auto-sync").start()
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5050"))
-    app.run(host="127.0.0.1", port=port, debug=True)
+    app.run(host="127.0.0.1", port=port, debug=DEV_DEBUG)
