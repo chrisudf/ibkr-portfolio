@@ -303,6 +303,42 @@
           当前持仓无价差组合；跨账户不共享抵押品，合并视图为各账户分别计算后相加。</div>
       </section>
 
+      <!-- IBKR Exposure Fee -->
+      <section class="panel" id="fees-panel" hidden>
+        <div class="panel-head">
+          <h2>敞口费 Exposure Fee</h2>
+          <span class="panel-note" id="fee-note"></span>
+        </div>
+        <div class="div-hero">
+          <div>
+            <div class="div-hero-label">期间合计（含 GST）</div>
+            <div class="div-hero-value fee-hero-value" id="fee-total">$0</div>
+            <div class="div-hero-sub" id="fee-sub"></div>
+          </div>
+          <div class="div-hero-yield" id="fee-recent"></div>
+        </div>
+        <div class="div-chart fee-chart" id="fee-chart"></div>
+        <div class="div-chart-note" id="fee-chart-note"></div>
+        <div class="table-wrap" style="margin-top:18px">
+          <table class="holdings">
+            <thead>
+              <tr>
+                <th>计费日（仓位）</th><th>入账日</th>
+                <th class="num">费用</th><th class="num">GST</th><th class="num">合计</th>
+              </tr>
+            </thead>
+            <tbody id="fee-body"></tbody>
+          </table>
+        </div>
+        <div class="margin-foot" id="fee-foot"></div>
+        <div class="div-legend">
+          IBKR 每天收盘后用比保证金更极端的情景给组合做压力测试，各情景下亏损超出账户权益部分的平均值
+          （Average Exposure）按日计费，下一个交易日入账，另加 10% GST。周一入账的那笔包含周五、周六、
+          周日三天，节假日同理。金额本身不大，它量的是最坏情况下账户会穿仓多少，所以看趋势比看金额有用。
+          降低办法：增加账户权益、买回便宜的卖出期权、分散或对冲集中持仓。
+        </div>
+      </section>
+
       <!-- Dividends -->
       <section class="panel" id="dividends-panel" hidden>
         <div class="panel-head">

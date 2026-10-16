@@ -147,6 +147,19 @@ function fundedSeries(navHistory) {
   return pts.slice(i);
 }
 
+// Fees for the merged view. Every charge belongs to exactly one account, so
+// this is a concat, tagged with the account so the table can say whose it
+// was. An account without Statement of Funds ships fees={} and adds nothing.
+function mergeFees(list) {
+  const events = list.flatMap(a => (a.fees?.events || [])
+    .map(e => ({ ...e, account: a.account?.Account || "" })));
+  if (!events.length) return {};
+  events.sort((x, y) => y.date.localeCompare(x.date)
+    || (y.for_date || "").localeCompare(x.for_date || "")
+    || x.account.localeCompare(y.account));
+  return { source: "statement_of_funds", events };
+}
+
 function mergeAccounts(accounts) {
   const list = Object.values(accounts);
   if (list.length === 1) return list[0];
@@ -506,13 +519,14 @@ function mergeAccounts(accounts) {
   // out of the merged return chain, and each flow belongs to exactly one
   // account so no dedupe question arises.
   const cash_flows = list.flatMap(a => a.cash_flows || []);
+  const fees = mergeFees(list);
 
   // If accounts share the same period (the usual case) collapse to one.
   const periods = [...new Set(list.map(a => a.statement?.Period).filter(Boolean))];
   return {
     account: { Account: "ALL" },
     statement: { Period: periods.length === 1 ? periods[0] : periods.join(" / ") },
-    nav, stocks, options, dividends, cost_history, nav_history, cash_flows,
+    nav, stocks, options, dividends, fees, cost_history, nav_history, cash_flows,
     performance: {
       realized_total: realizedTotal,
       unrealized_total: unrealizedTotal,
@@ -706,6 +720,9 @@ function render(data) {
   // Margin — prices are pooled across every loaded account, so pass the whole
   // set rather than just the account being viewed.
   renderMargin(data, currentDataRef.allAccounts);
+
+  // Exposure Fee — IBKR's own stress test, priced
+  renderFees(data);
 
   // Holdings — show all positions including cash equivalents (tagged)
   renderHoldings(data.stocks);
@@ -2723,6 +2740,114 @@ function renderDividends(data) {
     `;
     tbody.appendChild(tr);
   }
+}
+
+/* ---------------------------------------------------------------------------
+ * Exposure Fee — IBKR's own stress test, priced.
+ *
+ * Every evening IBKR stress-tests the portfolio with moves beyond the margin
+ * scenarios; when the average worst-case loss exceeds account equity it
+ * charges a fee the next business day, plus 10% GST. A charge "for" a
+ * Saturday is Monday's posting and covers Friday through Sunday. The dollars
+ * are small; what the fee measures is how far past zero equity the worst case
+ * goes, so the trend is the part worth watching.
+ * ------------------------------------------------------------------------- */
+
+const FEE_TABLE_ROWS = 20;
+
+// The numbers the fee panel prints, from the parser's events. IBKR books a fee
+// as a negative amount; everything here is flipped to a positive cost once, so
+// a refund shows up as a negative one. "Recent" is anchored on the data's own
+// as-of day, not the browser's clock — a weekend or a stalled sync must not
+// make the window look quiet.
+function feeSummary(events, asOf) {
+  const exposure = (events || []).filter(e => e.category === "exposure");
+  const other = (events || []).filter(e => e.category !== "exposure");
+  const cost = (evs, k = "total") => evs.reduce((s, e) => s - (e[k] || 0), 0);
+  const charges = evs => evs.filter(e => e.fee < 0).length;
+  const last = exposure.reduce((a, e) => (!a || e.date > a.date
+    || (e.date === a.date && (e.for_date || "") > (a.for_date || "")) ? e : a), null);
+  const anchor = asOf || (last ? last.date : "");
+  const cutoff = anchor
+    ? new Date(Date.parse(anchor) - 30 * DAY_MS).toISOString().slice(0, 10) : "";
+  const recent = exposure.filter(e => e.date > cutoff);
+  const byMonth = {};
+  for (const e of exposure) {
+    const ym = e.date.slice(0, 7);
+    (byMonth[ym] || (byMonth[ym] = { month: ym, net: 0 })).net -= e.total || 0;
+  }
+  const first = exposure.reduce((a, e) => {
+    const d = e.for_date || e.date;
+    return !a || d < a ? d : a;
+  }, "");
+  return {
+    count: charges(exposure),
+    fee: cost(exposure, "fee"),
+    gst: cost(exposure, "gst"),
+    total: cost(exposure),
+    first,
+    last,
+    recent: { count: charges(recent), total: cost(recent) },
+    by_month: Object.values(byMonth).sort((a, b) => a.month.localeCompare(b.month)),
+    other: { count: charges(other), total: cost(other) },
+  };
+}
+
+function renderFees(data) {
+  const panel = $("fees-panel");
+  const events = (data.fees?.events || []).filter(e => e.category === "exposure");
+  const hist = data.nav_history || [];
+  const s = feeSummary(data.fees?.events, hist.length ? hist[hist.length - 1].date : "");
+  // Only once the account has actually been charged — for everyone else the
+  // panel would be a permanent $0.
+  if (!s.last) {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  const fm = (v) => fmtCcy(v, 2, s.last.currency);
+  const merged = data.account?.Account === "ALL";
+
+  $("fee-note").textContent = `${data.statement?.Period || ""} · 数据来自 Statement of Funds`;
+  $("fee-total").textContent = fm(s.total);
+  $("fee-sub").textContent = `费用 ${fm(s.fee)} · GST ${fm(s.gst)} · ${s.count} 笔`
+    + ` · 最早计费日 ${s.first}`;
+  $("fee-recent").innerHTML =
+    `<div>近 30 天 <b>${fm(s.recent.total)}</b> · ${s.recent.count} 笔</div>`
+    + `<div>最近一笔：${esc(s.last.for_date || s.last.date)} 的仓位 ${fm(-s.last.total)}`
+    + `${s.last.weekend ? "（周五至周日三天）" : ""}</div>`;
+
+  // Monthly bars by posting month, spanning the whole statement window so the
+  // months before the first charge read as zero rather than vanishing.
+  const months = monthRange(s.by_month, data.statement?.Period);
+  const maxCost = Math.max(...months.map(m => Math.abs(m.net)), 0.01);
+  $("fee-chart").innerHTML = months.map(m => {
+    const h = Math.max(2, Math.abs(m.net) / maxCost * 100);
+    const label = m.month.slice(2).replace("-", "/");
+    return `<div class="div-bar" title="${m.month} 敞口费 ${fm(m.net)}">
+        <div class="div-bar-fill" style="height:${h}%"></div>
+        <div class="div-bar-label">${label}</div>
+      </div>`;
+  }).join("");
+  const best = s.by_month.reduce((a, b) => (!a || b.net > a.net ? b : a), null);
+  $("fee-chart-note").textContent = `${months.length} 个月里有 ${s.by_month.length} 个月被收费`
+    + (best ? ` · 最高 ${best.month} ${fm(best.net)}` : "");
+
+  const rows = events.slice(0, FEE_TABLE_ROWS);
+  $("fee-body").innerHTML = rows.map(e => `<tr>
+      <td>${esc(e.for_date || "—")}${e.weekend
+        ? ' <span class="tag tag-fee-weekend" title="周一入账，含周五、周六、周日三天">周末 3 天</span>'
+        : ""}${merged && e.account ? ` <span class="muted">${esc(maskAccountId(e.account))}</span>` : ""}</td>
+      <td class="muted">${esc(e.date)}</td>
+      <td class="num">${fm(-e.fee)}</td>
+      <td class="num muted">${fm(-e.gst)}</td>
+      <td class="num"><b>${fm(-e.total)}</b></td>
+    </tr>`).join("");
+  $("fee-foot").textContent =
+    (rows.length < events.length ? `表格只列最近 ${rows.length} 笔（共 ${events.length} 笔）。` : "")
+    + (s.other.count
+      ? `另有其他费用 ${fm(s.other.total)}（${s.other.count} 笔，如行情订阅），不计入上面的合计。`
+      : "");
 }
 
 function updateSortIndicators(tbodyId, state) {

@@ -13,6 +13,8 @@
 - **股票持仓明细表**：成本、市值、浮盈、回报率、占比
 - **期权持仓表**：拆分 Call/Put、多/空、行权价、到期、浮盈
 - **保证金占用**：卖出期权占用的 Reg-T 保证金估算、占账户总值比例、按标的拆分
+- **敞口费（Exposure Fee）**：IBKR 压力测试按日收的费 + 10% GST，逐笔、按月、近 30 天；
+  没被收过的账户不显示这张表
 - **分红收入**：报表期间的税前 / 预扣税 / 净分红，按标的与按月拆分
 - **已实现盈亏排行榜**：本期盈亏 Top 标的
 - **13F 对照**：把持仓跟 Dataroma 追踪的 83 位超级投资者最新一季的买卖动作对起来，三个视角：你的持仓 / 机构在买你没有 / 机构在清你持有
@@ -186,6 +188,18 @@ NOV-2025`，Symbol 为空），那不是分红税；算进来会虚增税负、�
 descriptor**（第一列会变成 section code，解析器靠字面量 `ClientAccountID`
 分段）和 **Display single column header row**（多 section 会塌成一个表头）。
 
+### 敞口费（Exposure Fee）的来源
+
+只读 **Statement of Funds**。费用本身是 ActivityCode `OFEE`（描述形如
+`Exposure Fee, Equity for 20260819`），10% 的 GST 是另一行 `STAX`
+（`GST Exposure Fee, …`），两行按描述配成一笔。Cash Transactions 里也有一份
+`Other Fees`，但没有 GST 行，所以不从那里读，两个都勾也不会重复计。
+
+描述里的日期是被压力测试的那天（仓位日），`ReportDate` 是入账日；「for」周六的
+那笔是周一入账，含周五到周日三天。行情订阅之类别的 `OFEE` 单独记，不进敞口费合计。
+没勾 Statement of Funds 时面板不显示 —— 不知道不等于零。手动上传的 Activity
+Statement 只有 GST 的期间合计、没有逐笔 GST，这条路径不出这张表。
+
 ## 首次安装
 ```bash
 cd ~/Desktop/ibkr-portfolio
@@ -288,10 +302,10 @@ Python，那边没装依赖：
 ```
 
 `tests/test_parsers.py` 锁的是保证金口径、分红去重 / 多币种、成本股息率的
-时间基准这些容易悄悄回退的地方 —— 改 `parser/` 或 `app.py` 之前先跑一遍。
-`tests/test_app_features.py` 覆盖快照留存与自动同步的调度判定。
+时间基准、敞口费与 GST 的配对这些容易悄悄回退的地方 —— 改 `parser/` 或 `app.py`
+之前先跑一遍。`tests/test_app_features.py` 覆盖快照留存与自动同步的调度判定。
 
-前端逻辑（周复盘、刷新轮询、告警条、净值曲线）的测试用 Node 自带的测试器，
+前端逻辑（周复盘、刷新轮询、告警条、净值曲线、敞口费汇总）的测试用 Node 自带的测试器，
 不用装任何依赖：
 ```bash
 node --test tests/*.mjs

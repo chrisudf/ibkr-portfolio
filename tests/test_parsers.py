@@ -510,6 +510,123 @@ def test_withdrawal_also_books_on_report_date():
 
 
 # ---------------------------------------------------------------------------
+# Exposure Fee: an OFEE debit in Statement of Funds plus a separate STAX row
+# for the 10% GST on it. Cash Transactions repeats the fee (no GST, same
+# TransactionID) and must not double it.
+# ---------------------------------------------------------------------------
+
+SOF_HDR_FEE = SOF_HDR_RD + ["TransactionID"]
+
+
+def _sof_fee(amount, for_date, report_date, txn, code="OFEE",
+             what="Exposure Fee, Equity", date=None):
+    """One fee or GST row shaped like live output: the fee row's Date runs a
+    day past its ReportDate, the GST row's doesn't."""
+    desc = f"{what} for {for_date}"
+    if code == "STAX":
+        desc = "GST " + desc
+    return [ACCT, code, desc, str(amount), "0", date or report_date, "", "USD",
+            "", "", "", "", report_date, txn]
+
+
+def _fees(sof_rows, extra=()):
+    return parse([_pnl(), _nav(), (SOF_HDR_FEE, sof_rows), *extra])["fees"]
+
+
+def test_exposure_fee_pairs_gst_and_books_on_report_date():
+    fees = _fees([
+        _sof_fee(-2.41, "20260819", "20260820", "f1", date="20260821"),
+        _sof_fee(-0.241, "20260819", "20260820", "g1", code="STAX"),
+    ])
+    assert fees["source"] == "statement_of_funds"
+    assert (fees["count"], fees["fee"], fees["gst"], fees["total"]) == (1, -2.41, -0.241, -2.651)
+    [e] = fees["events"]
+    assert e["date"] == "2026-08-20"        # posting day, not the fee row's Date
+    assert e["for_date"] == "2026-08-19"    # the day whose positions were tested
+    assert e["weekend"] is False
+    assert (e["fee"], e["gst"], e["total"]) == (-2.41, -0.241, -2.651)
+
+
+def test_saturday_charge_is_the_three_day_weekend_posting():
+    fees = _fees([_sof_fee(-4.38, "20260822", "20260824", "f1")])
+    assert fees["events"][0]["weekend"] is True
+
+
+def test_cash_transactions_copy_of_the_fee_is_not_counted_again():
+    fees = _fees(
+        [_sof_fee(-2.41, "20260819", "20260820", "f1"),
+         _sof_fee(-0.241, "20260819", "20260820", "g1", code="STAX")],
+        extra=[(CASH_HDR_TXN, [_cash_div(-2.41, "EXPOSURE FEE, EQUITY FOR 20260819 FOR AUG 2026",
+                                         typ="Other Fees", date="20260820", txn="f1")])])
+    assert (fees["count"], fees["total"]) == (1, -2.651)
+
+
+def test_no_statement_of_funds_means_fees_unknown_not_zero():
+    acct = parse([_pnl(), _nav(), (CASH_HDR_TXN, [
+        _cash_div(-2.41, "EXPOSURE FEE, EQUITY FOR 20260819 FOR AUG 2026",
+                  typ="Other Fees", date="20260820", txn="f1")])])
+    assert acct["fees"] == {}
+
+
+def test_statement_of_funds_without_fees_reports_zero():
+    fees = parse([_pnl(), _nav(), (SOF_HDR_RD, [
+        _sof_wire(5000, date="20260101", report_date="20260102")])])["fees"]
+    assert (fees["count"], fees["total"], fees["events"]) == (0, 0.0, [])
+
+
+def test_gst_finds_its_fee_across_posting_days_and_strays_are_dropped():
+    fees = _fees([
+        _sof_fee(-1.00, "20260702", "20260703", "f1"),
+        # GST booked the next business day still belongs to that fee...
+        _sof_fee(-0.10, "20260702", "20260706", "g1", code="STAX"),
+        # ...but GST on a fee that isn't in the statement taxes nothing here.
+        _sof_fee(-0.50, "20260601", "20260602", "g2", code="STAX"),
+    ])
+    assert (fees["count"], fees["gst"], fees["total"]) == (1, -0.1, -1.1)
+
+
+def test_other_fees_kept_apart_from_exposure():
+    fees = _fees([
+        _sof_fee(-1.00, "20260702", "20260703", "f1"),
+        _sof_fee(-10.00, "20261001", "20261002", "m1", what="P*NYSE NETWORK A NP L1"),
+        _sof_fee(-1.00, "20261001", "20261002", "m2", code="STAX", what="P*NYSE NETWORK A NP L1"),
+    ])
+    assert (fees["count"], fees["total"]) == (1, -1.0)
+    assert fees["other"] == {"count": 1, "fee": -10.0, "gst": -1.0, "total": -11.0}
+    assert {e["category"] for e in fees["events"]} == {"exposure", "other"}
+
+
+def test_fee_reversal_nets_and_a_refund_is_not_a_charge():
+    fees = _fees([
+        # Charged and reversed the same day: nothing happened.
+        _sof_fee(-1.20, "20260707", "20260708", "f1"),
+        _sof_fee(1.20, "20260707", "20260708", "f2"),
+        # Refund of an earlier day's fee, booked later: an event, not a charge.
+        _sof_fee(-1.50, "20260709", "20260710", "f3"),
+        _sof_fee(1.50, "20260709", "20260715", "f4"),
+    ])
+    assert fees["count"] == 1
+    assert fees["total"] == 0.0
+    assert len(fees["events"]) == 2
+
+
+def test_fees_are_row_order_invariant():
+    rows = [
+        _sof_fee(-1.04, "20260518", "20260519", "f1"),
+        _sof_fee(-0.104, "20260518", "20260519", "g1", code="STAX"),
+        _sof_fee(-3.42, "20260523", "20260525", "f2"),
+        _sof_fee(-0.342, "20260523", "20260525", "g2", code="STAX"),
+        _sof_fee(-1.12, "20260525", "20260526", "f3"),
+        _sof_fee(-0.112, "20260525", "20260526", "g3", code="STAX"),
+    ]
+    base = _fees(rows)
+    assert _fees(random.Random(7).sample(rows, len(rows))) == base
+    assert [e["date"] for e in base["events"]] == ["2026-05-26", "2026-05-25", "2026-05-19"]
+    acct = parse([_pnl(), _nav(), (SOF_HDR_FEE, rows)])
+    assert not any(k.startswith("_fee") for k in acct)  # scratch state stripped
+
+
+# ---------------------------------------------------------------------------
 # Upload route: a statement that parses to zero accounts must fail loudly.
 # ---------------------------------------------------------------------------
 

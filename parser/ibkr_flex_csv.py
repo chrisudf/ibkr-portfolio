@@ -89,6 +89,7 @@ def _empty_account() -> dict[str, Any]:
         "performance": {"realized_total": 0.0, "unrealized_total": 0.0, "by_symbol": {}},
         "cash_flows": [],   # persisted ledger: one id-keyed entry per external flow
         "dividends": {},    # aggregated payout summary, built in finalize
+        "fees": {},         # Exposure Fee (+ GST) charges, built in finalize
         # Per-symbol buy/sell tallies rebuilt from Statement of Funds trade
         # rows, so a position closed during the period still has a cost to
         # divide a dividend by. Open Positions only describes what you still
@@ -110,6 +111,9 @@ def _empty_account() -> dict[str, Any]:
         "_div_ids": set(),
         "_div_synth_seq": {},  # synth-key occurrence counter, like _cf_synth_seq
         "_sof_seen": False,  # any Statement of Funds row ingested; stripped
+        "_fee_rows": [],     # raw OFEE / STAX rows, paired in finalize; stripped
+        "_fee_ids": set(),
+        "_fee_synth_seq": {},
         "_nav_date": "",   # latest ReportDate seen in the NAV series; stripped
         "_starting_cash": 0.0,
         "_from_date": "",
@@ -764,6 +768,146 @@ def _finalize_cost_history(account: dict[str, Any]) -> None:
     account["cost_history"] = out
 
 
+# --- Fees ------------------------------------------------------------------
+#
+# IBKR's daily Exposure Fee (and any other "Other Fees" debit) posts to
+# Statement of Funds as ActivityCode OFEE, and the 10% GST on it as a separate
+# STAX row whose description is the fee's with "GST " in front:
+#
+#   OFEE  "Exposure Fee, Equity for 20260819"       -2.41
+#   STAX  "GST Exposure Fee, Equity for 20260819"   -0.241
+#
+# Cash Transactions repeats the fee as Type "Other Fees" (same TransactionID,
+# description upper-cased) but has no GST row, so Statement of Funds is the
+# only section holding the whole cost and fees are read from there alone.
+# The date inside the description is the day whose positions were
+# stress-tested; ReportDate is the day the charge posted. A charge "for" a
+# Saturday is Monday's posting and covers Friday through Sunday.
+
+_FEE_CODE = "OFEE"
+_FEE_GST_CODE = "STAX"
+_FEE_FOR_DATE_RE = re.compile(r"\bfor (\d{8})\b", re.I)
+_GST_PREFIX_RE = re.compile(r"^GST\s+", re.I)
+
+
+def _fee_id(account: dict[str, Any], row: dict[str, str], d: date,
+            code: str, amount: float) -> str | None:
+    """Dedupe key for one fee row; None means "already seen, skip".
+
+    Same scheme as the dividend keys: TransactionID when the query ships it,
+    otherwise a composite plus an occurrence ordinal so two genuinely
+    identical rows stay apart.
+    """
+    for col in _TXN_ID_COLUMNS:
+        txn = (row.get(col) or "").strip()
+        if txn:
+            key = f"txn:{txn}"
+            break
+    else:
+        desc = (row.get("ActivityDescription") or "").strip()
+        base = f"{d.isoformat()}|{code}|{desc}|{amount:.4f}"
+        seq = account["_fee_synth_seq"].get(base, 0) + 1
+        account["_fee_synth_seq"][base] = seq
+        key = f"synth:{base}|{seq}"
+    if key in account["_fee_ids"]:
+        return None
+    account["_fee_ids"].add(key)
+    return key
+
+
+def _ingest_fee(account: dict[str, Any], row: dict[str, str], code: str) -> None:
+    # Book on ReportDate like every other Statement of Funds flow here — the
+    # fee row's Date runs a day past it.
+    d = _parse_date(row.get("ReportDate", "")) or _parse_date(row.get("Date", ""))
+    amount = _to_float(row.get("Amount"))
+    if d is None or amount == 0:
+        return
+    if _fee_id(account, row, d, code, amount) is None:
+        return
+    account["_fee_rows"].append({
+        "code": code,
+        "date": d.isoformat(),
+        "description": (row.get("ActivityDescription") or "").strip(),
+        "amount": amount,
+        "currency": (row.get("CurrencyPrimary") or "").strip().upper(),
+    })
+
+
+def _finalize_fees(account: dict[str, Any]) -> None:
+    """Pair each fee with its GST row and summarise the charges.
+
+    Pairing goes by description (the GST row's minus its "GST " prefix) and
+    posting day, so row order doesn't matter. A GST row whose fee posted on a
+    different day still finds it by description, nearest day first; one with
+    no fee in the statement at all taxes something this panel doesn't track
+    and is left out rather than inflating the total.
+
+    Without Statement of Funds there is no way to know, so `fees` stays empty
+    instead of reporting a confident zero.
+    """
+    if not account["_sof_seen"]:
+        account["fees"] = {}
+        return
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    gst_rows = []
+    for r in account["_fee_rows"]:
+        if r["code"] == _FEE_GST_CODE:
+            gst_rows.append(r)
+            continue
+        g = groups.setdefault((r["description"], r["date"]),
+                              {"fee": 0.0, "gst": 0.0, "currency": r["currency"]})
+        g["fee"] += r["amount"]
+    for r in gst_rows:
+        desc = _GST_PREFIX_RE.sub("", r["description"])
+        key = (desc, r["date"])
+        if key not in groups:
+            same = sorted(k for k in groups if k[0] == desc)
+            if not same:
+                continue
+            posted = date.fromisoformat(r["date"])
+            key = min(same, key=lambda k: abs((date.fromisoformat(k[1]) - posted).days))
+        groups[key]["gst"] += r["amount"]
+
+    events = []
+    for (desc, posted), g in groups.items():
+        fee, gst = round(g["fee"], 6), round(g["gst"], 6)
+        if fee == 0 and gst == 0:
+            continue  # charged and reversed on the same day
+        m = _FEE_FOR_DATE_RE.search(desc)
+        for_d = _parse_date(m.group(1)) if m else None
+        events.append({
+            "date": posted,
+            "for_date": for_d.isoformat() if for_d else "",
+            # Charged "for" a weekend day = Monday's posting, Fri + Sat + Sun.
+            "weekend": bool(for_d and for_d.weekday() >= 5),
+            "category": "exposure" if desc.lower().startswith("exposure fee") else "other",
+            "description": desc,
+            "fee": fee,
+            "gst": gst,
+            "total": round(fee + gst, 6),
+            "currency": g["currency"],
+        })
+    events.sort(key=lambda e: (e["date"], e["for_date"], e["description"]), reverse=True)
+
+    def tally(category: str) -> dict[str, Any]:
+        evs = [e for e in events if e["category"] == category]
+        fee = round(sum((e["fee"] for e in evs), 0.0), 6)
+        gst = round(sum((e["gst"] for e in evs), 0.0), 6)
+        # A refund is an event but not a charge.
+        return {"count": sum(1 for e in evs if e["fee"] < 0),
+                "fee": fee, "gst": gst, "total": round(fee + gst, 6)}
+
+    account["fees"] = {
+        "source": "statement_of_funds",
+        # The headline numbers are the Exposure Fee alone. Any other OFEE
+        # debit (market data and the like) is tallied apart so it can't pass
+        # for exposure; IBKR's sign is kept, so a cost is negative.
+        **tally("exposure"),
+        "other": tally("other"),
+        "events": events,
+    }
+
+
 def _ingest_statement_of_funds(account: dict[str, Any], row: dict[str, str]) -> None:
     account["_sof_seen"] = True
     _ingest_trade_cost(account, row)
@@ -777,6 +921,9 @@ def _ingest_statement_of_funds(account: dict[str, Any], row: dict[str, str]) -> 
             if not _skip_unattributed_tax(kind, sym):
                 _ingest_dividend_row(account, "_div_sof", d, sym or "—",
                                      kind, amount, row)
+        return
+    if code in (_FEE_CODE, _FEE_GST_CODE):
+        _ingest_fee(account, row, code)
         return
     if code not in _EXTERNAL_CF_CODES:
         return
@@ -918,11 +1065,13 @@ def parse_ibkr_flex_csv(content: str) -> dict[str, Any]:
             for d, v in sorted(acct["_nav_rows"].items())
         ]
         _finalize_dividends(acct)
+        _finalize_fees(acct)
         _finalize_cost_history(acct)
         # Strip internal scratch state before serialising. _cf_ids is a set
         # and would blow up json.dump if it ever survived to the writer.
         for k in ("_cash_flows", "_cf_ids", "_cf_synth_seq",
                   "_div_cash", "_div_sof", "_div_ids", "_div_synth_seq",
+                  "_fee_rows", "_fee_ids", "_fee_synth_seq",
                   "_sof_seen", "_nav_date", "_nav_rows", "_starting_cash",
                   "_from_date", "_to_date"):
             acct.pop(k, None)
