@@ -173,7 +173,7 @@ test("键集合锁死：加字段先想清楚它上图会暴露什么", () => {
   for (const o of m.options) {
     assert.deepEqual(keys(o), ["dte", "expiry", "ret", "right", "side", "strike", "underlying"]);
   }
-  assert.deepEqual(keys(m.contributors), ["losers", "winners"]);
+  assert.deepEqual(keys(m.contributors), ["losers", "total", "winners"]);
   for (const c of [...m.contributors.winners, ...m.contributors.losers]) {
     assert.deepEqual(keys(c), ["contrib", "symbol"]);
   }
@@ -262,6 +262,22 @@ test("盈亏贡献：按标的合并、剔除现金等价物、除以期间平�
   assert.deepEqual(m.contributors.losers.map(w => w.symbol), ["GOOG", "AMZU"]);
   assert.ok(Math.abs(m.contributors.winners[0].contrib - 6000 / avg) < 1e-12);
   assert.ok(!m.contributors.winners.some(w => w.symbol === "BOXX"));
+  // 合计覆盖全部标的（不只印出来的前五）、同样剔除现金等价物：
+  // MSFT 6000 + SOXL 3000 + NVDA 1000 − GOOG 2500 − AMZU 800 = 6700
+  assert.ok(Math.abs(m.contributors.total - 6700 / avg) < 1e-12);
+});
+
+test("合计不受前五截断：第六名以后也算进去", () => {
+  const acct = account();
+  for (let i = 0; i < 4; i++) {
+    acct.performance.by_symbol[`ZZ${i}`] = { realized_total: 100, unrealized_total: 0, total: 100,
+      asset_category: "Stocks" };
+  }
+  const m = buildShareModel(acct, null);
+  const funded = acct.nav_history.slice(2);
+  const avg = funded.reduce((s, p) => s + p.total, 0) / funded.length;
+  assert.equal(m.contributors.winners.length, 5);                  // 印出来的仍是前五
+  assert.ok(Math.abs(m.contributors.total - 7100 / avg) < 1e-12);  // 合计是全部七个赢家 + 两个输家
 });
 
 test("没有基准数据时照常出图，只是不带对比", () => {

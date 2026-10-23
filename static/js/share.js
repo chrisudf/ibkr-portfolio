@@ -161,6 +161,13 @@ function buildShareModel(data, benchSeries) {
       .slice(0, SHARE_TOP_N).map(contrib),
     losers: ranked.filter(e => e.value < 0).sort((a, b) => a.value - b.value)
       .slice(0, SHARE_TOP_N).map(contrib),
+    // Every name, not only the ten printed. The card states this sum because
+    // it does NOT add up to the headline: average NAV already contains the
+    // year's gains and every deposit, so dividing by it gives a smaller
+    // number than the time-weighted chain — a few points on a steady book,
+    // tens of points on one that doubled or was funded mid-window. Saying
+    // so beats letting a reader find the gap alone.
+    total: avgNav > 0 ? ranked.reduce((sum, e) => sum + e.value, 0) / avgNav : 0,
   };
 
   return {
@@ -259,7 +266,7 @@ function shareChartBody(model) {
       parts.push(shareText(lx + 21, y, s.label, { size: 11, fill: SHARE_C.dim }));
       lx += 21 + shareTextWidth(s.label, 11) + 18;
     }
-    const top = y + 16, H = 156, left = SHARE_L + 28, right = SHARE_R;
+    const top = y + 16, H = 156, left = SHARE_L + 34, right = SHARE_R;
     const all = lines.flatMap(s => s.curve.map(p => p.v));
     let lo = Math.min(100, ...all), hi = Math.max(100, ...all);
     const padY = (hi - lo) * 0.06 || 1;
@@ -268,11 +275,15 @@ function shareChartBody(model) {
     const X = (i) => left + (right - left) * (n > 1 ? i / (n - 1) : 0);
     const Y = (v) => top + H - (H * (v - lo)) / (hi - lo);
     const step = [2, 5, 10, 20, 25, 50, 100, 200, 500].find(s => (hi - lo) / s <= 5) || 1000;
+    // Plotted as the index, labelled as what it means — 120 is "+20%" — the
+    // way Chinese brokerage apps draw 累计收益率. The dashed line is the
+    // shared start, 0%.
     for (let t = Math.ceil(lo / step) * step; t <= hi; t += step) {
-      const at100 = Math.abs(t - 100) < 1e-9;
+      const atStart = Math.abs(t - 100) < 1e-9;
       parts.push(`<line x1="${left}" x2="${right}" y1="${Y(t).toFixed(1)}" y2="${Y(t).toFixed(1)}"`
-        + ` stroke="${at100 ? SHARE_C.dim : SHARE_C.border}"${at100 ? ' stroke-dasharray="4 4"' : ""}/>`);
-      parts.push(shareText(left - 6, Y(t) + 3.5, String(t), { size: 10, fill: SHARE_C.faint, anchor: "end" }));
+        + ` stroke="${atStart ? SHARE_C.dim : SHARE_C.border}"${atStart ? ' stroke-dasharray="4 4"' : ""}/>`);
+      parts.push(shareText(left - 6, Y(t) + 3.5, sharePct((t - 100) / 100, 0),
+        { size: 10, fill: SHARE_C.faint, anchor: "end" }));
     }
     // Benchmarks first, so the account's own line sits on top.
     for (const s of [...lines.slice(1), lines[0]]) {
@@ -413,7 +424,7 @@ function shareOptionsBody(options) {
   };
 }
 
-function shareContribBody(c) {
+function shareContribBody(c, againstHeadline) {
   return (y) => {
     const parts = [];
     const maxAbs = Math.max(...[...c.winners, ...c.losers].map(e => Math.abs(e.contrib)), 1e-9);
@@ -432,7 +443,16 @@ function shareContribBody(c) {
       }
       bottom = Math.max(bottom, ry);
     }
-    return { parts, y: bottom };
+    let ty = bottom + 14;
+    parts.push(`<line x1="${SHARE_L}" x2="${SHARE_R}" y1="${ty}" y2="${ty}" stroke="${SHARE_C.border}"/>`);
+    ty += 22;
+    parts.push(shareText(SHARE_L, ty, "全部标的合计", { size: 12, fill: SHARE_C.dim }));
+    parts.push(shareText(SHARE_R, ty, sharePct(c.total), { size: 13, weight: 600, fill: shareTone(c.total), anchor: "end" }));
+    ty += 18;
+    parts.push(shareText(SHARE_L, ty, againstHeadline
+      ? "按平均净值计，和上方时间加权收益不是同一口径，合计不必相等"
+      : "按平均净值计", { size: 10.5, fill: SHARE_C.faint }));
+    return { parts, y: ty };
   };
 }
 
@@ -448,7 +468,7 @@ function renderShareSvg(model, title) {
   let y = 80;
   const add = (section) => { parts.push(...section.parts); y = section.y + 12; };
   if (model.perf) add(sharePanel(y, "收益（时间加权）", "已剔除出入金", shareReturnsBody(model)));
-  if (model.curve.length > 1) add(sharePanel(y, "净值走势", "起点 = 100", shareChartBody(model)));
+  if (model.curve.length > 1) add(sharePanel(y, "累计收益走势", "三条线同一天从 0% 起算", shareChartBody(model)));
   add(sharePanel(y, "持仓构成", "占持仓总额", shareAllocationBody(model.allocation)));
   if (model.holdings.length) {
     add(sharePanel(y, "正股持仓", "面积 = 占比 · 颜色 = 持仓回报", shareHoldingsBody(model.holdings)));
@@ -456,7 +476,7 @@ function renderShareSvg(model, title) {
   if (model.options.length) add(sharePanel(y, "期权持仓", "回报 = 浮动盈亏 ÷ 权利金", shareOptionsBody(model.options)));
   const c = model.contributors;
   if (c.winners.length || c.losers.length) {
-    add(sharePanel(y, "盈亏贡献（按标的）", "盈亏 ÷ 期间平均净值", shareContribBody(c)));
+    add(sharePanel(y, "盈亏贡献（按标的）", "盈亏 ÷ 期间平均净值", shareContribBody(c, !!model.perf)));
   }
   const foot = [
     model.asOf ? `数据截至 ${model.asOf} · 收益按时间加权计算，已剔除出入金` : "",
