@@ -21,6 +21,7 @@ from threading import Lock
 from flask import Flask, jsonify, render_template, request
 
 from parser import parse_ibkr_auto, parse_ibkr_pdf
+from parser.benchmarks import BenchmarkError, fetch_adjusted_closes
 from parser.flex_fetch import (FLEX_BUDGET_SEC, FLEX_CONFIG_NOTES,
                                FLEX_MAX_POLL_RETRIES, FLEX_MAX_POLLS,
                                FLEX_POLL_INTERVAL, FlexFetchError, fetch_one,
@@ -480,6 +481,102 @@ def superinvestors_status():
     if st["in_progress"] and st["started_at"]:
         out["elapsed_sec"] = int(time.time() - st["started_at"])
     return jsonify(out)
+
+
+# ---------------------------------------------------------------------------
+# Benchmarks for the share snapshot
+#
+# The snapshot compares the account's TWR with QQQ and SPY over the same NAV
+# window. Like the 13F cache this is a side fetch with no IBKR quota behind it,
+# but it is pulled on demand (when the share dialog opens) rather than by a
+# button: daily bars only change once a day, so a TTL'd file is all the
+# scheduling it needs. A failed fetch serves whatever stale rows the cache
+# still holds and says so in `errors`; the snapshot renders without a line it
+# has no data for rather than failing whole.
+# ---------------------------------------------------------------------------
+
+BENCHMARK_SYMBOLS = ("QQQ", "SPY")
+BENCHMARK_CACHE = UPLOAD_DIR / ".benchmarks.json"
+BENCHMARK_TTL_SEC = 6 * 3600
+# A cache that stops short of the requested end gets another try after this
+# long, not on every open — the NAV as-of date can be a session whose bar
+# Yahoo has not published yet, and nothing changes by asking again at once.
+BENCHMARK_RETRY_SEC = 30 * 60
+_benchmark_lock = Lock()
+
+
+def _read_benchmark_cache() -> dict:
+    try:
+        with BENCHMARK_CACHE.open(encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _benchmark_entry_ok(entry: dict | None, start_iso: str, end_iso: str,
+                        now: float) -> bool:
+    rows = (entry or {}).get("rows") or []
+    if not rows:
+        return False
+    age = now - float(entry.get("fetched_at") or 0)
+    if age > BENCHMARK_TTL_SEC or rows[0][0] > start_iso:
+        return False
+    return rows[-1][0] >= end_iso or age < BENCHMARK_RETRY_SEC
+
+
+def _benchmark_window(rows: list, start_iso: str, end_iso: str) -> list:
+    """Rows inside [start, end], plus the last bar before `start`.
+
+    The client carries each price forward onto NAV dates; when the window opens
+    on a day with no bar of its own (IBKR books NAV on a few exchange holidays)
+    the bar before it is the price that was in force, and dropping it would
+    leave the line nothing to start from.
+    """
+    first = 0
+    for i, r in enumerate(rows):
+        if r[0] <= start_iso:
+            first = i
+        else:
+            break
+    return [r for r in rows[first:] if r[0] <= end_iso]
+
+
+@app.get("/api/benchmarks")
+def benchmarks():
+    try:
+        start = date.fromisoformat(request.args.get("start", ""))
+        end = date.fromisoformat(request.args.get("end", ""))
+    except ValueError:
+        return jsonify({"error": "start and end must be YYYY-MM-DD"}), 400
+    if start > end or (end - start).days > 3700:
+        return jsonify({"error": "start must precede end, within ten years"}), 400
+    s_iso, e_iso = start.isoformat(), end.isoformat()
+    series: dict[str, list] = {}
+    errors: dict[str, str] = {}
+    with _benchmark_lock:
+        cache = _read_benchmark_cache()
+        now = time.time()
+        dirty = False
+        for sym in BENCHMARK_SYMBOLS:
+            entry = cache.get(sym)
+            if not _benchmark_entry_ok(entry, s_iso, e_iso, now):
+                try:
+                    # From a little before the window (see _benchmark_window)
+                    # through today, so the next snapshot of the same window
+                    # is served from disk.
+                    rows = fetch_adjusted_closes(
+                        sym, start - timedelta(days=10), max(end, date.today()))
+                    entry = cache[sym] = {"fetched_at": now, "rows": rows}
+                    dirty = True
+                except BenchmarkError as exc:
+                    app.logger.warning("[benchmarks] %s", exc)
+                    errors[sym] = str(exc)
+            if entry and entry.get("rows"):
+                series[sym] = _benchmark_window(entry["rows"], s_iso, e_iso)
+        if dirty:
+            _atomic_write_json(BENCHMARK_CACHE, cache)
+    return jsonify({"series": series, "errors": errors})
 
 
 def _pass_budget_sec(specs: list) -> int:

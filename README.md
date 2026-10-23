@@ -16,6 +16,23 @@
 - **分红收入**：报表期间的税前 / 预扣税 / 净分红，按标的与按月拆分
 - **已实现盈亏排行榜**：本期盈亏 Top 标的
 - **13F 对照**：把持仓跟 Dataroma 追踪的 83 位超级投资者最新一季的买卖动作对起来，三个视角：你的持仓 / 机构在买你没有 / 机构在清你持有
+- **分享快照**：把当前页（单个账号或总账户）生成一张手机竖版长图，可复制 / 保存 / 调系统分享，
+  发给家人朋友看；只含百分比，不含任何金额（见下）
+
+### 关于「分享快照」的口径
+图上**有**：时间加权收益、最大回撤和当前回撤（与同期 QQQ / SPY 含分红总回报并排）、
+TWR 指数曲线（起点 = 100）、持仓构成、正股占比与持仓回报、全部期权合约（行权价 / 到期 / 回报）、
+按标的的盈亏贡献（盈亏 ÷ 期间平均净值）。
+
+图上**没有**：任何金额、股数、期权张数、账号，以及保证金、卖 put 名义、簇敞口、到期日历。
+百分比加上任何一个绝对数就能反推出净值，所以金额是"全有或全无"；杠杆的后果已经体现在
+收益和回撤里，图上不展示手段，页脚注明"含期权"。曲线画的是 TWR 指数而不是原始净值 ——
+原始净值在每次入金时有台阶，遮掉纵轴也看得出入金时点和比例。
+
+实现上是白名单：`static/js/share.js` 的 `buildShareModel()` 只从数据里拷出允许的字段，
+卡片只从这个模型画。`tests/test_share_model.mjs` 锁死模型的键集合，并检查**缩放不变**
+（账本里所有金额和数量同乘一个常数，模型必须完全不变）—— 任何字段带出了绝对金额都会被抓到，
+不管它叫什么名字。往图上加东西，先改模型、再改这条测试。
 
 ### 关于「13F 对照」的口径
 
@@ -291,8 +308,10 @@ Python，那边没装依赖：
 时间基准这些容易悄悄回退的地方 —— 改 `parser/` 或 `app.py` 之前先跑一遍。
 `tests/test_app_features.py` 覆盖快照留存与自动同步的调度判定。
 
-前端逻辑（周复盘、刷新轮询、告警条、净值曲线）的测试用 Node 自带的测试器，
-不用装任何依赖：
+`tests/test_benchmarks.py` 覆盖分享快照的基准行情拉取与缓存（不连网）。
+
+前端逻辑（周复盘、刷新轮询、告警条、净值曲线、分享快照的白名单模型）的测试用 Node
+自带的测试器，不用装任何依赖：
 ```bash
 node --test tests/*.mjs
 ```
@@ -323,6 +342,7 @@ ibkr-portfolio/
 │   ├── ibkr_flex_csv.py    # Flex Web Service CSV 解析（多账户多 section）
 │   ├── ibkr_pdf.py         # PDF 解析（基于 pdfplumber）
 │   ├── flex_fetch.py       # 刷新按钮走的 Flex API 拉取
+│   ├── benchmarks.py       # 分享快照的 QQQ / SPY 基准行情（Yahoo，含分红）
 │   └── returns.py          # IRR / 年化回报率计算
 ├── tests/test_parsers.py   # 解析器回归测试（pytest，CSV 夹具）
 ├── scripts/
@@ -332,10 +352,14 @@ ibkr-portfolio/
 ├── templates/dashboard.html
 ├── static/css/style.css
 ├── static/js/dashboard.js  # D3 treemap + 表格渲染
+├── static/js/share.js      # 分享快照：白名单模型 + SVG 卡片 + 导出
 └── uploads/                # 每账户一份解析结果缓存
     ├── .position_settings.json   # 核心持仓 / 仓位区间（gitignore）
-    └── .auto_sync_state.json     # 自动同步的最近一次结果（gitignore）
+    ├── .auto_sync_state.json     # 自动同步的最近一次结果（gitignore）
+    └── .benchmarks.json          # 分享快照的基准行情缓存（gitignore）
 ```
 
 ## 数据安全
 所有解析都在本地完成，文件只缓存到 `uploads/`，不发送到任何外部服务。
+打开「分享快照」时服务端会向 Yahoo 请求 QQQ / SPY 的公开日线，请求里只有代码和起止日期。
+快照图片在浏览器里生成，不经过服务器。

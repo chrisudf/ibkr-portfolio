@@ -720,3 +720,30 @@ body.modal-open { overflow: hidden; }
   .f13-bar { width: 44px; }
   .f13-who { display: block; margin-right: 0; white-space: normal; }
 }
+
+/* Share snapshot dialog. The preview is the exported SVG itself at 1x,
+   scaled to the dialog's width — narrower than the card on a phone. */
+.share-modal { width: min(520px, 100%); max-height: min(92vh, 1000px); }
+.share-scope { margin-left: 6px; font-size: 12px; font-weight: 500; color: var(--text-dim); }
+.share-title-input {
+  flex: 1; min-width: 0;
+  padding: 7px 10px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--bg-soft);
+  color: var(--text); font: inherit; font-size: 13px;
+}
+.share-title-input:focus { outline: none; border-color: var(--accent); }
+.share-preview { padding-bottom: 16px; }
+.share-preview svg {
+  display: block; width: 100%; max-width: 420px; height: auto;
+  margin: 0 auto; border-radius: 14px; box-shadow: var(--shadow);
+}
+/* .ghost-btn's display:inline-flex outranks the UA rule for [hidden]. */
+.ghost-btn[hidden], .primary-btn[hidden] { display: none; }
+
+/* On a phone — where the share sheet is the whole point — the action row
+   already ran ~40px past a 375px screen before the share button joined it;
+   let it wrap under the brand instead of widening the page. */
+@media (max-width: 600px) {
+  .topbar { flex-wrap: wrap; gap: 12px; padding: 14px 16px; }
+  .actions { flex-wrap: wrap; gap: 8px; }
+}

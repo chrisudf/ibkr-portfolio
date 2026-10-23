@@ -10,6 +10,9 @@
   <!-- 13F overlay: separate file, and deferred AFTER dashboard.js because it
        uses its helpers ($, esc, fmtMoney, currentDataRef, showToast). -->
   <script src="/static/js/f13.js" defer></script>
+  <!-- Share snapshot: same deal — uses dashboard.js helpers (fundedSeries,
+       navStats, buildRankEntries, esc, …), so it loads after it. -->
+  <script src="/static/js/share.js" defer></script>
 </head>
 <body>
   <header class="topbar">
@@ -21,6 +24,9 @@
       </div>
     </div>
     <div class="actions">
+      <button id="share-btn" class="ghost-btn" type="button" disabled title="把当前页生成一张可以发给家人朋友的图片">
+        <span>⇪</span><span>分享快照</span>
+      </button>
       <button id="pos-btn" class="ghost-btn" type="button" disabled title="读取持仓规则中…">
         <span>◎</span><span>核心持仓</span>
       </button>
@@ -438,6 +444,30 @@
         <span class="modal-status" id="pos-status"></span>
         <button id="pos-cancel" class="ghost-btn" type="button">取消</button>
         <button id="pos-save" class="primary-btn" type="button">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="share-modal" class="modal-backdrop" hidden>
+    <div class="modal share-modal" role="dialog" aria-modal="true" aria-labelledby="share-modal-title">
+      <div class="modal-head">
+        <h2 id="share-modal-title">分享快照 <span class="share-scope" id="share-scope"></span></h2>
+        <button id="share-modal-close" class="modal-close" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-note">
+        图里只有<b>百分比、代码、日期和行权价</b>：没有金额、股数和张数，没有账号，也没有保证金、
+        卖 put 名义和簇敞口。收益曲线按时间加权、已剔除出入金。导出的就是下面这张图。
+      </div>
+      <div class="modal-tools">
+        <label class="modal-tools-label" for="share-title">标题</label>
+        <input id="share-title" class="share-title-input" type="text" maxlength="24" autocomplete="off" />
+      </div>
+      <div class="modal-body share-preview" id="share-preview"></div>
+      <div class="modal-foot">
+        <span class="modal-status" id="share-status"></span>
+        <button id="share-copy" class="ghost-btn" type="button" disabled>复制图片</button>
+        <button id="share-native" class="ghost-btn" type="button" disabled hidden>分享…</button>
+        <button id="share-save" class="primary-btn" type="button" disabled>保存图片</button>
       </div>
     </div>
   </div>
