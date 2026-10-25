@@ -725,6 +725,12 @@ function render(data) {
   // 13F overlay (cache loads async from /api/superinvestors; the panel
   // re-renders once it arrives, same pattern as clusters.json)
   renderSuperinvestors();
+
+  // Risk gate (static/js/risk.js). Always every account side by side — the
+  // tab only moves the highlight — so it reads allAccounts, not `data`.
+  // Called last on purpose: it sits at the top of the page, but a throw in it
+  // must not cost any panel rendered before it.
+  renderRiskGate();
 }
 
 /* ---------------------------------------------------------------------------
@@ -1777,6 +1783,9 @@ function navStats(series, flows) {
   return {
     maxDD, ddStart, ddEnd,
     curDD: 1 - index / peak,
+    // Where the current drawdown is measured from — the risk gate's breaker
+    // prints it ("高点 10/07").
+    curPeakDate: peakDate,
     annVol, annRet,
     // Un-annualized chained return over the series — what a short window
     // (the weekly recap) actually wants; annualizing 5 days is noise.

@@ -10,6 +10,8 @@
   <!-- 13F overlay: separate file, and deferred AFTER dashboard.js because it
        uses its helpers ($, esc, fmtMoney, currentDataRef, showToast). -->
   <script src="/static/js/f13.js" defer></script>
+  <!-- Risk gate: same arrangement — after dashboard.js, whose helpers it uses. -->
+  <script src="/static/js/risk.js" defer></script>
 </head>
 <body>
   <header class="topbar">
@@ -77,6 +79,35 @@
           <div class="kpi-sub" id="kpi-realized">已实现 $0</div>
         </div>
       </div>
+
+      <!-- Risk gate: every account side by side, whichever tab is selected -->
+      <section class="panel" id="risk-panel" hidden>
+        <div class="panel-head">
+          <h2>风险闸门 <span class="panel-note">下单前看一眼</span></h2>
+          <div class="risk-head-right">
+            <span class="panel-note" id="risk-note"></span>
+            <button id="risk-btn" class="ghost-btn risk-btn" type="button" disabled title="读取风险闸门设置中…">设置</button>
+          </div>
+        </div>
+        <div class="risk-verdict" id="risk-verdict"></div>
+        <div class="table-wrap">
+          <table class="holdings risk-table" id="risk-table"></table>
+        </div>
+        <div class="margin-foot" id="risk-table-note"></div>
+        <div class="risk-sub-section" id="risk-cash" hidden></div>
+        <div class="risk-sub-section" id="risk-earnings" hidden></div>
+        <div class="margin-foot">超线 = 只许替换，不许净新增；断路器 = 只减不加。线都是默认值（还没正式采纳），
+          在「设置」里改，也在那里标出哪个是组合保证金户、哪个是现金户（报表里没有这个信息）。
+          <b>卖 put 名义</b> = 行权价 × 张数 × 合约乘数，全部被行权要接货的钱，不看价内外。
+          <b>合并</b>列 = 两账户名义之和 ÷ 净值之和，不是两个比值的平均。
+          <b>AI 硬件簇</b> = 成员的正股市值 + LEAP 名义（多头 call 按正股价 × 股数，组合里没有正股报价时按行权价）
+          + 卖 put 名义。<b>回撤</b>按剔除出入金的 TWR 链、从最近 N 个 NAV 行的最高点算（IBKR 在美股休市日也记一行，
+          所以约等于交易日），入金不会把断路器关掉。<b>组合保证金线</b>：净值低于 US$100k 时 IBKR 只接受降低保证金的交易。
+          <b>现金户</b>：每个到期周的卖 put 名义对比现金 + BOXX；累计列假设被行权接来的正股不卖。
+          <b>财报</b>取自 Nasdaq，每天取一次；杠杆单股 ETF 按底层查（LITX→LITE、APPX→APP、NVDL→NVDA…），
+          SOXL / TQQQ 这类指数 ETF 不标；财报当天到期也算跨；<b>查不到 = 未知，不当作不跨</b>。
+          这一块总是同时显示所有账户，切换上方账号只改高亮列。</div>
+      </section>
 
       <!-- NAV history -->
       <section class="panel" id="nav-history-panel" hidden>
@@ -438,6 +469,35 @@
         <span class="modal-status" id="pos-status"></span>
         <button id="pos-cancel" class="ghost-btn" type="button">取消</button>
         <button id="pos-save" class="primary-btn" type="button">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="risk-modal" class="modal-backdrop" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="risk-modal-title">
+      <div class="modal-head">
+        <h2 id="risk-modal-title">风险闸门设置</h2>
+        <button id="risk-modal-close" class="modal-close" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-note">
+        这些线还没正式采纳，默认值来自 10 月复盘的提议。<b>留空 = 用默认值</b>（灰字），
+        所以以后改了默认值，没动过的线会跟着变。倍数按净值算（1 = 100% 净值），百分比直接填数字。
+        存在服务器上（<code>uploads/.risk_settings.json</code>），手机和电脑看到的是同一套。
+      </div>
+      <div class="modal-body">
+        <table class="holdings risk-form">
+          <tbody id="risk-form-body"></tbody>
+        </table>
+        <h3 class="risk-form-title">账户类型<span class="th-sub">报表里没有，要在这里标；组合保证金户才显示 US$100k 线，现金户才显示到期周对现金</span></h3>
+        <table class="holdings risk-form">
+          <tbody id="risk-accounts-body"></tbody>
+        </table>
+      </div>
+      <div class="modal-foot">
+        <span class="modal-status" id="risk-status"></span>
+        <button id="risk-reset" class="ghost-btn" type="button">线全部恢复默认</button>
+        <button id="risk-cancel" class="ghost-btn" type="button">取消</button>
+        <button id="risk-save" class="primary-btn" type="button">保存</button>
       </div>
     </div>
   </div>
