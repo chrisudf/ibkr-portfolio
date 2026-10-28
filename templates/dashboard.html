@@ -10,6 +10,8 @@
   <!-- 13F overlay: separate file, and deferred AFTER dashboard.js because it
        uses its helpers ($, esc, fmtMoney, currentDataRef, showToast). -->
   <script src="/static/js/f13.js" defer></script>
+  <!-- Risk gate: same arrangement — after dashboard.js, whose helpers it uses. -->
+  <script src="/static/js/risk.js" defer></script>
 </head>
 <body>
   <header class="topbar">
@@ -77,6 +79,42 @@
           <div class="kpi-sub" id="kpi-realized">已实现 $0</div>
         </div>
       </div>
+
+      <!-- Risk gate: the selected account; 总账户 shows every account side by side -->
+      <section class="panel" id="risk-panel" hidden>
+        <div class="panel-head">
+          <h2 class="risk-title">
+            <button id="risk-toggle" class="risk-toggle" type="button"
+                    aria-expanded="true" aria-controls="risk-body" title="收起 / 展开">
+              <span class="risk-chevron" aria-hidden="true">▾</span>风险闸门
+            </button>
+            <span class="panel-note">下单前看一眼</span>
+          </h2>
+          <div class="risk-head-right">
+            <span class="panel-note" id="risk-note"></span>
+            <button id="risk-btn" class="ghost-btn risk-btn" type="button" disabled title="读取风险闸门设置中…">设置</button>
+          </div>
+        </div>
+        <!-- Collapsed, the panel keeps one line of verdict: folding the gate
+             away must not fold the alarm away with it. -->
+        <div class="risk-summary" id="risk-summary" hidden></div>
+        <div id="risk-body">
+          <div class="risk-verdict" id="risk-verdict"></div>
+          <div class="table-wrap">
+            <table class="holdings risk-table" id="risk-table"></table>
+          </div>
+          <div class="margin-foot" id="risk-table-note"></div>
+          <div class="risk-sub-section" id="risk-cash" hidden></div>
+          <ul class="risk-legend">
+            <li><b>超线</b> → 只许替换，不许净新增。线是默认值、没正式采纳，在「设置」里改，账户类型也在那里标。</li>
+            <li><b>卖 put 名义</b> = 行权价 × 股数：全部被行权要付的钱，不分价内外。</li>
+            <li><b>AI 硬件簇</b> = 成员的正股市值 + LEAP 名义（正股价 × 股数）+ 卖 put 名义。</li>
+            <li><b>回撤断路器</b>：−10% → 停卖 put（roll 不加张数和名义，闲置现金可以买正股和期权多头）；−20% → 只减不加。回撤剔除出入金，从窗口内最高点算。</li>
+            <li><b>组合保证金线</b>：净值低于 US$100k，IBKR 只接受降低保证金的交易。<b>现金户</b>：每个到期周的卖 put 名义对比现金 + BOXX，累计列假设接来的股票不卖。</li>
+            <li>跟着账号页签走；<b>总账户</b>把两户并排，加一列合并（名义之和 ÷ 净值之和）。</li>
+          </ul>
+        </div>
+      </section>
 
       <!-- NAV history -->
       <section class="panel" id="nav-history-panel" hidden>
@@ -438,6 +476,35 @@
         <span class="modal-status" id="pos-status"></span>
         <button id="pos-cancel" class="ghost-btn" type="button">取消</button>
         <button id="pos-save" class="primary-btn" type="button">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="risk-modal" class="modal-backdrop" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="risk-modal-title">
+      <div class="modal-head">
+        <h2 id="risk-modal-title">风险闸门设置</h2>
+        <button id="risk-modal-close" class="modal-close" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-note">
+        这些线还没正式采纳，默认值来自 10 月复盘的提议。<b>留空 = 用默认值</b>（灰字），
+        所以以后改了默认值，没动过的线会跟着变。倍数按净值算（1 = 100% 净值），百分比直接填数字。
+        存在服务器上（<code>uploads/.risk_settings.json</code>），手机和电脑看到的是同一套。
+      </div>
+      <div class="modal-body">
+        <table class="holdings risk-form">
+          <tbody id="risk-form-body"></tbody>
+        </table>
+        <h3 class="risk-form-title">账户类型<span class="th-sub">报表里没有，要在这里标；组合保证金户才显示 US$100k 线，现金户才显示到期周对现金</span></h3>
+        <table class="holdings risk-form">
+          <tbody id="risk-accounts-body"></tbody>
+        </table>
+      </div>
+      <div class="modal-foot">
+        <span class="modal-status" id="risk-status"></span>
+        <button id="risk-reset" class="ghost-btn" type="button">线全部恢复默认</button>
+        <button id="risk-cancel" class="ghost-btn" type="button">取消</button>
+        <button id="risk-save" class="primary-btn" type="button">保存</button>
       </div>
     </div>
   </div>

@@ -377,6 +377,187 @@ def put_position_settings():
     return jsonify(payload)
 
 
+# --- Risk gate settings: the lines the 风险闸门 panel judges against ---------
+#
+# None of these lines is an adopted rule yet — they are the numbers the
+# 2026-10 reviews proposed — so every one is a setting, not a constant. The
+# DEFAULTS live in static/js/risk.js (RISK_DEFAULTS); this file stores only
+# what was typed, the same split the position bands use: an empty file means
+# "all defaults", and a blank box in the dialog means "the default", so moving
+# a default in the JS moves every line nobody overrode.
+#
+# It is also the only place the dashboard learns what KIND each account is.
+# The Flex payload does not say (the query has no Account Information
+# section), and the kind decides which rule applies: the US$100k floor binds a
+# portfolio-margin account only, and the expiry-week cash check is for a cash
+# account that cannot borrow its way through an assignment. Account ids live
+# in this file under uploads/ (gitignored) — never in the repo.
+RISK_SETTINGS_FILE = UPLOAD_DIR / ".risk_settings.json"
+
+# key → (lowest, highest, whole number?). Ratios are × NAV (1.0 = 100% of
+# NAV), pm_warn / drawdown_stop are fractions, pm_floor is account currency.
+_RISK_LIMITS = {
+    "put_nav_max": (0.0, 20.0, False),
+    "single_put_nav_max": (0.0, 20.0, False),
+    "cluster_nav_max": (0.0, 50.0, False),
+    "pm_floor": (0.0, 1e9, False),
+    "pm_warn": (0.0, 1.0, False),
+    "drawdown_days": (5, 260, True),
+    "drawdown_stop": (0.0, 1.0, False),   # 一级断路器：停卖 put
+    "drawdown_halt": (0.0, 1.0, False),   # 二级断路器：只减不加
+}
+_ACCOUNT_KINDS = ("pm", "margin", "cash")
+_RISK_LABEL_MAX = 24
+
+
+def _risk_threshold(key: str, raw) -> float | int | None:
+    if raw is None or raw == "":
+        return None
+    lo, hi, whole = _RISK_LIMITS[key]
+    # bool is an int to Python; true/false in a threshold is a client bug.
+    if isinstance(raw, bool):
+        raise ValueError(f"{key} must be a number or null")
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} must be a number or null") from None
+    if val != val or val in (float("inf"), float("-inf")):
+        raise ValueError(f"{key} must be a finite number")
+    if whole:
+        if val != int(val):
+            raise ValueError(f"{key} must be a whole number")
+        val = int(val)
+    else:
+        val = round(val, 6)
+    if not lo <= val <= hi:
+        # Same trap as the position bands: the dialog speaks percent, the
+        # wire format is a fraction, and 10 for 0.10 is the likely slip.
+        raise ValueError(f"{key} must be between {lo:g} and {hi:g}; got {raw!r}")
+    return val
+
+
+def _risk_symbol_list(field: str, raw, limit: int) -> list[str] | None:
+    """None keeps the default list; [] is a deliberate "nothing"."""
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise ValueError(f"'{field}' must be a list of symbols or null")
+    out: list[str] = []
+    for sym in raw:
+        key = str(sym or "").strip().upper()
+        if not key:
+            continue
+        if not _SYMBOL_RE.match(key):
+            raise ValueError(f"{field}: invalid symbol {sym!r}")
+        if key not in out:
+            out.append(key)
+    if len(out) > limit:
+        raise ValueError(f"{field}: at most {limit} symbols")
+    return out
+
+
+def _normalize_risk_settings(raw: dict) -> dict:
+    """Validate the dialog's body; raise ValueError naming the first bad field."""
+    if not isinstance(raw, dict):
+        raise ValueError("body must be a JSON object")
+    # `or {}` would wave an empty list through as "no overrides"; a list here
+    # is a client bug worth a 400.
+    th_raw = raw.get("thresholds")
+    th_raw = {} if th_raw is None else th_raw
+    if not isinstance(th_raw, dict):
+        raise ValueError("'thresholds' must be an object")
+    thresholds: dict = {}
+    for key, value in th_raw.items():
+        if key not in _RISK_LIMITS:
+            raise ValueError(f"unknown threshold {key!r}")
+        val = _risk_threshold(key, value)
+        if val is not None:
+            thresholds[key] = val
+    # The second breaker step must sit at or below the first. Only checkable
+    # when both are typed — the defaults live in risk.js, which checks the
+    # mixed case before it ever sends.
+    stop, halt = thresholds.get("drawdown_stop"), thresholds.get("drawdown_halt")
+    if stop is not None and halt is not None and halt < stop:
+        raise ValueError("drawdown_halt (只减不加) must not be shallower than "
+                         "drawdown_stop (停卖 put)")
+    acc_raw = raw.get("accounts")
+    acc_raw = {} if acc_raw is None else acc_raw
+    if not isinstance(acc_raw, dict):
+        raise ValueError("'accounts' must be an object")
+    if len(acc_raw) > 50:
+        raise ValueError("too many accounts")
+    accounts: dict[str, dict] = {}
+    for acct_id, cfg in acc_raw.items():
+        if not _ACCT_ID_RE.match(str(acct_id or "")):
+            raise ValueError(f"invalid account id {acct_id!r}")
+        if not isinstance(cfg, dict):
+            raise ValueError(f"{acct_id}: entry must be an object")
+        kind = cfg.get("kind") or None
+        if kind is not None and kind not in _ACCOUNT_KINDS:
+            raise ValueError(f"{acct_id}: kind must be one of "
+                             f"{', '.join(_ACCOUNT_KINDS)} or null")
+        label = cfg.get("label") or ""
+        if not isinstance(label, str):
+            raise ValueError(f"{acct_id}: label must be a string")
+        # Printed into the panel header; the client escapes, this just keeps
+        # control characters and runs of whitespace out of the file. Collapse
+        # first, so a tab between two words becomes a space, not nothing.
+        label = "".join(ch for ch in " ".join(label.split()) if ch.isprintable())
+        if len(label) > _RISK_LABEL_MAX:
+            raise ValueError(f"{acct_id}: label longer than {_RISK_LABEL_MAX} characters")
+        if kind is None and not label:
+            continue
+        accounts[str(acct_id)] = {"kind": kind, "label": label}
+    return {
+        "thresholds": thresholds,
+        "cluster": _risk_symbol_list("cluster", raw.get("cluster"), 100),
+        "watch": _risk_symbol_list("watch", raw.get("watch"), 20),
+        "accounts": accounts,
+    }
+
+
+def _blank_risk_settings() -> dict:
+    return {"version": 1, "thresholds": {}, "cluster": None, "watch": None,
+            "accounts": {}, "updated_at": ""}
+
+
+def _read_risk_settings() -> dict:
+    try:
+        with open(RISK_SETTINGS_FILE, "r", encoding="utf-8") as f:
+            stored = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return _blank_risk_settings()
+    try:
+        norm = _normalize_risk_settings(stored)
+    except ValueError:
+        app.logger.warning("risk settings file is invalid; ignoring it")
+        return _blank_risk_settings()
+    return {"version": 1, **norm, "updated_at": stored.get("updated_at") or ""}
+
+
+@app.get("/api/settings/risk")
+def get_risk_settings():
+    return jsonify(_read_risk_settings())
+
+
+@app.put("/api/settings/risk")
+def put_risk_settings():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "expected a JSON object"}), 400
+    try:
+        norm = _normalize_risk_settings(body)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    payload = {
+        "version": 1,
+        **norm,
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    _atomic_write_json(RISK_SETTINGS_FILE, payload, indent=2)
+    return jsonify(payload)
+
+
 # ---------------------------------------------------------------------------
 # 13F superinvestor overlay
 #
