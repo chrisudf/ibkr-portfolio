@@ -727,7 +727,40 @@ body.modal-open { overflow: hidden; }
 
 .risk-head-right { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }
 .ghost-btn.risk-btn { padding: 6px 14px; font-size: 12px; }
-.panel-head h2 .panel-note { margin-left: 8px; font-weight: 400; letter-spacing: 0; }
+.risk-title { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.risk-title .panel-note { font-weight: 400; letter-spacing: 0; }
+
+/* The title is the fold switch. A bare button in the heading's own type, so
+   the panel reads the same as every other one until you reach for it. */
+.risk-toggle {
+  display: inline-flex; align-items: baseline; gap: 6px;
+  margin: 0; padding: 0; border: 0; background: none;
+  font: inherit; color: inherit; letter-spacing: inherit; cursor: pointer;
+  transition: color 0.15s;
+}
+.risk-toggle:hover { color: var(--accent); }
+.risk-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 4px; }
+.risk-chevron {
+  display: inline-block; width: 12px; font-size: 12px; color: var(--text-dim);
+  transition: transform 0.15s;
+}
+#risk-panel.risk-collapsed .risk-chevron { transform: rotate(-90deg); }
+#risk-panel.risk-collapsed .panel-head { margin-bottom: 10px; }
+
+/* Folded: one line per account. display:flex would beat the hidden
+   attribute, hence the explicit rule. */
+.risk-summary { display: flex; flex-wrap: wrap; gap: 4px 20px; font-size: 13px; }
+.risk-summary[hidden] { display: none; }
+.risk-sum.red { color: var(--red); }
+.risk-sum.amber { color: var(--amber); }
+.risk-sum.ok { color: var(--green); }
+.risk-sum b { color: var(--text); font-weight: 600; }
+
+.risk-legend {
+  margin: 14px 0 0; padding-left: 18px;
+  font-size: 12px; line-height: 1.75; color: var(--text-faint);
+}
+.risk-legend b { color: var(--text-dim); font-weight: 600; }
 
 .risk-verdict { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
 .risk-verdict:empty { display: none; }

@@ -45,10 +45,24 @@ def test_risk_settings_normalization():
     assert norm({})["cluster"] is None and norm({})["watch"] is None
 
 
+def test_two_breaker_steps():
+    from app import _normalize_risk_settings as norm
+
+    got = norm({"thresholds": {"drawdown_stop": 0.08, "drawdown_halt": 0.25}})
+    assert got["thresholds"] == {"drawdown_stop": 0.08, "drawdown_halt": 0.25}
+    # Equal is allowed: one step that is both "停卖 put" and "只减不加".
+    assert norm({"thresholds": {"drawdown_stop": 0.15, "drawdown_halt": 0.15}})["thresholds"]
+    # Only one typed: the other is a client-side default, so nothing to compare.
+    assert norm({"thresholds": {"drawdown_halt": 0.05}})["thresholds"] == {"drawdown_halt": 0.05}
+    with pytest.raises(ValueError, match="drawdown_halt"):
+        norm({"thresholds": {"drawdown_stop": 0.20, "drawdown_halt": 0.10}})
+
+
 @pytest.mark.parametrize("body", [
     {"thresholds": {"bogus": 1}},                      # unknown line
     {"thresholds": {"pm_warn": 10}},                   # percent typed as a fraction
     {"thresholds": {"drawdown_stop": 1.5}},
+    {"thresholds": {"drawdown_halt": 20}},             # percent typed as a fraction
     {"thresholds": {"put_nav_max": -0.1}},
     {"thresholds": {"drawdown_days": 2.5}},            # not a whole number
     {"thresholds": {"drawdown_days": 1}},              # too short to mean anything

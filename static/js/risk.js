@@ -19,8 +19,9 @@
  *   距组合保证金线               PM accounts only: NAV against the US$100k
  *                               floor — under it IBKR accepts only trades that
  *                               reduce margin
- *   近 N 日回撤 / 断路器          flow-adjusted drawdown from the window's high;
- *                               past the stop the answer is 只减不加
+ *   近 N 日回撤 / 断路器          flow-adjusted drawdown from the window's high,
+ *                               in two steps: at −10% no new short puts, at
+ *                               −20% 只减不加 (shares and long options too)
  *   到期周 vs 现金               cash accounts only: each expiry week's
  *                               short-put notional against cash + BOXX
  *
@@ -59,7 +60,8 @@ const RISK_DEFAULTS = {
   pm_floor: 100000,          // PM 账户净值线（账户本币，USD）
   pm_warn: 0.10,             // 缓冲不到净值的 10% 亮黄
   drawdown_days: 30,         // 回撤窗口：最近 N 个 NAV 行
-  drawdown_stop: 0.10,       // 窗口高点回撤到 −10% → 断路器
+  drawdown_stop: 0.10,       // 一级断路器：窗口高点回撤到 −10% → 停卖 put
+  drawdown_halt: 0.20,       // 二级断路器：回撤到 −20% → 只减不加
 };
 
 // Names that gap together on an AI-capex scare, gated as one position.
@@ -212,10 +214,17 @@ function riskDrawdown(navHistory, flows, days) {
            rows: series.length };
 }
 
-// At or past the stop. Inclusive: the rule is "−10% trips it", not "worse
-// than −10%".
-function riskTripped(dd, cfg) {
-  return !!dd && dd.dd <= -cfg.drawdown_stop + RISK_EPS;
+// Which breaker step the drawdown has reached: 0 none, 1 no new short puts,
+// 2 nothing new at all. Inclusive — "−10% trips it", not "worse than −10%".
+// The first step is aimed at short puts on purpose: they are the leverage that
+// compounds a slide (the assignment bill grows and margin rises as prices
+// fall), while a share or a long option paid for with idle cash risks only
+// itself. Past the second step that distinction stops mattering.
+function riskBreaker(dd, cfg) {
+  if (!dd) return 0;
+  if (dd.dd <= -cfg.drawdown_halt + RISK_EPS) return 2;
+  if (dd.dd <= -cfg.drawdown_stop + RISK_EPS) return 1;
+  return 0;
 }
 
 // Cash account: short-put notional by expiry week against cash + BOXX. The
@@ -237,8 +246,7 @@ function riskCashWeeks(options, priceBook, todayTs, cashLike) {
   });
 }
 
-// The verdict for one account column. The breaker outranks the lines: past
-// it nothing new goes on, replacement included.
+// The verdict for one account column. `breaker` is the step reached (0–2).
 function riskVerdict(judge, dd, pm, cashWeeks, cfg) {
   const fx = (r) => `${r.toFixed(2)}x`;
   const crossed = [];
@@ -246,7 +254,7 @@ function riskVerdict(judge, dd, pm, cashWeeks, cfg) {
   for (const w of judge.watch) if (w.over) crossed.push(`${w.u} ${fx(w.ratio)}`);
   for (const s of judge.single) if (s.over) crossed.push(`${s.u} ${fx(s.ratio)}`);
   if (judge.cluster.over) crossed.push(`AI 硬件簇 ${fx(judge.cluster.ratio)}`);
-  const breaker = riskTripped(dd, cfg);
+  const breaker = riskBreaker(dd, cfg);
   const cashShort = (cashWeeks || []).filter(w => w.over).length;
   const pmLevel = pm ? pm.level : "ok";
   return {
@@ -264,6 +272,18 @@ function riskScope(ids, selected) {
     return { ids: [selected], merged: false };
   }
   return { ids, merged: ids.length > 1 };
+}
+
+// One account's verdict in a few words, for the folded panel's single line.
+function riskBrief(v) {
+  const parts = [];
+  if (v.breaker === 2) parts.push("只减不加");
+  else if (v.breaker === 1) parts.push("停卖 put");
+  if (v.crossed.length) parts.push(`超线 ${v.crossed.length} 项`);
+  if (v.pmLevel === "red") parts.push("PM 线下");
+  else if (v.pmLevel === "amber") parts.push("PM 缓冲薄");
+  if (v.cashShort) parts.push(`${v.cashShort} 周现金不够`);
+  return parts.length ? parts.join(" · ") : "线内";
 }
 
 /* --- Rendering ------------------------------------------------------------ */
@@ -343,9 +363,12 @@ function renderRiskVerdict(cols, cfg) {
   const lines = cols.map(c => {
     const v = c.verdict;
     const parts = [];
-    if (v.breaker) {
-      parts.push(`<b class="down">断路器：只减不加</b>`
-        + `（近 ${cfg.drawdown_days} 个交易日回撤 ${fmtPct(c.dd.dd, 1)}）`);
+    const ddText = c.dd ? `近 ${cfg.drawdown_days} 个交易日回撤 ${fmtPct(c.dd.dd, 1)}` : "";
+    if (v.breaker === 2) {
+      parts.push(`<b class="down">二级断路器：只减不加</b>（${ddText}，正股和期权多头也停）`);
+    } else if (v.breaker === 1) {
+      parts.push(`<b class="down">断路器：不开新卖 put</b>`
+        + `（${ddText}；roll 不加张数和名义，闲置现金可以买正股和期权多头）`);
     }
     if (v.crossed.length) {
       parts.push(`<b class="down">超线 ${v.crossed.length} 项：只许替换，不许净新增</b>`
@@ -368,6 +391,13 @@ function renderRiskVerdict(cols, cfg) {
       + `<span><b>${esc(c.label)}</b>${kind}：${parts.join("；")}</span></div>`;
   });
   $("risk-verdict").innerHTML = lines.join("");
+  // Rendered whether or not the panel is folded, so unfolding and folding
+  // never shows a stale line.
+  $("risk-summary").innerHTML = cols.map(c => {
+    const icon = c.verdict.level === "red" ? "⛔" : c.verdict.level === "amber" ? "⚠" : "✓";
+    return `<span class="risk-sum ${c.verdict.level}">${icon} <b>${esc(c.label)}</b>：`
+      + `${riskBrief(c.verdict)}</span>`;
+  }).join("");
 }
 
 function renderRiskTable(cols, cfg) {
@@ -429,12 +459,14 @@ function renderRiskTable(cols, cfg) {
       })));
   }
   rows.push(row(`近 ${cfg.drawdown_days} 个交易日回撤`,
-    `≤ −${fmtPct(cfg.drawdown_stop, 0)} 断路器`, cols.map(c => {
+    `≤ −${fmtPct(cfg.drawdown_stop, 0)} 停卖 put · ≤ −${fmtPct(cfg.drawdown_halt, 0)} 只减不加`,
+    cols.map(c => {
       if (!c.dd) return blank(c, "—", "净值序列不足 5 个点");
-      const tripped = riskTripped(c.dd, cfg);
+      const step = riskBreaker(c.dd, cfg);
+      const tag = step === 2 ? "只减不加" : step === 1 ? "停卖 put" : "";
       const peak = c.dd.peakDate === c.dd.lastDate ? "在窗口高点" : `高点 ${fmtMD(c.dd.peakDate)}`;
-      return cell(c, c.dd.dd < -0.0005 ? fmtPct(c.dd.dd, 1) : "0%", tripped ? "down" : "",
-        tripped && !c.merged ? `<span class="tag tag-over">断路器</span> ${peak}` : peak,
+      return cell(c, c.dd.dd < -0.0005 ? fmtPct(c.dd.dd, 1) : "0%", step ? "down" : "",
+        tag && !c.merged ? `<span class="tag tag-over">${tag}</span> ${peak}` : peak,
         `${c.dd.rows} 个 NAV 行，截至 ${c.dd.lastDate}，剔除出入金`);
     })));
   const head = cols.map(c => `<th class="num${on(c)}">${esc(c.label)}`
@@ -492,7 +524,8 @@ const RISK_FIELDS = [
   { key: "pm_floor", label: "组合保证金净值线", unit: "US$", scale: 1 },
   { key: "pm_warn", label: "离线缓冲预警（占净值）", unit: "%", scale: 100 },
   { key: "drawdown_days", label: "回撤窗口", unit: "个交易日", scale: 1 },
-  { key: "drawdown_stop", label: "回撤断路器", unit: "%", scale: 100 },
+  { key: "drawdown_stop", label: "回撤一级（停卖 put）", unit: "%", scale: 100 },
+  { key: "drawdown_halt", label: "回撤二级（只减不加）", unit: "%", scale: 100 },
 ];
 
 // toFixed round-trips: 0.1 × 100 is 10.000000000000002 in binary floating
@@ -564,6 +597,11 @@ function riskDraft() {
     if (Number.isNaN(v)) return { error: `${f.label}：填的不是数字` };
     thresholds[f.key] = v;
   }
+  // Checked against the defaults too: typing only the first step deeper than
+  // the default second one would make 停卖 put the stricter-sounding, later one.
+  const stop = thresholds.drawdown_stop ?? RISK_DEFAULTS.drawdown_stop;
+  const halt = thresholds.drawdown_halt ?? RISK_DEFAULTS.drawdown_halt;
+  if (halt < stop) return { error: "回撤二级（只减不加）不能比一级（停卖 put）浅" };
   const list = (name) => riskListFromInput(
     document.querySelector(`#risk-form-body [data-list="${name}"]`).value);
   const accounts = {};
@@ -626,8 +664,38 @@ function wireRiskModal() {
   });
 }
 
+/* --- Folding ------------------------------------------------------------ */
+
+// Folded or open is a per-device preference — a phone may want the gate shut
+// and the desk want it open — so it lives in this browser, unlike the lines,
+// which must read the same everywhere and are kept on the server.
+const RISK_FOLD_KEY = "ibkr.riskGate.collapsed";
+
+function applyRiskFold(collapsed) {
+  $("risk-panel").classList.toggle("risk-collapsed", collapsed);
+  $("risk-body").hidden = collapsed;
+  $("risk-summary").hidden = !collapsed;
+  $("risk-toggle").setAttribute("aria-expanded", String(!collapsed));
+}
+
+function wireRiskToggle() {
+  let collapsed = false;
+  try {
+    collapsed = localStorage.getItem(RISK_FOLD_KEY) === "1";
+  } catch (_) { /* storage blocked: start open */ }
+  applyRiskFold(collapsed);
+  $("risk-toggle").addEventListener("click", () => {
+    collapsed = !collapsed;
+    applyRiskFold(collapsed);
+    try {
+      localStorage.setItem(RISK_FOLD_KEY, collapsed ? "1" : "0");
+    } catch (_) { /* fine: it just won't be remembered */ }
+  });
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   wireRiskModal();
+  wireRiskToggle();
   // Same guard as the position rules: the 设置 button ships disabled and only
   // a successful read enables it, so a failed GET can never lead to a save
   // that writes blanks over the stored lines. The panel itself still renders

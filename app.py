@@ -403,7 +403,8 @@ _RISK_LIMITS = {
     "pm_floor": (0.0, 1e9, False),
     "pm_warn": (0.0, 1.0, False),
     "drawdown_days": (5, 260, True),
-    "drawdown_stop": (0.0, 1.0, False),
+    "drawdown_stop": (0.0, 1.0, False),   # 一级断路器：停卖 put
+    "drawdown_halt": (0.0, 1.0, False),   # 二级断路器：只减不加
 }
 _ACCOUNT_KINDS = ("pm", "margin", "cash")
 _RISK_LABEL_MAX = 24
@@ -472,6 +473,13 @@ def _normalize_risk_settings(raw: dict) -> dict:
         val = _risk_threshold(key, value)
         if val is not None:
             thresholds[key] = val
+    # The second breaker step must sit at or below the first. Only checkable
+    # when both are typed — the defaults live in risk.js, which checks the
+    # mixed case before it ever sends.
+    stop, halt = thresholds.get("drawdown_stop"), thresholds.get("drawdown_halt")
+    if stop is not None and halt is not None and halt < stop:
+        raise ValueError("drawdown_halt (只减不加) must not be shallower than "
+                         "drawdown_stop (停卖 put)")
     acc_raw = raw.get("accounts")
     acc_raw = {} if acc_raw is None else acc_raw
     if not isinstance(acc_raw, dict):

@@ -49,8 +49,8 @@ const consts = [
 
 const DASH_FNS = ["parseExpiryTs", "groupExpiries", "fundedSeries", "navStats"];
 const RISK_FNS = ["riskConfig", "riskNav", "riskBook", "mergeRiskBooks", "riskJudge",
-                  "riskPmBuffer", "riskDrawdown", "riskTripped", "riskCashWeeks",
-                  "riskVerdict", "riskScope"];
+                  "riskPmBuffer", "riskDrawdown", "riskBreaker", "riskCashWeeks",
+                  "riskVerdict", "riskScope", "riskBrief"];
 const R = new Function(
   `${consts}\n`
   + DASH_FNS.map(n => extract(dash, "dashboard.js", n)).join("\n") + "\n"
@@ -222,6 +222,7 @@ test("设置：缺省全走默认值，覆盖只改填了的，读不懂的回�
   assert.equal(d.pm_floor, 100000);
   assert.equal(d.drawdown_days, 30);
   assert.equal(d.drawdown_stop, 0.10);
+  assert.equal(d.drawdown_halt, 0.20);
   assert.deepEqual(d.watch, ["SOXL"]);
   assert.deepEqual(d.cluster, R.RISK_CLUSTER);
   const c = R.riskConfig({ thresholds: { put_nav_max: 1.5, pm_warn: "abc", bogus: 3 },
@@ -288,16 +289,33 @@ test("断路器：窗口高点回撤 −15% 跳闸，并给出高点日期", () 
   near(dd.dd, -0.15, 1e-12);
   assert.equal(dd.peakDate, hist[hist.length - 2].date);   // 平台期推到最后一天
   assert.equal(dd.lastDate, hist[hist.length - 1].date);
-  assert.equal(R.riskTripped(dd, CFG), true);
+  assert.equal(R.riskBreaker(dd, CFG), 1);                // −15%：一级，停卖 put
 });
 
 test("断路器：正好 −10% 也跳闸（含浮点误差），−9.9% 不跳", () => {
   const exact = [{ total: 100000 }, { total: 100000 }, { total: 100000 },
                  { total: 95000 }, { total: 90000 }]
     .map((p, i) => ({ ...p, date: weekdays(5)[i] }));
-  assert.equal(R.riskTripped(R.riskDrawdown(exact, [], 30), CFG), true);
+  assert.equal(R.riskBreaker(R.riskDrawdown(exact, [], 30), CFG), 1);
   const almost = exact.map((p, i) => (i === 4 ? { ...p, total: 90100 } : p));
-  assert.equal(R.riskTripped(R.riskDrawdown(almost, [], 30), CFG), false);
+  assert.equal(R.riskBreaker(R.riskDrawdown(almost, [], 30), CFG), 0);
+});
+
+test("断路器分两级：−10% 停卖 put，−20% 只减不加，两条线都走配置", () => {
+  const at = (dd) => R.riskBreaker({ dd }, CFG);
+  assert.equal(at(-0.099), 0);
+  assert.equal(at(-0.10), 1);
+  assert.equal(at(-0.199), 1);
+  assert.equal(at(-0.20), 2);
+  assert.equal(at(-0.256), 2);
+  // 「正好 −20%」从净值链算出来带浮点误差，照样算二级
+  const chain = [100000, 100000, 100000, 90000, 80000]
+    .map((total, i) => ({ total, date: weekdays(5)[i] }));
+  assert.equal(R.riskBreaker(R.riskDrawdown(chain, [], 30), CFG), 2);
+  const cfg = R.riskConfig({ thresholds: { drawdown_stop: 0.05, drawdown_halt: 0.30 } });
+  assert.equal(R.riskBreaker({ dd: -0.06 }, cfg), 1);
+  assert.equal(R.riskBreaker({ dd: -0.25 }, cfg), 1);
+  assert.equal(R.riskBreaker({ dd: -0.30 }, cfg), 2);
 });
 
 test("入金不能把断路器关掉：剔除出入金后回撤不变", () => {
@@ -308,9 +326,9 @@ test("入金不能把断路器关掉：剔除出入金后回撤不变", () => {
   const { pts, flows } = navPathWithFlows(rets, { 12: 30000 });
   const withFlow = R.riskDrawdown(pts, flows, 30);
   near(withFlow.dd, base.dd, 1e-12);
-  assert.equal(R.riskTripped(withFlow, CFG), true);
+  assert.equal(R.riskBreaker(withFlow, CFG), 1);
   // 同样的净值如果不剔除入金，就会被读成「没事」—— 说明上面那条确实在起作用
-  assert.equal(R.riskTripped(R.riskDrawdown(pts, [], 30), CFG), false);
+  assert.equal(R.riskBreaker(R.riskDrawdown(pts, [], 30), CFG), 0);
 });
 
 test("出金不能凭空跳闸", () => {
@@ -318,7 +336,7 @@ test("出金不能凭空跳闸", () => {
   assert.equal(pts[pts.length - 1].total, 60000);       // 原始净值掉了 40%
   const dd = R.riskDrawdown(pts, flows, 30);
   near(dd.dd, 0, 1e-12);
-  assert.equal(R.riskTripped(dd, CFG), false);
+  assert.equal(R.riskBreaker(dd, CFG), 0);
 });
 
 test("回撤只看最近 N 行：窗口外的老回撤不算", () => {
@@ -334,7 +352,7 @@ test("回撤只看最近 N 行：窗口外的老回撤不算", () => {
 test("净值行不足 5 个：给不出回撤，也不跳闸", () => {
   const dd = R.riskDrawdown(navPath([-0.2, -0.2]), [], 30);
   assert.equal(dd, null);
-  assert.equal(R.riskTripped(dd, CFG), false);
+  assert.equal(R.riskBreaker(dd, CFG), 0);
 });
 
 // --- cash account weeks ------------------------------------------------------------
@@ -362,7 +380,7 @@ test("现金户：按到期周汇总卖 put 名义，当周超现金+BOXX 标红
 test("结论：断路器、超线、PM 破线、现金不够都是红；只有 PM 缓冲薄是黄；都没有是线内", () => {
   const j = R.riskJudge(R.riskBook(ACCT_A, CFG, BOOK), CFG);
   const v = R.riskVerdict(j, { dd: -0.12 }, { level: "red" }, null, CFG);
-  assert.equal(v.breaker, true);
+  assert.equal(v.breaker, 1);
   assert.equal(v.level, "red");
   assert.deepEqual(v.crossed, ["卖 put 1.15x", "SOXL 0.38x", "MSFT 0.50x", "COHR 0.28x",
                                "AI 硬件簇 1.38x"]);
@@ -373,6 +391,19 @@ test("结论：断路器、超线、PM 破线、现金不够都是红；只有 P
   const v2 = R.riskVerdict(calm, null, null, [{ over: true }, { over: false }], CFG);
   assert.equal(v2.cashShort, 1);
   assert.equal(v2.level, "red");
+  const deep = R.riskVerdict(calm, { dd: -0.25 }, null, null, CFG);
+  assert.equal(deep.breaker, 2);                  // 二级：只减不加
+  assert.equal(deep.level, "red");
+});
+
+test("收起后的一行结论：和完整结论同一套判断，只是更短", () => {
+  const v = (o) => ({ crossed: [], breaker: 0, pmLevel: "ok", cashShort: 0, ...o });
+  assert.equal(R.riskBrief(v({ breaker: 1, crossed: ["a", "b", "c", "d"], pmLevel: "red" })),
+               "停卖 put · 超线 4 项 · PM 线下");
+  assert.equal(R.riskBrief(v({ breaker: 2 })), "只减不加");
+  assert.equal(R.riskBrief(v({ crossed: ["a"], cashShort: 2 })), "超线 1 项 · 2 周现金不够");
+  assert.equal(R.riskBrief(v({ pmLevel: "amber" })), "PM 缓冲薄");
+  assert.equal(R.riskBrief(v({})), "线内");
 });
 
 // --- wiring ----------------------------------------------------------------------------

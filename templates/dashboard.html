@@ -83,29 +83,37 @@
       <!-- Risk gate: the selected account; 总账户 shows every account side by side -->
       <section class="panel" id="risk-panel" hidden>
         <div class="panel-head">
-          <h2>风险闸门 <span class="panel-note">下单前看一眼</span></h2>
+          <h2 class="risk-title">
+            <button id="risk-toggle" class="risk-toggle" type="button"
+                    aria-expanded="true" aria-controls="risk-body" title="收起 / 展开">
+              <span class="risk-chevron" aria-hidden="true">▾</span>风险闸门
+            </button>
+            <span class="panel-note">下单前看一眼</span>
+          </h2>
           <div class="risk-head-right">
             <span class="panel-note" id="risk-note"></span>
             <button id="risk-btn" class="ghost-btn risk-btn" type="button" disabled title="读取风险闸门设置中…">设置</button>
           </div>
         </div>
-        <div class="risk-verdict" id="risk-verdict"></div>
-        <div class="table-wrap">
-          <table class="holdings risk-table" id="risk-table"></table>
+        <!-- Collapsed, the panel keeps one line of verdict: folding the gate
+             away must not fold the alarm away with it. -->
+        <div class="risk-summary" id="risk-summary" hidden></div>
+        <div id="risk-body">
+          <div class="risk-verdict" id="risk-verdict"></div>
+          <div class="table-wrap">
+            <table class="holdings risk-table" id="risk-table"></table>
+          </div>
+          <div class="margin-foot" id="risk-table-note"></div>
+          <div class="risk-sub-section" id="risk-cash" hidden></div>
+          <ul class="risk-legend">
+            <li><b>超线</b> → 只许替换，不许净新增。线是默认值、没正式采纳，在「设置」里改，账户类型也在那里标。</li>
+            <li><b>卖 put 名义</b> = 行权价 × 股数：全部被行权要付的钱，不分价内外。</li>
+            <li><b>AI 硬件簇</b> = 成员的正股市值 + LEAP 名义（正股价 × 股数）+ 卖 put 名义。</li>
+            <li><b>回撤断路器</b>：−10% → 停卖 put（roll 不加张数和名义，闲置现金可以买正股和期权多头）；−20% → 只减不加。回撤剔除出入金，从窗口内最高点算。</li>
+            <li><b>组合保证金线</b>：净值低于 US$100k，IBKR 只接受降低保证金的交易。<b>现金户</b>：每个到期周的卖 put 名义对比现金 + BOXX，累计列假设接来的股票不卖。</li>
+            <li>跟着账号页签走；<b>总账户</b>把两户并排，加一列合并（名义之和 ÷ 净值之和）。</li>
+          </ul>
         </div>
-        <div class="margin-foot" id="risk-table-note"></div>
-        <div class="risk-sub-section" id="risk-cash" hidden></div>
-        <div class="margin-foot">超线 = 只许替换，不许净新增；断路器 = 只减不加。线都是默认值（还没正式采纳），
-          在「设置」里改，也在那里标出哪个是组合保证金户、哪个是现金户（报表里没有这个信息）。
-          <b>卖 put 名义</b> = 行权价 × 张数 × 合约乘数，全部被行权要接货的钱，不看价内外。
-          <b>合并</b>列 = 两账户名义之和 ÷ 净值之和（按净值加权的平均，不是简单平均）。
-          <b>AI 硬件簇</b> = 成员的正股市值 + LEAP 名义（多头 call 按正股价 × 股数，组合里没有正股报价时按行权价）
-          + 卖 put 名义。<b>回撤</b>按剔除出入金的 TWR 链、从最近 N 个 NAV 行的最高点算（IBKR 在美股休市日也记一行，
-          所以约等于交易日），入金不会把断路器关掉。<b>组合保证金线</b>：净值低于 US$100k 时 IBKR 只接受降低保证金的交易。
-          <b>现金户</b>：每个到期周的卖 put 名义对比现金 + BOXX；累计列假设被行权接来的正股不卖。
-          财报不在这里判，财报季自己看。
-          跟着上方的账号切换：单个账号只显示这一户；「总账户」把两户并排、再加合并列，用来看是不是两户押了同一个方向。
-          合并比值是两户按净值加权的平均，不会比较差的那一户更高，所以只看下单的那个账户不会漏掉报警。</div>
       </section>
 
       <!-- NAV history -->
