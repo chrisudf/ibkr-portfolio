@@ -225,8 +225,8 @@ def test_settings_file_is_not_mistaken_for_an_account(tmp_path, monkeypatch):
     monkeypatch.setattr(app_mod, "UPLOAD_DIR", tmp_path)
     (tmp_path / ".position_settings.json").write_text(
         '{"version": 1, "symbols": {}}', encoding="utf-8")
-    (tmp_path / "U17456181.json").write_text('{"nav": {"total": 1}}', encoding="utf-8")
-    assert list(app_mod._load_all_accounts()) == ["U17456181"]
+    (tmp_path / "U1234567.json").write_text('{"nav": {"total": 1}}', encoding="utf-8")
+    assert list(app_mod._load_all_accounts()) == ["U1234567"]
 
 
 def test_position_settings_response_shape_is_stable(tmp_path, monkeypatch):

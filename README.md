@@ -260,6 +260,11 @@ set -a && . scripts/sync.env && set +a && python app.py
 
 打开 <http://127.0.0.1:5050/>，上传你的 IBKR 报表。
 
+Flask 调试模式（Werkzeug 调试器 + 改代码自动重启）**默认关闭**，本地开发需要时设
+`FLASK_DEBUG=1` 再启动（PowerShell：`$env:FLASK_DEBUG = "1"`）。调试器的网页控制台能执行任意
+Python，所以只在监听 `127.0.0.1` 时打开 —— 把 `app.run` 的 host 改成 `0.0.0.0` 让局域网访问时，
+别同时设 `FLASK_DEBUG`。
+
 > **本地实例的刷新按钮默认锁死**（返回 409），哪怕 `sync.env` 已经加载 ——
 > 恰恰因为它加载的就是生产那一套凭据。同一个 Flex query 每天大约只放行一次
 > 生成，而计划同步已经占住了它：在本地点一次，饿死的是部署实例第二天的那次
@@ -381,3 +386,6 @@ ibkr-portfolio/
 
 ## 数据安全
 所有解析都在本地完成，文件只缓存到 `uploads/`，不发送到任何外部服务。
+
+## 许可证
+[MIT](LICENSE)
