@@ -17,7 +17,7 @@
 - **已实现盈亏排行榜**：本期盈亏 Top 标的
 - **13F 对照**：把持仓跟 Dataroma 追踪的 83 位超级投资者最新一季的买卖动作对起来，三个视角：你的持仓 / 机构在买你没有 / 机构在清你持有
 - **风险闸门**：下单前看的一张表 —— 卖 put 名义、单标的、AI 硬件簇、组合保证金线、回撤断路器、
-  现金户到期周、跨财报，每个账户一列加合并一列，超线标红并写明该怎么做（见下）
+  现金户到期周，每个账户一列加合并一列，超线标红并写明该怎么做（见下）
 
 ### 关于「风险闸门」的口径
 
@@ -33,7 +33,8 @@
 | 距组合保证金线 | 只对标成「组合保证金」的账户：净值 − US$100k；百分比按净值算（还能跌多少 / 要涨多少才回到线上） | 缓冲 < 10% 黄，破线红 |
 | 近 30 个交易日回撤 | 剔除出入金的 TWR 链，从最近 30 个 NAV 行的最高点算 | 到 −10% 跳闸 |
 | 到期周 vs 现金 | 只对标成「现金户」的账户：每个到期周的卖 put 名义对比现金 + BOXX（SGOV 同样算现金等价物）；累计列假设接来的正股不卖 | 当周超过标红，累计超过标黄 |
-| 跨财报 | 每张未平的卖出期权：标的下一次财报日 ≤ 到期日就算跨（财报当天到期也算） | — |
+
+财报**不在**这里判：做过一版「卖出期权到期跨不跨下次财报」，又拿掉了 —— 财报季自己盯。
 
 几个容易读错的地方：
 
@@ -43,11 +44,6 @@
   按行权价估，悬停提示会说有几张是估的。
 - **回撤窗口按 NAV 行数算**：IBKR 在美股休市日也记一行，所以 30 行约等于 30 个交易日。入金不会把断路器关掉，
   出金也不会凭空跳闸 —— 跟净值曲线面板同一条 TWR 链。
-- **财报日期**来自 Nasdaq 的公开接口 `api.nasdaq.com/api/analyst/{SYM}/earnings-date`（要浏览器 User-Agent），
-  服务端缓存一天（`uploads/.earnings_cache.json`），取失败的一小时后再试；重取失败时，7 天内取到、日期还没过的
-  旧答案会顶上并标「旧缓存」。单股杠杆 ETF 按底层查（LITX→LITE、APPX→APP、NVDL→NVDA 等，名单是
-  `static/js/risk.js` 里手工维护的 `EARNINGS_ALIAS`）；SOXL / TQQQ 这类指数 ETF 不标，在表尾合并成一行。
-  **取不到日期 = 未知，绝不当作「不跨」** —— 漏进名单的杠杆 ETF 会显示未知，补进映射即可。
 - **账户类型报表里没有**（Flex query 不含 Account Information），要在面板右上角「设置」里标出组合保证金户 /
   现金户；没标的账户不显示 PM 线和到期周表。
 
@@ -328,7 +324,7 @@ Python，那边没装依赖：
 `tests/test_parsers.py` 锁的是保证金口径、分红去重 / 多币种、成本股息率的
 时间基准这些容易悄悄回退的地方 —— 改 `parser/` 或 `app.py` 之前先跑一遍。
 `tests/test_app_features.py` 覆盖快照留存与自动同步的调度判定。
-`tests/test_risk_gate.py` 覆盖风险闸门设置的校验 / 读写，以及 Nasdaq 财报日期的解析与缓存（不连网）。
+`tests/test_risk_gate.py` 覆盖风险闸门设置的校验 / 读写。
 
 前端逻辑（周复盘、刷新轮询、告警条、净值曲线、风险闸门）的测试用 Node 自带的测试器，
 不用装任何依赖：
@@ -362,7 +358,6 @@ ibkr-portfolio/
 │   ├── ibkr_flex_csv.py    # Flex Web Service CSV 解析（多账户多 section）
 │   ├── ibkr_pdf.py         # PDF 解析（基于 pdfplumber）
 │   ├── flex_fetch.py       # 刷新按钮走的 Flex API 拉取
-│   ├── earnings.py         # 风险闸门的下次财报日期（Nasdaq，缓存一天）
 │   └── returns.py          # IRR / 年化回报率计算
 ├── tests/test_parsers.py   # 解析器回归测试（pytest，CSV 夹具）
 ├── scripts/
@@ -376,10 +371,8 @@ ibkr-portfolio/
 └── uploads/                # 每账户一份解析结果缓存
     ├── .position_settings.json   # 核心持仓 / 仓位区间（gitignore）
     ├── .risk_settings.json       # 风险闸门的线 / 簇成员 / 账户类型（gitignore）
-    ├── .earnings_cache.json      # 下次财报日期缓存（gitignore）
     └── .auto_sync_state.json     # 自动同步的最近一次结果（gitignore）
 ```
 
 ## 数据安全
 所有解析都在本地完成，文件只缓存到 `uploads/`，不发送到任何外部服务。
-风险闸门会向 Nasdaq 请求卖出期权所涉标的的下一次财报日期，请求里只有股票代码。

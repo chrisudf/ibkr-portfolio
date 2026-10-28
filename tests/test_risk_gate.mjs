@@ -7,9 +7,7 @@
 //   1. 合并列是「名义之和 ÷ 净值之和」，不是两个账户比值的平均；
 //   2. 线是「严格超过才算超线」，正好压线不算；断路器是「到 −10% 就跳闸」，
 //      而且浮点误差不能决定压线那一下的结论；
-//   3. 回撤剔除出入金 —— 入金不能把断路器关掉，出金不能凭空跳闸；
-//   4. 财报：只有一个真实日期落在到期之后才能说「不跨」，任何拿不到的情况
-//      都是「未知」，绝不能落成「不跨」。
+//   3. 回撤剔除出入金 —— 入金不能把断路器关掉，出金不能凭空跳闸。
 // 账号全部是假的（U1111111 / U2222222）—— 仓库是公开的。
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -46,16 +44,12 @@ const consts = [
   extractConst(risk, /const RISK_DEFAULTS = \{[\s\S]*?\n\};/, "RISK_DEFAULTS"),
   extractConst(risk, /const RISK_CLUSTER = \[[\s\S]*?\];/, "RISK_CLUSTER"),
   extractConst(risk, /const RISK_WATCH = [^;]+;/, "RISK_WATCH"),
-  extractConst(risk, /const EARNINGS_ALIAS = \{[\s\S]*?\};/, "EARNINGS_ALIAS"),
-  extractConst(risk, /const EARNINGS_NONE = new Set\(\[[\s\S]*?\]\);/, "EARNINGS_NONE"),
   extractConst(risk, /const RISK_EPS = [^;]+;/, "RISK_EPS"),
-  extractConst(risk, /const EARNINGS_RANK = [^;]+;/, "EARNINGS_RANK"),
 ].join("\n");
 
 const DASH_FNS = ["parseExpiryTs", "groupExpiries", "fundedSeries", "navStats"];
 const RISK_FNS = ["riskConfig", "riskNav", "riskBook", "mergeRiskBooks", "riskJudge",
                   "riskPmBuffer", "riskDrawdown", "riskTripped", "riskCashWeeks",
-                  "earningsTicker", "expiryIso", "earningsVerdict", "riskEarningsRows",
                   "riskVerdict"];
 const R = new Function(
   `${consts}\n`
@@ -325,73 +319,6 @@ test("现金户：按到期周汇总卖 put 名义，当周超现金+BOXX 标红
   assert.equal(weeks[0].dte, 4);
   assert.ok(weeks[0].items.every(s => s.includes("P")), "卖 call 混进来了");
   near(weeks[1].ratio, 37000 / 30000);
-});
-
-// --- earnings ----------------------------------------------------------------------
-
-test("财报代码：单股杠杆 ETF 映射到底层，指数 ETF 不标", () => {
-  assert.equal(R.earningsTicker("LITX"), "LITE");
-  assert.equal(R.earningsTicker("APPX"), "APP");
-  assert.equal(R.earningsTicker("NVDL"), "NVDA");
-  assert.equal(R.earningsTicker("SOXL"), null);
-  assert.equal(R.earningsTicker("TQQQ"), null);
-  assert.equal(R.earningsTicker("COHR"), "COHR");
-  assert.equal(R.earningsTicker(""), null);
-});
-
-const TODAY = "2026-10-25";
-const ok = (date, extra = {}) => ({ status: "ok", date, timing: "", estimated: false, ...extra });
-
-test("财报在到期前或到期当天 → 跨；在到期之后 → 不跨", () => {
-  assert.equal(R.earningsVerdict("20NOV26", "COHR", ok("2026-11-04"), TODAY).state, "cross");
-  assert.equal(R.earningsVerdict("20NOV26", "COHR", ok("2026-11-20"), TODAY).state, "cross");
-  assert.equal(R.earningsVerdict("20NOV26", "COHR", ok("2026-11-21"), TODAY).state, "clear");
-  assert.equal(R.earningsVerdict("20NOV26", "COHR", ok(TODAY), TODAY).state, "cross");
-});
-
-test("拿不到日期的每一种情况都是未知，绝不是不跨", () => {
-  const junk = [
-    undefined, null,
-    { status: "error", date: null }, { status: "none", date: null },
-    { status: "ok", date: null }, { status: "ok" }, { status: "pending", date: "2026-12-01" },
-    ok("2026-10-01"),                                    // 日期已经过去
-  ];
-  for (const e of junk) {
-    const v = R.earningsVerdict("20NOV26", "COHR", e, TODAY);
-    assert.equal(v.state, "unknown", `entry ${JSON.stringify(e)} → ${v.state}`);
-    assert.ok(v.why, "未知要说明原因");
-  }
-  assert.equal(R.earningsVerdict("garbage", "COHR", ok("2026-12-01"), TODAY).state, "unknown");
-  assert.equal(R.earningsVerdict("20NOV26", null, ok("2026-11-04"), TODAY).state, "na");
-});
-
-test("每张未平的卖出期权一行（镜像合约两行），排序：跨 → 未知 → 不跨 → 不适用", () => {
-  const accounts = {
-    U2222222: { options: [put("COHR", "20NOV26", 220, -1), put("SOXL", "27NOV26", 75, -4)] },
-    U1111111: { options: [
-      put("COHR", "20NOV26", 220, -1),
-      call("LITX", "20NOV26", 50, -1),
-      put("MSFT", "18DEC26", 400, -1),
-      put("ORCL", "19MAR27", 175, -1),
-      call("NVDA", "21JAN28", 220, 1),                   // 多头：不在这张表
-    ] },
-  };
-  const earnings = {
-    COHR: ok("2026-11-04", { timing: "amc" }),
-    LITE: ok("2026-11-05"),
-    MSFT: ok("2027-01-27"),
-    ORCL: { status: "error", date: null },
-  };
-  const rows = R.riskEarningsRows(accounts, earnings, TODAY);
-  assert.deepEqual(rows.map(r => [r.acct, r.o.underlying, r.state]), [
-    ["U1111111", "COHR", "cross"],
-    ["U2222222", "COHR", "cross"],
-    ["U1111111", "LITX", "cross"],                       // 按 LITE 的财报判
-    ["U1111111", "ORCL", "unknown"],
-    ["U1111111", "MSFT", "clear"],
-    ["U2222222", "SOXL", "na"],
-  ]);
-  assert.equal(rows.find(r => r.o.underlying === "LITX").ticker, "LITE");
 });
 
 // --- verdict -------------------------------------------------------------------------

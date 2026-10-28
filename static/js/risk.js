@@ -23,8 +23,9 @@
  *                               past the stop the answer is 只减不加
  *   到期周 vs 现金               cash accounts only: each expiry week's
  *                               short-put notional against cash + BOXX
- *   跨财报                       every open short option: does its expiry
- *                               fall on or after the underlying's next report
+ *
+ * Earnings are deliberately not a rule here: a "this put crosses a report"
+ * column was built and taken out again — earnings season is watched by hand.
  *
  * It is the same table on every tab, on purpose. Selling the same contract in
  * both accounts on the same day is a household problem, and a gate showing
@@ -40,9 +41,9 @@
  * on it.
  *
  * Loaded after dashboard.js and leans on its helpers ($, esc, fmtMoney,
- * fmtPct, maskAccountId, currentDataRef, buildPriceBook, parseExpiryTs,
- * groupExpiries, fundedSeries, navStats, mergeAccounts, showToast, DAY_MS,
- * CASH_EQUIVALENTS, CONTRACT_MULTIPLIER).
+ * fmtPct, maskAccountId, currentDataRef, buildPriceBook, groupExpiries,
+ * fundedSeries, navStats, mergeAccounts, showToast, DAY_MS, CASH_EQUIVALENTS,
+ * CONTRACT_MULTIPLIER).
  * ------------------------------------------------------------------------- */
 
 // The proposed lines. A blank box in the 设置 dialog means "this value".
@@ -63,25 +64,6 @@ const RISK_CLUSTER = ["SOXL", "SOXX", "SMH", "NVDA", "NVDL", "AVGO", "COHR",
                       "LITE", "LITX", "VRT", "MU", "TSM"];
 // Underlyings with a 单标的 row of their own, whatever their size.
 const RISK_WATCH = ["SOXL"];
-
-// Single-stock leveraged ETFs report nothing themselves but gap on their
-// underlying's report, so the earnings column asks about the underlying.
-// Hand-maintained, like F13_SHARE_CLASSES. A fund missing from here is asked
-// about under its own ticker, Nasdaq answers "no such symbol", and the row
-// reads 未知 — the failure is the safe one.
-const EARNINGS_ALIAS = {
-  LITX: "LITE", APPX: "APP", NVDL: "NVDA", NVDU: "NVDA", CONL: "COIN",
-  METU: "META", TSLL: "TSLA", AMDL: "AMD", MSTU: "MSTR", MSTX: "MSTR",
-};
-// Index / sector / commodity / crypto funds: there is no report to cross, so
-// their rows read 不适用 rather than 未知. (A SOXL put does feel NVDA's report
-// — that exposure is what the cluster row is for, not this column.)
-const EARNINGS_NONE = new Set([
-  "SOXL", "SOXS", "TQQQ", "SQQQ", "UPRO", "SPXL", "SPXU", "TNA", "TECL", "FNGU",
-  "QQQ", "QQQM", "SPY", "VOO", "IVV", "IWM", "DIA", "SOXX", "SMH", "XLK",
-  "TLT", "TMF", "GLD", "GDX", "GDXU", "NUGT", "JNUG", "SLV", "UVXY", "VXX",
-  "IBIT", "ETHU", "BITX", "BOXX", "SGOV",
-]);
 
 const RISK_KIND_LABEL = { pm: "组合保证金", margin: "Reg-T 保证金", cash: "现金户" };
 
@@ -252,61 +234,6 @@ function riskCashWeeks(options, priceBook, todayTs, cashLike) {
   });
 }
 
-// Which ticker's report a contract on `u` is exposed to; null = none (index
-// and commodity funds).
-function earningsTicker(u) {
-  if (!u || EARNINGS_NONE.has(u)) return null;
-  return EARNINGS_ALIAS[u] || u;
-}
-
-// "27NOV26" → "2026-11-27"; "" when the expiry does not parse.
-function expiryIso(s) {
-  const ts = parseExpiryTs(s);
-  return ts == null ? "" : new Date(ts).toISOString().slice(0, 10);
-}
-
-// cross / clear / unknown / na. The asymmetry is the whole point: only a
-// real date that falls AFTER the expiry may say clear. Every way of not
-// knowing — no answer yet, a failed fetch, Nasdaq without the symbol, a date
-// already behind us — is unknown, never clear. A report ON expiry day counts
-// as crossing: even after the close it lands inside the exercise window.
-function earningsVerdict(expiry, ticker, entry, todayIso) {
-  if (ticker == null) return { state: "na" };
-  const exp = expiryIso(expiry);
-  if (!exp) return { state: "unknown", why: "到期日读不出" };
-  if (!entry) return { state: "unknown", why: "还没取到" };
-  if (entry.status !== "ok" || !entry.date) {
-    return { state: "unknown",
-             why: entry.status === "none" ? "Nasdaq 没有这个代码的财报日期" : "取数失败" };
-  }
-  if (entry.date < todayIso) {
-    return { state: "unknown", why: `数据源给的日期 ${entry.date} 已经过了` };
-  }
-  return { state: entry.date <= exp ? "cross" : "clear", date: entry.date };
-}
-
-const EARNINGS_RANK = { cross: 0, unknown: 1, clear: 2, na: 3 };
-
-// Every open short option across the accounts, with its verdict. Mirrored
-// contracts stay two rows: each account has to close its own.
-function riskEarningsRows(accounts, earnings, todayIso) {
-  const rows = [];
-  for (const [acct, a] of Object.entries(accounts || {})) {
-    for (const o of a.options || []) {
-      if (!(o.quantity < 0)) continue;
-      const ticker = earningsTicker(o.underlying);
-      const entry = ticker ? (earnings || {})[ticker] : null;
-      rows.push({ acct, o, ticker, entry, ...earningsVerdict(o.expiry, ticker, entry, todayIso) });
-    }
-  }
-  const exp = (r) => parseExpiryTs(r.o.expiry) ?? Infinity;
-  rows.sort((a, b) => EARNINGS_RANK[a.state] - EARNINGS_RANK[b.state]
-    || exp(a) - exp(b)
-    || String(a.o.symbol).localeCompare(String(b.o.symbol))
-    || a.acct.localeCompare(b.acct));
-  return rows;
-}
-
 // The verdict for one account column. The breaker outranks the lines: past
 // it nothing new goes on, replacement included.
 function riskVerdict(judge, dd, pm, cashWeeks, cfg) {
@@ -339,44 +266,10 @@ const fmtK = (v) => {
   return `${sign}$${Math.round(a)}`;
 };
 const fmtMD = (iso) => (iso ? `${+iso.slice(5, 7)}/${+iso.slice(8, 10)}` : "");
-const EARNINGS_TIMING = { amc: "盘后", bmo: "盘前" };
-
-// Earnings dates are US dates; Brisbane's Saturday morning is New York's
-// Friday, and a report due that Friday must not read as already past.
-function usTodayIso() {
-  try {
-    return new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" });
-  } catch (_) {
-    return new Date().toISOString().slice(0, 10);
-  }
-}
 
 function riskAccountLabel(id, cfg) {
   const label = ((cfg.accounts || {})[id] || {}).label;
   return label ? `${label} ${maskAccountId(id)}` : maskAccountId(id);
-}
-
-// The symbol set last asked for. Re-renders (tab switches, settings saves)
-// ask again only when the set of short-option underlyings actually changed.
-let riskEarningsKey = null;
-
-function ensureEarnings(tickers) {
-  const key = [...new Set(tickers)].sort().join(",");
-  if (key === riskEarningsKey) return;
-  riskEarningsKey = key;
-  if (!key) { currentDataRef.earnings = { symbols: {} }; return; }
-  currentDataRef.earnings = { loading: true, symbols: {} };
-  fetch(`/api/earnings?symbols=${encodeURIComponent(key)}`)
-    .then(r => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
-    .then(j => {
-      if (riskEarningsKey === key) currentDataRef.earnings = { symbols: j.symbols || {} };
-    })
-    .catch(exc => {
-      if (riskEarningsKey === key) {
-        currentDataRef.earnings = { error: String(exc.message || exc), symbols: {} };
-      }
-    })
-    .then(() => { if (riskEarningsKey === key) renderRiskGate(); });
 }
 
 function renderRiskGate() {
@@ -409,11 +302,6 @@ function renderRiskGate() {
   }
   const accountCols = cols.filter(c => !c.merged);
 
-  // Earnings: asked once per distinct symbol set; the table re-renders when
-  // the answer lands. Until then every row is 未知, which is what it is.
-  const earnRows = riskEarningsRows(accounts, (currentDataRef.earnings || {}).symbols, usTodayIso());
-  ensureEarnings(earnRows.map(r => r.ticker).filter(Boolean));
-
   // A gate read before an order has to say how old its numbers are: these are
   // the last statement's closes, not live prices.
   const asOfs = [...new Set(ids.map(id => {
@@ -429,13 +317,12 @@ function renderRiskGate() {
       ? `${unkinded} 个账户未设类型 —— 在「设置」里标出组合保证金户 / 现金户`
       : "线是默认值、未正式采纳，可在「设置」里改");
 
-  renderRiskVerdict(accountCols, earnRows, cfg);
+  renderRiskVerdict(accountCols, cfg);
   renderRiskTable(cols, cfg);
   renderRiskCash(accountCols);
-  renderRiskEarnings(earnRows, accounts, cfg);
 }
 
-function renderRiskVerdict(cols, earnRows, cfg) {
+function renderRiskVerdict(cols, cfg) {
   const lines = cols.map(c => {
     const v = c.verdict;
     const parts = [];
@@ -463,21 +350,6 @@ function renderRiskVerdict(cols, earnRows, cfg) {
     return `<div class="risk-verdict-line ${v.level}"><span class="risk-verdict-icon">${icon}</span>`
       + `<span><b>${esc(c.label)}</b>${kind}：${parts.join("；")}</span></div>`;
   });
-  const cross = earnRows.filter(r => r.state === "cross");
-  const unknown = earnRows.filter(r => r.state === "unknown");
-  const earn = currentDataRef.earnings || {};
-  if (cross.length || unknown.length) {
-    const sum = (rows) => rows.reduce((s, r) => s + Math.abs(r.o.quantity || 0), 0);
-    lines.push(`<div class="risk-verdict-line ${cross.length ? "red" : "amber"}">`
-      + `<span class="risk-verdict-icon">${cross.length ? "⛔" : "⚠"}</span><span>`
-      + (cross.length ? `<b class="down">${sum(cross)} 张卖出期权的到期跨过财报</b>` : "")
-      + (cross.length && unknown.length ? "；" : "")
-      + (unknown.length
-        ? `<b class="amber">${sum(unknown)} 张${earn.loading ? "的财报日期读取中" : "查不到财报日期"}</b>`
-          + `<span class="muted">（未知不等于不跨）</span>`
-        : "")
-      + `</span></div>`);
-  }
   $("risk-verdict").innerHTML = lines.join("");
 }
 
@@ -589,65 +461,6 @@ function renderRiskCash(cols) {
         <th class="num">累计名义</th><th class="num">累计 ÷ 现金+BOXX</th></tr></thead>
       <tbody>${body}</tbody></table></div>`;
   }).join("");
-}
-
-function renderRiskEarnings(rows, accounts, cfg) {
-  const el = $("risk-earnings");
-  if (!rows.length) { el.innerHTML = ""; el.hidden = true; return; }
-  el.hidden = false;
-  const earn = currentDataRef.earnings || {};
-  const TAG = {
-    cross: '<span class="tag tag-over">跨财报</span>',
-    unknown: '<span class="tag tag-under">未知</span>',
-    clear: '<span class="tag tag-inband">不跨</span>',
-    na: '<span class="tag tag-gone">不适用</span>',
-  };
-  const multi = Object.keys(accounts || {}).length > 1;
-  // Index-fund contracts have nothing to cross. Listed one per row they
-  // outnumbered the contracts that do, so they collapse into one closing
-  // line — still counted, never silently dropped.
-  const flagged = rows.filter(r => r.state !== "na");
-  const na = rows.filter(r => r.state === "na");
-  const body = flagged.map(r => {
-    const o = r.o;
-    const e = r.entry;
-    let when;
-    if (e && e.status === "ok" && e.date) {
-      const via = r.ticker !== o.underlying ? `${esc(r.ticker)} ` : "";
-      const tags = [EARNINGS_TIMING[e.timing] || "", e.estimated ? "估" : "",
-                    e.stale ? "旧缓存" : ""].filter(Boolean);
-      when = `${via}${fmtMD(e.date)}`
-        + (tags.length ? ` <span class="muted">${tags.join(" · ")}</span>` : "");
-    } else {
-      when = `<span class="muted">${earn.loading ? "读取中…" : esc(r.why || "未知")}</span>`;
-    }
-    const tip = r.state === "unknown" ? (r.why || "")
-      : (e && e.as_of ? `Nasdaq，取于 ${e.as_of}` : "");
-    const exp = expiryIso(o.expiry);
-    return `<tr>
-      ${multi ? `<td>${esc(riskAccountLabel(r.acct, cfg))}</td>` : ""}
-      <td><b>${esc(o.symbol)}</b></td>
-      <td class="num">${Math.abs(o.quantity)}</td>
-      <td>${exp ? fmtMD(exp) : esc(o.expiry || "?")}</td>
-      <td title="${esc(tip)}">${when}</td>
-      <td>${TAG[r.state]}</td>
-    </tr>`;
-  }).join("") + (na.length
-    ? `<tr class="risk-na-row"><td colspan="${multi ? 5 : 4}" class="muted">另有 `
-      + `${na.reduce((s, r) => s + Math.abs(r.o.quantity || 0), 0)} 张卖出期权在指数 / 商品 ETF 上（`
-      + `${[...new Set(na.map(r => r.o.underlying))].map(esc).join("、")}）—— 没有财报，不标</td>`
-      + `<td>${TAG.na}</td></tr>`
-    : "");
-  const n = (s) => rows.filter(r => r.state === s).length;
-  el.innerHTML = `<h3>卖出期权 × 下次财报
-      <span class="muted">跨 ${n("cross")} · 未知 ${n("unknown")} · 不跨 ${n("clear")} · 不适用 ${n("na")}</span></h3>
-    <div class="table-wrap"><table class="holdings">
-      <thead><tr>${multi ? "<th>账户</th>" : ""}<th>合约</th><th class="num">张数</th>
-        <th>到期</th><th>下次财报</th><th>判定</th></tr></thead>
-      <tbody>${body}</tbody></table></div>`
-    + (earn.error
-      ? `<div class="margin-foot down">财报日期读取失败：${esc(earn.error)} —— 全部按未知处理。</div>`
-      : "");
 }
 
 /* --- The settings dialog -------------------------------------------------- */

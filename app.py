@@ -26,7 +26,6 @@ from parser.flex_fetch import (FLEX_BUDGET_SEC, FLEX_CONFIG_NOTES,
                                FLEX_POLL_INTERVAL, FlexFetchError, fetch_one,
                                parse_accounts_env)
 from parser.dataroma import fetch_all as fetch_all_13f
-from parser.earnings import lookup as lookup_earnings
 from parser.ibkr_flex_csv import describe_sections
 from parser.snapshots import load_snapshots, record_snapshot
 
@@ -549,39 +548,6 @@ def put_risk_settings():
     }
     _atomic_write_json(RISK_SETTINGS_FILE, payload, indent=2)
     return jsonify(payload)
-
-
-# --- Earnings dates for the risk gate's "crosses a report" column ------------
-#
-# A dumb cached proxy on purpose. WHICH symbols to ask about is the
-# dashboard's call — it maps single-stock leveraged ETFs to what they track
-# (LITX → LITE) and never asks about index ETFs — so the mapping lives next to
-# the rule that needs it (static/js/risk.js), and this endpoint only fetches
-# and caches. No quota anywhere on this path: one request per symbol per day.
-EARNINGS_CACHE = UPLOAD_DIR / ".earnings_cache.json"
-_EARNINGS_MAX_SYMBOLS = 60
-
-
-@app.get("/api/earnings")
-def earnings_dates():
-    raw = request.args.get("symbols", "")
-    syms = sorted({s.strip().upper() for s in raw.split(",") if s.strip()})
-    if not syms:
-        return jsonify({"source": "nasdaq", "symbols": {}})
-    bad = next((s for s in syms if not _SYMBOL_RE.match(s)), None)
-    if bad:
-        return jsonify({"error": f"invalid symbol {bad!r}"}), 400
-    if len(syms) > _EARNINGS_MAX_SYMBOLS:
-        return jsonify({"error": f"at most {_EARNINGS_MAX_SYMBOLS} symbols"}), 400
-    try:
-        out = lookup_earnings(syms, EARNINGS_CACHE)
-    except Exception as exc:  # noqa: BLE001 - per-symbol failures never get here
-        app.logger.exception("[earnings] lookup failed")
-        return jsonify({"error": f"lookup failed: {exc}"}), 500
-    failed = [s for s, e in out.items() if e.get("status") == "error"]
-    if failed:
-        app.logger.info("[earnings] no answer for %s", ", ".join(failed))
-    return jsonify({"source": "nasdaq", "symbols": out})
 
 
 # ---------------------------------------------------------------------------
