@@ -721,6 +721,123 @@ body.modal-open { overflow: hidden; }
   .f13-who { display: block; margin-right: 0; white-space: normal; }
 }
 
+/* --- Risk gate -----------------------------------------------------------
+   The verdict lines come first and carry the colour; the table under them is
+   the evidence, so only the crossed cells are tinted there. */
+
+.risk-head-right { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }
+.ghost-btn.risk-btn { padding: 6px 14px; font-size: 12px; }
+.risk-title { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.risk-title .panel-note { font-weight: 400; letter-spacing: 0; }
+
+/* The title is the fold switch. A bare button in the heading's own type, so
+   the panel reads the same as every other one until you reach for it. */
+.risk-toggle {
+  display: inline-flex; align-items: baseline; gap: 6px;
+  margin: 0; padding: 0; border: 0; background: none;
+  font: inherit; color: inherit; letter-spacing: inherit; cursor: pointer;
+  transition: color 0.15s;
+}
+.risk-toggle:hover { color: var(--accent); }
+.risk-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 4px; }
+.risk-chevron {
+  display: inline-block; width: 12px; font-size: 12px; color: var(--text-dim);
+  transition: transform 0.15s;
+}
+#risk-panel.risk-collapsed .risk-chevron { transform: rotate(-90deg); }
+#risk-panel.risk-collapsed .panel-head { margin-bottom: 10px; }
+
+/* Folded: one line per account. display:flex would beat the hidden
+   attribute, hence the explicit rule. */
+.risk-summary { display: flex; flex-wrap: wrap; gap: 4px 20px; font-size: 13px; }
+.risk-summary[hidden] { display: none; }
+.risk-sum.red { color: var(--red); }
+.risk-sum.amber { color: var(--amber); }
+.risk-sum.ok { color: var(--green); }
+.risk-sum b { color: var(--text); font-weight: 600; }
+
+.risk-legend {
+  margin: 14px 0 0; padding-left: 18px;
+  font-size: 12px; line-height: 1.75; color: var(--text-faint);
+}
+.risk-legend b { color: var(--text-dim); font-weight: 600; }
+
+.risk-verdict { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+.risk-verdict:empty { display: none; }
+.risk-verdict-line {
+  display: flex; gap: 10px; align-items: baseline;
+  padding: 9px 12px; border-radius: 10px;
+  font-size: 13px; line-height: 1.6;
+  background: var(--panel-2); border-left: 3px solid var(--border);
+}
+.risk-verdict-line.red { border-left-color: var(--red); background: rgba(248, 113, 113, 0.08); }
+.risk-verdict-line.amber { border-left-color: var(--amber); background: rgba(251, 191, 36, 0.08); }
+.risk-verdict-line.ok { border-left-color: var(--green); }
+.risk-verdict-icon { flex: none; }
+
+table.risk-table th[scope="row"] {
+  color: var(--text); font-size: 12.5px; font-weight: 600;
+  text-transform: none; letter-spacing: 0; white-space: nowrap;
+}
+/* On a phone the accounts scroll sideways under the rule names; the names
+   stay put, or a red 2.44x arrives with nothing saying what it measures. */
+table.risk-table th[scope="row"], table.risk-table thead th:first-child {
+  position: sticky; left: 0; z-index: 1; background: var(--panel);
+}
+table.risk-table thead th .th-sub {
+  display: block; margin-top: 3px;
+  font-size: 10px; text-transform: none; letter-spacing: 0; color: var(--text-faint);
+}
+table.risk-table td.num b { font-size: 14px; font-weight: 600; }
+table.risk-table td.down b { color: var(--red); }
+table.risk-table td.amber b { color: var(--amber); }
+.risk-sub { margin-top: 3px; font-size: 11px; color: var(--text-faint); white-space: nowrap; }
+.risk-sub .tag { margin-right: 4px; }
+/* The tab you are on — a highlight, not a filter. */
+table.risk-table .risk-active { background: rgba(107, 215, 255, 0.06); }
+table.risk-table thead th.risk-active { color: var(--accent); }
+.risk-line { color: var(--text-faint); font-size: 12px; white-space: nowrap; }
+
+.risk-sub-section { margin-top: 20px; }
+/* Squeezed to a phone, the contract list broke after every word and one week
+   stood twenty lines tall; scrolling sideways is the lesser cost. */
+.risk-sub-section td.expiry-items { min-width: 170px; }
+.risk-sub-section h3 { font-size: 13px; margin: 0 0 10px; }
+.risk-sub-section h3 .muted { font-weight: 400; margin-left: 6px; font-size: 12px; }
+
+/* Settings dialog */
+.risk-form td { vertical-align: middle; font-size: 12.5px; }
+.risk-input { display: inline-flex; align-items: center; gap: 6px; }
+.risk-input .unit { color: var(--text-faint); font-size: 12px; }
+.risk-input input, .risk-form .risk-text, .risk-form select {
+  padding: 6px 8px;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px;
+  font-family: inherit; font-size: 12px; font-variant-numeric: tabular-nums;
+  transition: border-color 0.15s;
+}
+.risk-input input { width: 96px; text-align: right; }
+.risk-form .risk-text { width: 100%; resize: vertical; }
+.risk-input input:focus, .risk-form .risk-text:focus, .risk-form select:focus {
+  outline: none; border-color: var(--accent);
+}
+.risk-input input::placeholder, .risk-form .risk-text::placeholder { color: var(--text-faint); }
+.risk-input input::-webkit-outer-spin-button,
+.risk-input input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.risk-input input[type=number] { -moz-appearance: textfield; appearance: textfield; }
+.risk-form-title { font-size: 13px; margin: 18px 0 4px; }
+.risk-form-title .th-sub {
+  display: block; margin-top: 3px;
+  font-size: 11px; font-weight: 400; color: var(--text-faint);
+}
+
+@media (max-width: 600px) {
+  .panel-head:has(.risk-head-right) { flex-direction: column; align-items: flex-start; gap: 8px; }
+  .risk-head-right { justify-content: flex-start; }
+  table.risk-table th[scope="row"] { white-space: normal; min-width: 92px; max-width: 110px; }
+  table.risk-table th, table.risk-table td { padding: 9px 8px; }
+}
+
 /* Share snapshot dialog. The preview is the exported SVG itself at 1x,
    scaled to the dialog's width — narrower than the card on a phone. */
 .share-modal { width: min(520px, 100%); max-height: min(92vh, 1000px); }
