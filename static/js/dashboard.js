@@ -726,8 +726,9 @@ function render(data) {
   // re-renders once it arrives, same pattern as clusters.json)
   renderSuperinvestors();
 
-  // Risk gate (static/js/risk.js). Always every account side by side — the
-  // tab only moves the highlight — so it reads allAccounts, not `data`.
+  // Risk gate (static/js/risk.js). Follows the tab like the panels above, but
+  // reads allAccounts rather than `data`: 总账户 lays the accounts side by
+  // side, which the merged book alone cannot.
   // Called last on purpose: it sits at the top of the page, but a throw in it
   // must not cost any panel rendered before it.
   renderRiskGate();

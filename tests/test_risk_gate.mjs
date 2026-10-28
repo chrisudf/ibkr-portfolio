@@ -50,7 +50,7 @@ const consts = [
 const DASH_FNS = ["parseExpiryTs", "groupExpiries", "fundedSeries", "navStats"];
 const RISK_FNS = ["riskConfig", "riskNav", "riskBook", "mergeRiskBooks", "riskJudge",
                   "riskPmBuffer", "riskDrawdown", "riskTripped", "riskCashWeeks",
-                  "riskVerdict"];
+                  "riskVerdict", "riskScope"];
 const R = new Function(
   `${consts}\n`
   + DASH_FNS.map(n => extract(dash, "dashboard.js", n)).join("\n") + "\n"
@@ -149,7 +149,7 @@ test("单列标的（SOXL）单独判，其余单标的按名义从大到小", (
   assert.deepEqual(j.single.map(r => r.over), [true, true]);     // 0.5、0.275 都 > 0.25
 });
 
-test("合并列 = 名义之和 ÷ 净值之和，不是两个比值的平均", () => {
+test("合并列 = 名义之和 ÷ 净值之和，不是两个比值的简单平均", () => {
   const a = R.riskBook(ACCT_A, CFG, BOOK);
   const b = R.riskBook(ACCT_B, CFG, BOOK);
   const m = R.riskJudge(R.mergeRiskBooks([a, b]), CFG);
@@ -159,6 +159,42 @@ test("合并列 = 名义之和 ÷ 净值之和，不是两个比值的平均", (
   near(m.watch[0].ratio, 60000 / 240000);        // 两边的 SOXL 加在一起
   assert.equal(m.watch[0].over, false);          // 正好 0.25：压线不算超
   assert.equal(m.nav, 240000);
+});
+
+// 面板跟着账号页签走的依据：合并比值是两户按净值加权的平均，一定落在两户之间
+// —— 两户都在线内，合并就不可能超线，只看下单的那一户不会漏报警。
+test("合并比值落在两户之间：每户都不超线时合并也不会超线", () => {
+  const book = (nav, soxl, cohr, stock) => ({
+    nav, putTotal: soxl + cohr, byU: { SOXL: soxl, COHR: cohr }, unparsed: 0,
+    cluster: { stockMV: stock, leap: 0, put: soxl + cohr, leapAssumed: 0 }, cashLike: 0,
+  });
+  const pairs = [
+    [book(80000, 30000, 22000, 6000), book(160000, 30000, 20000, 9000)],
+    [book(50000, 0, 40000, 0), book(400000, 90000, 0, 50000)],
+    [book(100000, 20000, 20000, 1000), book(100000, 25000, 5000, 2000)],
+  ];
+  for (const [a, b] of pairs) {
+    const ja = R.riskJudge(a, CFG), jb = R.riskJudge(b, CFG);
+    const m = R.riskJudge(R.mergeRiskBooks([a, b]), CFG);
+    const between = (x, y, v) => v >= Math.min(x, y) - 1e-12 && v <= Math.max(x, y) + 1e-12;
+    assert.ok(between(ja.put.ratio, jb.put.ratio, m.put.ratio));
+    assert.ok(between(ja.watch[0].ratio, jb.watch[0].ratio, m.watch[0].ratio));
+    assert.ok(between(ja.cluster.ratio, jb.cluster.ratio, m.cluster.ratio));
+    if (!ja.put.over && !jb.put.over) assert.equal(m.put.over, false);
+    if (!ja.watch[0].over && !jb.watch[0].over) assert.equal(m.watch[0].over, false);
+  }
+});
+
+test("页签范围：账号页签只看自己，总账户（或失效的选择）看全部并带合并列", () => {
+  const ids = ["U1111111", "U2222222"];
+  assert.deepEqual(R.riskScope(ids, "U1111111"), { ids: ["U1111111"], merged: false });
+  assert.deepEqual(R.riskScope(ids, "U2222222"), { ids: ["U2222222"], merged: false });
+  assert.deepEqual(R.riskScope(ids, "ALL"), { ids, merged: true });
+  assert.deepEqual(R.riskScope(ids, "U9999999"), { ids, merged: true });   // 账号已不在
+  assert.deepEqual(R.riskScope(ids, null), { ids, merged: true });
+  // 只有一个账户时没有「合并」可言
+  assert.deepEqual(R.riskScope(["U1111111"], "U1111111"), { ids: ["U1111111"], merged: false });
+  assert.deepEqual(R.riskScope(["U1111111"], "ALL"), { ids: ["U1111111"], merged: false });
 });
 
 test("压线不算超线，超一点点才算；浮点误差不改结论", () => {

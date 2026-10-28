@@ -27,10 +27,13 @@
  * Earnings are deliberately not a rule here: a "this put crosses a report"
  * column was built and taken out again — earnings season is watched by hand.
  *
- * It is the same table on every tab, on purpose. Selling the same contract in
- * both accounts on the same day is a household problem, and a gate showing
- * only the account on screen would hide the half you are about to copy the
- * order into. The tab you are on is highlighted, nothing more.
+ * It follows the account tab like every other panel: an account's tab shows
+ * that account alone, and 总账户 lays every account side by side with the
+ * household column. Looking only at the account you are trading in misses no
+ * alarm — every line is judged per account, and the household ratio is the
+ * accounts' NAV-weighted average, so it can never be over a line that every
+ * account is under. The side-by-side view is for the other question: is the
+ * same bet sitting in both accounts.
  *
  * None of these lines is an adopted rule. RISK_DEFAULTS are proposals, and
  * the 设置 dialog overrides any of them (stored server-side in
@@ -253,6 +256,16 @@ function riskVerdict(judge, dd, pm, cashWeeks, cfg) {
   };
 }
 
+// Which accounts the selected tab shows. An account's own tab shows just that
+// account; 总账户 — or a selection that no longer exists — shows them all,
+// plus the household column when there is more than one.
+function riskScope(ids, selected) {
+  if (selected && selected !== "ALL" && ids.includes(selected)) {
+    return { ids: [selected], merged: false };
+  }
+  return { ids, merged: ids.length > 1 };
+}
+
 /* --- Rendering ------------------------------------------------------------ */
 
 const fmtX = (r) => (r == null ? "—" : `${r.toFixed(2)}x`);
@@ -275,11 +288,15 @@ function riskAccountLabel(id, cfg) {
 function renderRiskGate() {
   const panel = $("risk-panel");
   const accounts = currentDataRef.allAccounts || {};
-  const ids = Object.keys(accounts).sort();
-  if (!ids.length) { panel.hidden = true; return; }
+  const all = Object.keys(accounts).sort();
+  if (!all.length) { panel.hidden = true; return; }
   panel.hidden = false;
 
+  const scope = riskScope(all, currentDataRef.selected);
+  const ids = scope.ids;
   const cfg = riskConfig(currentDataRef.riskSettings);
+  // Prices stay pooled across every account even with one on screen: a spot
+  // is a market fact, and a LEAP held here may be priced by stock held there.
   const book = buildPriceBook(accounts);
   const todayTs = Date.now();
   const cols = ids.map(id => {
@@ -293,7 +310,7 @@ function renderRiskGate() {
     return { id, label: riskAccountLabel(id, cfg), kind, book: b, judge, dd, pm, weeks,
              verdict: riskVerdict(judge, dd, pm, weeks, cfg) };
   });
-  if (ids.length > 1) {
+  if (scope.merged) {
     const merged = mergeAccounts(accounts);
     const b = mergeRiskBooks(cols.map(c => c.book));
     cols.push({ id: "ALL", label: "合并", kind: null, book: b, judge: riskJudge(b, cfg),
@@ -355,7 +372,8 @@ function renderRiskVerdict(cols, cfg) {
 
 function renderRiskTable(cols, cfg) {
   const active = currentDataRef.selected;
-  const on = (c) => (c.id === active ? " risk-active" : "");
+  // A lone column needs no highlight; on 总账户 it marks the household one.
+  const on = (c) => (cols.length > 1 && c.id === active ? " risk-active" : "");
   const cell = (c, html, tone = "", sub = "", tip = "") =>
     `<td class="num${on(c)}${tone ? ` ${tone}` : ""}"${tip ? ` title="${esc(tip)}"` : ""}>`
     + `<b>${html}</b>${sub ? `<div class="risk-sub">${sub}</div>` : ""}</td>`;
