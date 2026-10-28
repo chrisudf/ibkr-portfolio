@@ -559,10 +559,12 @@ async function loadPortfolio() {
   if (payload.empty) {
     $("empty").hidden = false;
     $("dashboard").hidden = true;
+    $("share-btn").disabled = true;
     return;
   }
   $("empty").hidden = true;
   $("dashboard").hidden = false;
+  $("share-btn").disabled = false;
   // Accept both new multi-account payload and legacy single-account shape.
   // For legacy, key by the real account id when present so the account
   // switcher doesn't label it as a masked "default".
@@ -1746,6 +1748,11 @@ function navStats(series, flows) {
   let index = 1, peak = 1, peakDate = pts[0].date;
   let maxDD = 0, ddStart = pts[0].date, ddEnd = pts[0].date;
   const rets = [];
+  // The chained index itself, one point per NAV date. The share snapshot
+  // draws this instead of raw NAV: raw NAV steps up on every deposit, so even
+  // with the dollar axis hidden its shape would tell a reader when money went
+  // in and how much relative to the account.
+  const curve = [{ date: pts[0].date, index: 1 }];
   for (let i = 1; i < pts.length; i++) {
     // Accumulate the two directions SEPARATELY. Netting them first would
     // cancel a deposit against a withdrawal landing in the same interval
@@ -1769,6 +1776,7 @@ function navStats(series, flows) {
     if (r < -0.99) r = -0.99;
     rets.push(r);
     index *= 1 + r;
+    curve.push({ date: pts[i].date, index });
     // >= so a flat stretch at the peak advances the date: the drawdown
     // "starts" at the last day you were whole, not the first.
     if (index >= peak) { peak = index; peakDate = pts[i].date; }
@@ -1809,6 +1817,7 @@ function navStats(series, flows) {
     lowPreFunding: fl.reduce(
       (s, f) => (f.date > lowPt.date && f.amount > 0 ? s + f.amount : s), 0) > lowPt.total,
     first: pts[0], last: pts[pts.length - 1],
+    curve,
   };
 }
 
@@ -3288,6 +3297,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("refresh-btn").addEventListener("click", refreshFromIBKR);
   resumeRefreshWatch();
   wirePositionModal();
+  wireShareModal();
 
   // Core-holding rules. Like the cluster fetch below, the first render may
   // land before this resolves, so re-render once it arrives.
