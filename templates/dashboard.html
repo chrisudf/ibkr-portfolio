@@ -169,7 +169,13 @@
       <section class="panel" id="core-panel" hidden>
         <div class="panel-head">
           <h2>核心持仓与仓位区间</h2>
-          <span class="panel-note" id="core-note"></span>
+          <div class="core-head-right">
+            <span class="panel-note" id="core-note"></span>
+            <div class="seg-toggle" id="core-sort">
+              <button type="button" data-sort="status" class="active">按状态</button>
+              <button type="button" data-sort="weight">按占总资产</button>
+            </div>
+          </div>
         </div>
         <div class="table-wrap">
           <table class="holdings">
@@ -195,8 +201,9 @@
           区间规则本身是<b>全局共享</b>的一套，同一个 5% – 10% 分别套在每本账上 ——
           所以一个标的只在另一个账号里持有时，这里会显示 0% 并打「本账号无持仓」。
           目标区间的两端都是你自己填的百分比：下限留空按 0% 算（不报欠配），上限留空按 100% 算
-          （不报超上限）。<b>核心持仓</b>不参与判定，只是热力图上的白圈和这张表的排序优先级 ——
+          （不报超上限）。<b>核心持仓</b>不参与判定，只是热力图上的白圈和这张表「按状态」排序时的优先级 ——
           下限既然是填出来的，再拿一个勾选框把它关掉只会让人填了数字却等不到提醒。
+          排序：<b>按状态</b>把超上限、欠配排在前面；<b>按占总资产</b>从高到低，选择记在当前浏览器。
           规则在右上角「核心持仓」里改，存在服务器上（<code>uploads/.position_settings.json</code>）。</div>
       </section>
 

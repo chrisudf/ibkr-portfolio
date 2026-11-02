@@ -1984,6 +1984,23 @@ function exposureTip(r) {
   return bits.join(" + ") || "无投入资本";
 }
 
+// Row order on the panel. 按状态 (the default) puts what needs adjusting
+// first — over the cap, then under the floor — core holdings first within
+// each; 按占总资产 is the plain ranking by weight. Ties go by ticker, so two
+// renders that agree on the key never reshuffle.
+const CORE_STATUS_RANK = { over: 0, under: 1, ok: 2 };
+const CORE_SORTS = {
+  status: (a, b) => (CORE_STATUS_RANK[a.status] ?? 3) - (CORE_STATUS_RANK[b.status] ?? 3)
+    || b.core - a.core || b.weight - a.weight || a.symbol.localeCompare(b.symbol),
+  weight: (a, b) => b.weight - a.weight || a.symbol.localeCompare(b.symbol),
+};
+// Which order is a per-device preference, like the risk gate's fold — a phone
+// and a desk may want different ones — so it lives in this browser.
+const CORE_SORT_KEY = "ibkr.coreTable.sort";
+let coreSort = "status";
+// The scope label of the view on screen, so re-sorting redraws this panel alone.
+let coreScopeLabel = "";
+
 // One row per CONFIGURED symbol, scored against the account on screen.
 // Symbols with no position in this view keep their row: a core holding at 0%
 // here is the most extreme under-weight there is, and dropping the row would
@@ -2007,19 +2024,18 @@ function positionRows() {
       elsewhere: !bySymbol[sym] && universe.has(sym),
     };
   });
-  const rank = { over: 0, under: 1, ok: 2 };
-  rows.sort((a, b) =>
-    (rank[a.status] ?? 3) - (rank[b.status] ?? 3)
-    || (b.core - a.core)
-    || b.weight - a.weight);
+  rows.sort(CORE_SORTS[coreSort] || CORE_SORTS.status);
   return { totalNav, rows };
 }
 
 function renderCorePositions(scopeLabel) {
+  coreScopeLabel = scopeLabel;
   const panel = $("core-panel");
   const { totalNav, rows } = positionRows();
   if (!rows.length) { panel.hidden = true; return; }
   panel.hidden = false;
+  $("core-sort").querySelectorAll("button").forEach(b =>
+    b.classList.toggle("active", b.dataset.sort === coreSort));
 
   const alerts = rows.filter(r => r.status === "over" || r.status === "under");
   const coreCount = rows.filter(r => r.core).length;
@@ -2304,6 +2320,22 @@ function wirePositionModal() {
   $("pos-body").addEventListener("change", (e) => {
     if (e.target.dataset.role !== "core") return;
     posDraft[e.target.closest("tr").dataset.sym].core = e.target.checked;
+  });
+}
+
+function wireCoreSort() {
+  try {
+    const saved = localStorage.getItem(CORE_SORT_KEY);
+    if (Object.hasOwn(CORE_SORTS, saved ?? "")) coreSort = saved;
+  } catch (_) { /* storage blocked: start on the default order */ }
+  $("core-sort").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-sort]");
+    if (!btn || btn.dataset.sort === coreSort) return;
+    coreSort = btn.dataset.sort;
+    try {
+      localStorage.setItem(CORE_SORT_KEY, coreSort);
+    } catch (_) { /* fine: it just won't be remembered */ }
+    renderCorePositions(coreScopeLabel);
   });
 }
 
@@ -3288,6 +3320,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("refresh-btn").addEventListener("click", refreshFromIBKR);
   resumeRefreshWatch();
   wirePositionModal();
+  wireCoreSort();
 
   // Core-holding rules. Like the cluster fetch below, the first render may
   // land before this resolves, so re-render once it arrives.
