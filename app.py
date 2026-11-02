@@ -396,6 +396,9 @@ RISK_SETTINGS_FILE = UPLOAD_DIR / ".risk_settings.json"
 
 # key → (lowest, highest, whole number?). Ratios are × NAV (1.0 = 100% of
 # NAV), pm_warn / drawdown_stop are fractions, pm_floor is account currency.
+# put_close_warn / put_close_stop are what buying a put back costs × the
+# premium it was sold for (2.0 = the price doubled; under 1.0 the put is in
+# profit, which is no stop), stock_drop_warn a fraction of the position's cost.
 _RISK_LIMITS = {
     "put_nav_max": (0.0, 20.0, False),
     "single_put_nav_max": (0.0, 20.0, False),
@@ -405,6 +408,9 @@ _RISK_LIMITS = {
     "drawdown_days": (5, 260, True),
     "drawdown_stop": (0.0, 1.0, False),   # 一级断路器：停卖 put
     "drawdown_halt": (0.0, 1.0, False),   # 二级断路器：只减不加
+    "put_close_warn": (1.0, 50.0, False),  # 卖 put 预警：平仓价 ÷ 权利金
+    "put_close_stop": (1.0, 50.0, False),  # 卖 put 止损：平仓价 ÷ 权利金
+    "stock_drop_warn": (0.0, 1.0, False),  # 正股较持仓成本的跌幅
 }
 _ACCOUNT_KINDS = ("pm", "margin", "cash")
 _RISK_LABEL_MAX = 24
@@ -480,6 +486,10 @@ def _normalize_risk_settings(raw: dict) -> dict:
     if stop is not None and halt is not None and halt < stop:
         raise ValueError("drawdown_halt (只减不加) must not be shallower than "
                          "drawdown_stop (停卖 put)")
+    # Same for the two put steps.
+    put_warn, put_stop = thresholds.get("put_close_warn"), thresholds.get("put_close_stop")
+    if put_warn is not None and put_stop is not None and put_stop < put_warn:
+        raise ValueError("put_close_stop (止损) must not be below put_close_warn (预警)")
     acc_raw = raw.get("accounts")
     acc_raw = {} if acc_raw is None else acc_raw
     if not isinstance(acc_raw, dict):

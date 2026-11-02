@@ -7,7 +7,9 @@
 //   1. 合并列是「名义之和 ÷ 净值之和」，不是两个账户比值的平均；
 //   2. 线是「严格超过才算超线」，正好压线不算；断路器是「到 −10% 就跳闸」，
 //      而且浮点误差不能决定压线那一下的结论；
-//   3. 回撤剔除出入金 —— 入金不能把断路器关掉，出金不能凭空跳闸。
+//   3. 回撤剔除出入金 —— 入金不能把断路器关掉，出金不能凭空跳闸；
+//   4. 两条持仓报警按单笔判、含线：卖 put 平仓价正好 2 倍（预警）/ 3 倍（止损）权利金、
+//      正股正好 −20% 都算到线。
 // 账号全部是假的（U1111111 / U2222222）—— 仓库是公开的。
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -35,6 +37,7 @@ function extractConst(src, re, what) {
 }
 
 const consts = [
+  extractConst(dash, /const fmtPct = [^;]+;/, "fmtPct"),
   extractConst(dash, /const CASH_EQUIVALENTS = [^;]+;/, "CASH_EQUIVALENTS"),
   extractConst(dash, /const CONTRACT_MULTIPLIER = [^;]+;/, "CONTRACT_MULTIPLIER"),
   extractConst(dash, /const MARK_ITM_RATIO = [^;]+;/, "MARK_ITM_RATIO"),
@@ -50,7 +53,7 @@ const consts = [
 const DASH_FNS = ["parseExpiryTs", "groupExpiries", "fundedSeries", "navStats"];
 const RISK_FNS = ["riskConfig", "riskNav", "riskBook", "mergeRiskBooks", "riskJudge",
                   "riskPmBuffer", "riskDrawdown", "riskBreaker", "riskCashWeeks",
-                  "riskVerdict", "riskScope", "riskBrief"];
+                  "riskUnderwater", "riskVerdict", "riskScope", "riskBrief", "riskPutLabel"];
 const R = new Function(
   `${consts}\n`
   + DASH_FNS.map(n => extract(dash, "dashboard.js", n)).join("\n") + "\n"
@@ -223,6 +226,9 @@ test("设置：缺省全走默认值，覆盖只改填了的，读不懂的回�
   assert.equal(d.drawdown_days, 30);
   assert.equal(d.drawdown_stop, 0.10);
   assert.equal(d.drawdown_halt, 0.20);
+  assert.equal(d.put_close_warn, 2.0);
+  assert.equal(d.put_close_stop, 3.0);
+  assert.equal(d.stock_drop_warn, 0.20);
   assert.deepEqual(d.watch, ["SOXL"]);
   assert.deepEqual(d.cluster, R.RISK_CLUSTER);
   const c = R.riskConfig({ thresholds: { put_nav_max: 1.5, pm_warn: "abc", bogus: 3 },
@@ -375,7 +381,119 @@ test("现金户：按到期周汇总卖 put 名义，当周超现金+BOXX 标红
   near(weeks[1].ratio, 37000 / 30000);
 });
 
+// --- per-position alarms --------------------------------------------------------------
+
+// 形状照报表：卖 put 的 cost_basis 是收到的权利金、value 是平仓要付的市值，空头两个都为负。
+const sold = (u, expiry, strike, qty, premium, close) =>
+  put(u, expiry, strike, qty, { cost_basis: -premium, value: -close, unrealized_pl: premium - close });
+const lot = (symbol, cost, ret, qty = 10) => ({
+  symbol, quantity: qty, cost_basis: cost, unrealized_pl: cost * ret,
+  cost_price: cost / qty, close_price: cost * (1 + ret) / qty, value: cost * (1 + ret),
+});
+
+test("卖 put 两档：收 100、平仓 200 正好预警，300 正好止损；卖 call、买 put、没有权利金的不判", () => {
+  const u = R.riskUnderwater({ stocks: [], options: [
+    sold("SOXL", "06NOV26", 80, -2, 1000, 3750),        // 3.75x：止损
+    sold("COHR", "20NOV26", 220, -1, 100, 300),         // 正好 3x：止损
+    sold("ONDS", "23OCT26", 6.5, -1, 100, 200),         // 收 100、市值 −200：正好 2x，预警
+    sold("VRT", "20NOV26", 200, -1, 900, 1790),         // 1.99x：线内
+    sold("MSFT", "18DEC26", 400, -1, 1200, 300),        // 浮盈：平仓比收的还便宜
+    call("LITX", "20NOV26", 50, -1, { cost_basis: -200, value: -1000 }),   // 5x，但是卖 call
+    put("QQQ", "20NOV26", 500, 1, { cost_basis: 800, value: 100 }),        // 买 put
+    put("NVDL", "20NOV26", 30, -1, { cost_basis: 0, value: -50 }),         // 没有权利金可比
+  ] }, CFG);
+  assert.deepEqual(u.puts.map(p => p.u), ["SOXL", "COHR", "ONDS", "VRT", "MSFT"]);   // 最差的在前
+  assert.deepEqual(u.puts.map(p => p.level), ["red", "red", "amber", "ok", "ok"]);
+  near(u.puts[0].ratio, 3.75);
+  assert.equal(u.puts[0].premium, 1000);
+  assert.equal(u.puts[0].close, 3750);
+  assert.equal(u.puts[0].qty, 2);
+  near(u.puts[4].ratio, 0.25);
+  assert.deepEqual(u.putHits.map(p => p.u), ["SOXL", "COHR", "ONDS"]);   // 红的排在黄的前面
+});
+
+test("卖 put 两档：压线那一下的浮点误差不改结论，两条线都走配置", () => {
+  // 0.3 / (0.1 + 0.2) = 0.9999999999999999：算出来的比值比线小一丝
+  const noisy = (k) => ({ stocks: [],
+    options: [sold("SOXL", "06NOV26", 80, -1, 300, k * 300 * 0.3 / (0.1 + 0.2))] });
+  for (const [k, level] of [[2, "amber"], [3, "red"]]) {
+    const p = R.riskUnderwater(noisy(k), CFG).puts[0];
+    assert.ok(p.ratio < k, "夹具没造出浮点误差");
+    assert.equal(p.level, level);
+  }
+  const book = { stocks: [], options: [sold("VRT", "20NOV26", 200, -1, 900, 2500)] };   // 2.78x
+  assert.equal(R.riskUnderwater(book, CFG).puts[0].level, "amber");
+  const tighter = R.riskConfig({ thresholds: { put_close_warn: 1.5, put_close_stop: 2.5 } });
+  assert.equal(R.riskUnderwater(book, tighter).puts[0].level, "red");
+  const looser = R.riskConfig({ thresholds: { put_close_warn: 3, put_close_stop: 4 } });
+  assert.equal(R.riskUnderwater(book, looser).putHits.length, 0);
+});
+
+test("卖 put 两档：只填一边、跟另一边的默认值顺序反了，生效时并成一条线", () => {
+  // 只填预警 4：止损走默认 3，预警永远轮不到 —— 生效时并进止损线，3x 起都是红
+  const lone = R.riskConfig({ thresholds: { put_close_warn: 4 } });
+  assert.deepEqual([lone.put_close_warn, lone.put_close_stop], [3, 3]);
+  const at = (close) => R.riskUnderwater({ stocks: [],
+    options: [sold("VRT", "20NOV26", 200, -1, 100, close)] }, lone).puts[0].level;
+  assert.equal(at(350), "red");
+  assert.equal(at(250), "ok");
+  // 只填止损 1.5：预警默认 2 比它高，同样并成一条 1.5
+  const lowStop = R.riskConfig({ thresholds: { put_close_stop: 1.5 } });
+  assert.deepEqual([lowStop.put_close_warn, lowStop.put_close_stop], [1.5, 1.5]);
+  // 顺序本来就对的照用
+  const fine = R.riskConfig({ thresholds: { put_close_warn: 1.5, put_close_stop: 2.5 } });
+  assert.deepEqual([fine.put_close_warn, fine.put_close_stop], [1.5, 2.5]);
+});
+
+test("正股较持仓成本：正好 −20% 算到线；现金等价物、空头正股不判", () => {
+  const u = R.riskUnderwater({ options: [], stocks: [
+    lot("ETHU", 1000, -0.793),
+    lot("APP", 2000, -0.20),                           // 正好 −20%
+    lot("VRT", 2000, -0.1995),
+    lot("NVDA", 1000, 0.5),
+    lot("BOXX", 12000, -0.25),                         // 现金等价物：从不判
+    { symbol: "TSLA", quantity: -10, cost_basis: -2500, unrealized_pl: -900 },   // 空头
+  ] }, CFG);
+  assert.deepEqual(u.stocks.map(s => s.u), ["ETHU", "APP", "VRT", "NVDA"]);
+  near(u.stocks[0].ret, -0.793);
+  assert.deepEqual(u.stockHits.map(s => s.u), ["ETHU", "APP"]);
+  const deeper = R.riskConfig({ thresholds: { stock_drop_warn: 0.5 } });
+  assert.deepEqual(R.riskUnderwater({ options: [], stocks: [lot("ETHU", 1000, -0.793),
+    lot("APP", 2000, -0.2)] }, deeper).stockHits.map(s => s.u), ["ETHU"]);
+});
+
+test("合约标签带到期和行权价：同一个标的一串 put 也分得清", () => {
+  assert.equal(R.riskPutLabel({ u: "SOXL", expiry: "6NOV26", strike: 80, qty: 2 }), "SOXL 11/6 80P ×2");
+  assert.equal(R.riskPutLabel({ u: "ONDS", expiry: "23OCT26", strike: 6.5, qty: 1 }), "ONDS 10/23 6.5P");
+  assert.equal(R.riskPutLabel({ u: "XYZ", expiry: "", strike: 0, qty: 1 }), "XYZ ? ?P");   // 读不出的照实说
+});
+
 // --- verdict -------------------------------------------------------------------------
+
+test("结论：卖 put 到止损线是红；到预警线、正股跌到成本线下是黄，不跟超线抢红色", () => {
+  const calm = R.riskJudge(R.riskBook({ nav: { total: 500000 }, stocks: [], options: [] }, CFG, {}), CFG);
+  const stops = (options, stocks) => R.riskUnderwater({ options, stocks }, CFG);
+  const red = R.riskVerdict(calm, null, null, null, CFG,
+    stops([sold("SOXL", "06NOV26", 80, -2, 1000, 3500), sold("VRT", "20NOV26", 200, -1, 900, 2000)],
+          [lot("ETHU", 1000, -0.5)]));
+  assert.equal(red.putStops, 1);                       // 3.5x
+  assert.equal(red.putWarns, 1);                       // 2.22x
+  assert.equal(red.stockDrops, 1);
+  assert.equal(red.level, "red");
+  const warn = R.riskVerdict(calm, null, null, null, CFG,
+    stops([sold("SOXL", "06NOV26", 80, -2, 1000, 2500)], []));   // 2.5x：只到预警
+  assert.equal(warn.putStops, 0);
+  assert.equal(warn.putWarns, 1);
+  assert.equal(warn.level, "amber");
+  const amber = R.riskVerdict(calm, null, null, null, CFG, stops([], [lot("ETHU", 1000, -0.5)]));
+  assert.equal(amber.putStops, 0);
+  assert.equal(amber.level, "amber");
+  const under = R.riskVerdict(calm, null, null, null, CFG,
+    stops([sold("VRT", "20NOV26", 200, -1, 900, 1000)], [lot("APP", 2000, -0.1)]));
+  assert.equal(under.level, "ok");
+  // 合并列不传 stops：只看比值和断路器，照旧
+  assert.equal(R.riskVerdict(calm, null, null, null, CFG).level, "ok");
+});
 
 test("结论：断路器、超线、PM 破线、现金不够都是红；只有 PM 缓冲薄是黄；都没有是线内", () => {
   const j = R.riskJudge(R.riskBook(ACCT_A, CFG, BOOK), CFG);
@@ -404,6 +522,10 @@ test("收起后的一行结论：和完整结论同一套判断，只是更短",
   assert.equal(R.riskBrief(v({ crossed: ["a"], cashShort: 2 })), "超线 1 项 · 2 周现金不够");
   assert.equal(R.riskBrief(v({ pmLevel: "amber" })), "PM 缓冲薄");
   assert.equal(R.riskBrief(v({})), "线内");
+  assert.equal(R.riskBrief(v({ crossed: ["a"], putStops: 2, putWarns: 1, stockDrops: 5 }), CFG),
+               "超线 1 项 · 2 张 put 到止损线 · 1 张 put 到预警线 · 5 只正股跌 ≥ 20%");
+  assert.equal(R.riskBrief(v({ stockDrops: 1 }), R.riskConfig({ thresholds: { stock_drop_warn: 0.3 } })),
+               "1 只正股跌 ≥ 30%");
 });
 
 // --- wiring ----------------------------------------------------------------------------
