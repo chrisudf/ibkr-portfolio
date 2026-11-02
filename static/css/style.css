@@ -793,6 +793,9 @@ table.risk-table td.down b { color: var(--red); }
 table.risk-table td.amber b { color: var(--amber); }
 .risk-sub { margin-top: 3px; font-size: 11px; color: var(--text-faint); white-space: nowrap; }
 .risk-sub .tag { margin-right: 4px; }
+/* One position per line in the per-position rows; a contract never breaks
+   between its label and its ratio. */
+.risk-item { display: block; white-space: nowrap; }
 /* The tab you are on — a highlight, not a filter. */
 table.risk-table .risk-active { background: rgba(107, 215, 255, 0.06); }
 table.risk-table thead th.risk-active { color: var(--accent); }

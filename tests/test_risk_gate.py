@@ -58,6 +58,22 @@ def test_two_breaker_steps():
         norm({"thresholds": {"drawdown_stop": 0.20, "drawdown_halt": 0.10}})
 
 
+def test_position_alarm_lines():
+    """卖 put 止损 is the cost to close × the premium, the stock line a fraction of cost."""
+    from app import _normalize_risk_settings as norm
+
+    got = norm({"thresholds": {"put_close_warn": "1.5", "put_close_stop": "3",
+                               "stock_drop_warn": 0.15}})
+    assert got["thresholds"] == {"put_close_warn": 1.5, "put_close_stop": 3.0,
+                                 "stock_drop_warn": 0.15}
+    # Equal is allowed: one line that is both 预警 and 止损.
+    assert norm({"thresholds": {"put_close_warn": 2, "put_close_stop": 2}})["thresholds"]
+    # Only one typed: the other is a client-side default, so nothing to compare.
+    assert norm({"thresholds": {"put_close_stop": 1.5}})["thresholds"] == {"put_close_stop": 1.5}
+    with pytest.raises(ValueError, match="put_close_stop"):
+        norm({"thresholds": {"put_close_warn": 3, "put_close_stop": 2}})
+
+
 @pytest.mark.parametrize("body", [
     {"thresholds": {"bogus": 1}},                      # unknown line
     {"thresholds": {"pm_warn": 10}},                   # percent typed as a fraction
@@ -66,6 +82,10 @@ def test_two_breaker_steps():
     {"thresholds": {"put_nav_max": -0.1}},
     {"thresholds": {"drawdown_days": 2.5}},            # not a whole number
     {"thresholds": {"drawdown_days": 1}},              # too short to mean anything
+    {"thresholds": {"put_close_stop": 200}},           # percent of premium typed as a multiple
+    {"thresholds": {"put_close_stop": 0.5}},           # under 1x the put is in profit: no stop
+    {"thresholds": {"put_close_warn": 0.9}},
+    {"thresholds": {"stock_drop_warn": 20}},           # percent typed as a fraction
     {"thresholds": {"put_nav_max": True}},             # bool is not a number here
     {"thresholds": {"put_nav_max": "abc"}},
     {"thresholds": {"put_nav_max": float("nan")}},

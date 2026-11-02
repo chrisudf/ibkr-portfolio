@@ -24,6 +24,18 @@
  *                               −20% 只减不加 (shares and long options too)
  *   到期周 vs 现金               cash accounts only: each expiry week's
  *                               short-put notional against cash + BOXX
+ *   卖 put 预警 / 止损           each short put on its own: what buying it
+ *                               back costs against the premium it was sold
+ *                               for — amber at 2× (the price doubled, a loss
+ *                               of one premium), red at 3×
+ *   正股较持仓成本               each stock position against its own cost
+ *                               basis — amber at −20%
+ *
+ * The last two are about positions already on, not the next order, and they
+ * never merge: a contract belongs to one account, and so does the cost a
+ * stock is measured against — one name can sit 25% under water in one
+ * account and 15% in the other. The household column leaves them to the
+ * accounts.
  *
  * Earnings are deliberately not a rule here: a "this put crosses a report"
  * column was built and taken out again — earnings season is watched by hand.
@@ -46,8 +58,8 @@
  *
  * Loaded after dashboard.js and leans on its helpers ($, esc, fmtMoney,
  * fmtPct, maskAccountId, currentDataRef, buildPriceBook, groupExpiries,
- * fundedSeries, navStats, mergeAccounts, showToast, DAY_MS, CASH_EQUIVALENTS,
- * CONTRACT_MULTIPLIER).
+ * parseExpiryTs, fundedSeries, navStats, mergeAccounts, showToast, DAY_MS,
+ * CASH_EQUIVALENTS, CONTRACT_MULTIPLIER).
  * ------------------------------------------------------------------------- */
 
 // The proposed lines. A blank box in the 设置 dialog means "this value".
@@ -62,6 +74,9 @@ const RISK_DEFAULTS = {
   drawdown_days: 30,         // 回撤窗口：最近 N 个 NAV 行
   drawdown_stop: 0.10,       // 一级断路器：窗口高点回撤到 −10% → 停卖 put
   drawdown_halt: 0.20,       // 二级断路器：回撤到 −20% → 只减不加
+  put_close_warn: 2.0,       // 卖 put 预警：平仓价达到卖出时收的权利金的 2 倍 → 黄
+  put_close_stop: 3.0,       // 卖 put 止损：平仓价达到 3 倍 → 红
+  stock_drop_warn: 0.20,     // 正股较持仓成本跌到 −20% → 黄
 };
 
 // Names that gap together on an AI-capex scare, gated as one position.
@@ -246,8 +261,50 @@ function riskCashWeeks(options, priceBook, todayTs, cashLike) {
   });
 }
 
-// The verdict for one account column. `breaker` is the step reached (0–2).
-function riskVerdict(judge, dd, pm, cashWeeks, cfg) {
+// The two per-position lines, for one account. Both read the statement the
+// way the tables further down print it. A short put is measured by what
+// buying it back costs — the options table's 市值, negative on a short —
+// against the premium it was sold for, its 权利金 (cost_basis, negative too),
+// in two steps. Sold for $100 and marked at −$200 is 2×: the price has
+// doubled, the loss is one premium (回报 −100%) — amber, time to review.
+// Marked at −$300 is 3×, red, the stop. A stock's figure is the holdings
+// table's 回报, unrealized_pl ÷ cost_basis. Inclusive, like the breaker:
+// exactly on a line trips it, float noise or not.
+//
+// Short calls stay out (a covered call's loss is its shares' gain), and so do
+// cash equivalents and short stock. Each list is sorted worst first, which
+// makes its hits a prefix of it — the red puts ahead of the amber ones.
+function riskUnderwater(data, cfg) {
+  const level = (r) => (r >= cfg.put_close_stop - RISK_EPS ? "red"
+    : r >= cfg.put_close_warn - RISK_EPS ? "amber" : "ok");
+  const puts = [];
+  for (const o of data.options || []) {
+    if (!(o.quantity < 0) || o.right !== "P" || !(o.cost_basis < 0)) continue;
+    const premium = -o.cost_basis, close = -(o.value || 0), ratio = close / premium;
+    puts.push({ u: o.underlying || o.symbol, expiry: o.expiry, strike: o.strike,
+                qty: -o.quantity, premium, close, ratio, level: level(ratio) });
+  }
+  puts.sort((a, b) => b.ratio - a.ratio || a.u.localeCompare(b.u));
+  const stocks = [];
+  for (const s of data.stocks || []) {
+    if (CASH_EQUIVALENTS.has(s.symbol) || !(s.quantity > 0) || !(s.cost_basis > 0)) continue;
+    stocks.push({ u: s.symbol, cost: s.cost_price, price: s.close_price,
+                  ret: (s.unrealized_pl || 0) / s.cost_basis });
+  }
+  stocks.sort((a, b) => a.ret - b.ret || a.u.localeCompare(b.u));
+  return {
+    puts, stocks,
+    putHits: puts.filter(p => p.level !== "ok"),
+    stockHits: stocks.filter(s => s.ret <= -cfg.stock_drop_warn + RISK_EPS),
+  };
+}
+
+// The verdict for one account column. `breaker` is the step reached (0–2);
+// `stops` is riskUnderwater's read of the same account. A put at its stop is
+// red like a crossed line. A put at its first step, and a stock under its
+// cost line, are amber: they say a holding needs looking at, not whether the
+// next order may go in.
+function riskVerdict(judge, dd, pm, cashWeeks, cfg, stops) {
   const fx = (r) => `${r.toFixed(2)}x`;
   const crossed = [];
   if (judge.put.over) crossed.push(`卖 put ${fx(judge.put.ratio)}`);
@@ -257,10 +314,13 @@ function riskVerdict(judge, dd, pm, cashWeeks, cfg) {
   const breaker = riskBreaker(dd, cfg);
   const cashShort = (cashWeeks || []).filter(w => w.over).length;
   const pmLevel = pm ? pm.level : "ok";
+  const putStops = stops ? stops.putHits.filter(p => p.level === "red").length : 0;
+  const putWarns = stops ? stops.putHits.length - putStops : 0;
+  const stockDrops = stops ? stops.stockHits.length : 0;
   return {
-    crossed, breaker, pmLevel, cashShort,
-    level: breaker || crossed.length || pmLevel === "red" || cashShort ? "red"
-      : pmLevel === "amber" ? "amber" : "ok",
+    crossed, breaker, pmLevel, cashShort, putStops, putWarns, stockDrops,
+    level: breaker || crossed.length || pmLevel === "red" || cashShort || putStops ? "red"
+      : pmLevel === "amber" || putWarns || stockDrops ? "amber" : "ok",
   };
 }
 
@@ -275,7 +335,7 @@ function riskScope(ids, selected) {
 }
 
 // One account's verdict in a few words, for the folded panel's single line.
-function riskBrief(v) {
+function riskBrief(v, cfg) {
   const parts = [];
   if (v.breaker === 2) parts.push("只减不加");
   else if (v.breaker === 1) parts.push("停卖 put");
@@ -283,6 +343,9 @@ function riskBrief(v) {
   if (v.pmLevel === "red") parts.push("PM 线下");
   else if (v.pmLevel === "amber") parts.push("PM 缓冲薄");
   if (v.cashShort) parts.push(`${v.cashShort} 周现金不够`);
+  if (v.putStops) parts.push(`${v.putStops} 张 put 到止损线`);
+  if (v.putWarns) parts.push(`${v.putWarns} 张 put 到预警线`);
+  if (v.stockDrops) parts.push(`${v.stockDrops} 只正股跌 ≥ ${fmtPct(cfg.stock_drop_warn, 0)}`);
   return parts.length ? parts.join(" · ") : "线内";
 }
 
@@ -299,6 +362,15 @@ const fmtK = (v) => {
   return `${sign}$${Math.round(a)}`;
 };
 const fmtMD = (iso) => (iso ? `${+iso.slice(5, 7)}/${+iso.slice(8, 10)}` : "");
+
+// "SOXL 11/6 80P ×2": a put ladder puts several contracts on one name, and
+// the expiry and strike are what tell its rungs apart.
+function riskPutLabel(p) {
+  const ts = parseExpiryTs(p.expiry);
+  const when = ts == null ? (p.expiry || "?")
+    : `${new Date(ts).getUTCMonth() + 1}/${new Date(ts).getUTCDate()}`;
+  return `${p.u} ${when} ${p.strike || "?"}P${p.qty > 1 ? ` ×${p.qty}` : ""}`;
+}
 
 function riskAccountLabel(id, cfg) {
   const label = ((cfg.accounts || {})[id] || {}).label;
@@ -327,8 +399,9 @@ function renderRiskGate() {
     const dd = riskDrawdown(a.nav_history, a.cash_flows, cfg.drawdown_days);
     const pm = kind === "pm" ? riskPmBuffer(b.nav, cfg.pm_floor, cfg.pm_warn) : null;
     const weeks = kind === "cash" ? riskCashWeeks(a.options, book, todayTs, b.cashLike) : null;
-    return { id, label: riskAccountLabel(id, cfg), kind, book: b, judge, dd, pm, weeks,
-             verdict: riskVerdict(judge, dd, pm, weeks, cfg) };
+    const stops = riskUnderwater(a, cfg);
+    return { id, label: riskAccountLabel(id, cfg), kind, book: b, judge, dd, pm, weeks, stops,
+             verdict: riskVerdict(judge, dd, pm, weeks, cfg, stops) };
   });
   if (scope.merged) {
     const merged = mergeAccounts(accounts);
@@ -384,6 +457,22 @@ function renderRiskVerdict(cols, cfg) {
     if (v.cashShort) {
       parts.push(`<b class="down">${v.cashShort} 个到期周的卖 put 名义超过现金 + BOXX</b>`);
     }
+    // Every position at a line is named, however many: these are the ones
+    // to act on, and a count would leave the reader to go and find them.
+    const putsAt = (lvl) => c.stops.putHits.filter(p => p.level === lvl)
+      .map(p => `${esc(riskPutLabel(p))} ${fmtX(p.ratio)}`).join("、");
+    if (v.putStops) {
+      parts.push(`<b class="down">止损线：${v.putStops} 张卖 put 平仓价达到权利金的 `
+        + `${+cfg.put_close_stop.toFixed(2)} 倍</b>（${putsAt("red")}）`);
+    }
+    if (v.putWarns) {
+      parts.push(`<b class="amber">预警：${v.putWarns} 张卖 put 平仓价达到权利金的 `
+        + `${+cfg.put_close_warn.toFixed(2)} 倍</b>，该复盘 / 考虑 roll（${putsAt("amber")}）`);
+    }
+    if (v.stockDrops) {
+      parts.push(`<b class="amber">${v.stockDrops} 只正股较持仓成本跌 ≥ ${fmtPct(cfg.stock_drop_warn, 0)}</b>（`
+        + c.stops.stockHits.map(s => `${esc(s.u)} ${fmtPct(s.ret, 1)}`).join("、") + "）");
+    }
     if (!parts.length) parts.push(`<span class="up">全部在线内</span>`);
     const icon = v.level === "red" ? "⛔" : v.level === "amber" ? "⚠" : "✓";
     const kind = c.kind ? ` <span class="muted">${RISK_KIND_LABEL[c.kind] || ""}</span>` : "";
@@ -396,7 +485,7 @@ function renderRiskVerdict(cols, cfg) {
   $("risk-summary").innerHTML = cols.map(c => {
     const icon = c.verdict.level === "red" ? "⛔" : c.verdict.level === "amber" ? "⚠" : "✓";
     return `<span class="risk-sum ${c.verdict.level}">${icon} <b>${esc(c.label)}</b>：`
-      + `${riskBrief(c.verdict)}</span>`;
+      + `${riskBrief(c.verdict, cfg)}</span>`;
   }).join("");
 }
 
@@ -469,6 +558,50 @@ function renderRiskTable(cols, cfg) {
         tag && !c.merged ? `<span class="tag tag-over">${tag}</span> ${peak}` : peak,
         `${c.dd.rows} 个 NAV 行，截至 ${c.dd.lastDate}，剔除出入金`);
     })));
+  // Per position: the household column has nothing of its own to add, the
+  // account columns already hold every contract and every lot. At the line,
+  // a cell lists every position on it, one per line; under it, the worst one
+  // and how far it is from the line.
+  // [html, tone] per position: one put cell can hold a stop and a warning.
+  const items = (list) => list.map(([html, tone]) =>
+    `<span class="risk-item${tone ? ` ${tone}` : ""}">${html}</span>`).join("");
+  const STEP = { red: "止损", amber: "预警" };
+  rows.push(row("卖 put 平仓价 ÷ 权利金",
+    `≥ ${fmtX(cfg.put_close_warn)} 预警 · ≥ ${fmtX(cfg.put_close_stop)} 止损`, cols.map(c => {
+      if (!c.stops) return blank(c, "—", "按账户判：每张合约只属于一个账户");
+      const [top] = c.stops.puts;
+      if (!top) return blank(c, "无");
+      if (!(top.ratio > 1)) return blank(c, "全部浮盈");
+      const hits = c.stops.putHits;
+      const tip = (p) => `${riskPutLabel(p)}：平仓 ${fmtMoney(p.close)} ÷ 卖出时收的权利金 `
+        + `${fmtMoney(p.premium)}${STEP[p.level] ? `（${STEP[p.level]}）` : ""}`;
+      if (!hits.length) {
+        return cell(c, `${esc(riskPutLabel(top))} ${fmtX(top.ratio)}`, "",
+          `平仓 ${fmtK(top.close)} / 权利金 ${fmtK(top.premium)}`, tip(top));
+      }
+      const red = hits.filter(p => p.level === "red").length;
+      return cell(c,
+        items(hits.map(p => [`${esc(riskPutLabel(p))} ${fmtX(p.ratio)}`,
+                             p.level === "red" ? "down" : "amber"])),
+        red ? "down" : "amber",
+        [red && `${red} 张止损`, hits.length - red && `${hits.length - red} 张预警`]
+          .filter(Boolean).join(" · "),
+        hits.map(tip).join("\n"));
+    })));
+  rows.push(row("正股较持仓成本", `≤ −${fmtPct(cfg.stock_drop_warn, 0)} 报警`, cols.map(c => {
+    if (!c.stops) return blank(c, "—", "按账户判：成本按各账户自己的算");
+    const [top] = c.stops.stocks;
+    if (!top) return blank(c, "无");
+    if (!(top.ret < 0)) return blank(c, "全部浮盈");
+    const hits = c.stops.stockHits;
+    const tip = (s) => `${s.u}：成本价 ${fmtMoney(s.cost, 2)}，现价 ${fmtMoney(s.price, 2)}`;
+    if (!hits.length) {
+      return cell(c, `${esc(top.u)} ${fmtPct(top.ret, 1)}`, "",
+        `成本 ${fmtMoney(top.cost, 2)} → ${fmtMoney(top.price, 2)}`, tip(top));
+    }
+    return cell(c, items(hits.map(s => [`${esc(s.u)} ${fmtPct(s.ret, 1)}`, ""])), "amber",
+      `${hits.length} 只到线`, hits.map(tip).join("\n"));
+  })));
   const head = cols.map(c => `<th class="num${on(c)}">${esc(c.label)}`
     + (c.kind ? `<span class="th-sub">${RISK_KIND_LABEL[c.kind] || ""}</span>` : "")
     + `</th>`).join("");
@@ -526,6 +659,9 @@ const RISK_FIELDS = [
   { key: "drawdown_days", label: "回撤窗口", unit: "个交易日", scale: 1 },
   { key: "drawdown_stop", label: "回撤一级（停卖 put）", unit: "%", scale: 100 },
   { key: "drawdown_halt", label: "回撤二级（只减不加）", unit: "%", scale: 100 },
+  { key: "put_close_warn", label: "卖 put 预警（平仓价 ÷ 权利金）", unit: "x", scale: 1 },
+  { key: "put_close_stop", label: "卖 put 止损（平仓价 ÷ 权利金）", unit: "x", scale: 1 },
+  { key: "stock_drop_warn", label: "正股较持仓成本跌幅报警", unit: "%", scale: 100 },
 ];
 
 // toFixed round-trips: 0.1 × 100 is 10.000000000000002 in binary floating
@@ -602,6 +738,10 @@ function riskDraft() {
   const stop = thresholds.drawdown_stop ?? RISK_DEFAULTS.drawdown_stop;
   const halt = thresholds.drawdown_halt ?? RISK_DEFAULTS.drawdown_halt;
   if (halt < stop) return { error: "回撤二级（只减不加）不能比一级（停卖 put）浅" };
+  // Same for the two put steps: a stop below the warning would leave amber unreachable.
+  const putWarn = thresholds.put_close_warn ?? RISK_DEFAULTS.put_close_warn;
+  const putStop = thresholds.put_close_stop ?? RISK_DEFAULTS.put_close_stop;
+  if (putStop < putWarn) return { error: "卖 put 止损线不能比预警线低" };
   const list = (name) => riskListFromInput(
     document.querySelector(`#risk-form-body [data-list="${name}"]`).value);
   const accounts = {};
