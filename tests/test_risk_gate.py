@@ -68,7 +68,9 @@ def test_position_alarm_lines():
                                  "stock_drop_warn": 0.15}
     # Equal is allowed: one line that is both 预警 and 止损.
     assert norm({"thresholds": {"put_close_warn": 2, "put_close_stop": 2}})["thresholds"]
-    # Only one typed: the other is a client-side default, so nothing to compare.
+    # Only one typed: the other is a client-side default, so nothing to compare
+    # here. riskConfig puts the effective pair in order where the default and
+    # the override meet (test_risk_gate.mjs), so a lone 1.5 stop is one line.
     assert norm({"thresholds": {"put_close_stop": 1.5}})["thresholds"] == {"put_close_stop": 1.5}
     with pytest.raises(ValueError, match="put_close_stop"):
         norm({"thresholds": {"put_close_warn": 3, "put_close_stop": 2}})

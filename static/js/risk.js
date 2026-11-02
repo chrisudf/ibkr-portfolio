@@ -101,6 +101,13 @@ function riskConfig(stored) {
   for (const [k, v] of Object.entries(s.thresholds || {})) {
     if (k in cfg && v != null && Number.isFinite(Number(v))) cfg[k] = Number(v);
   }
+  // A put warning above the stop could never show: the stop claims every put
+  // first. The dialog refuses that pair, but the server stores only what was
+  // typed, so a lone override meets its partner's default only here — and a
+  // default can move after a value was saved. The effective pair is put in
+  // order where the two meet: the warning folds into the stop, one line, the
+  // same thing the dialog accepts when both are typed equal.
+  if (cfg.put_close_warn > cfg.put_close_stop) cfg.put_close_warn = cfg.put_close_stop;
   cfg.cluster = Array.isArray(s.cluster) ? s.cluster : RISK_CLUSTER;
   cfg.watch = Array.isArray(s.watch) ? s.watch : RISK_WATCH;
   cfg.accounts = s.accounts || {};
@@ -559,9 +566,11 @@ function renderRiskTable(cols, cfg) {
         `${c.dd.rows} 个 NAV 行，截至 ${c.dd.lastDate}，剔除出入金`);
     })));
   // Per position: the household column has nothing of its own to add, the
-  // account columns already hold every contract and every lot. At the line,
-  // a cell lists every position on it, one per line; under it, the worst one
-  // and how far it is from the line.
+  // account columns already hold every contract and every lot. A cell lists
+  // every position at a line, one per line — hits first, always: a 1x put
+  // line or a 0% stock line puts a position that has lost nothing on the
+  // line, and 全部浮盈 must not hide it. Only with no hits does a cell fall
+  // back to the worst position and how far it is from the line.
   // [html, tone] per position: one put cell can hold a stop and a warning.
   const items = (list) => list.map(([html, tone]) =>
     `<span class="risk-item${tone ? ` ${tone}` : ""}">${html}</span>`).join("");
@@ -569,13 +578,13 @@ function renderRiskTable(cols, cfg) {
   rows.push(row("卖 put 平仓价 ÷ 权利金",
     `≥ ${fmtX(cfg.put_close_warn)} 预警 · ≥ ${fmtX(cfg.put_close_stop)} 止损`, cols.map(c => {
       if (!c.stops) return blank(c, "—", "按账户判：每张合约只属于一个账户");
-      const [top] = c.stops.puts;
-      if (!top) return blank(c, "无");
-      if (!(top.ratio > 1)) return blank(c, "全部浮盈");
       const hits = c.stops.putHits;
       const tip = (p) => `${riskPutLabel(p)}：平仓 ${fmtMoney(p.close)} ÷ 卖出时收的权利金 `
         + `${fmtMoney(p.premium)}${STEP[p.level] ? `（${STEP[p.level]}）` : ""}`;
       if (!hits.length) {
+        const [top] = c.stops.puts;
+        if (!top) return blank(c, "无");
+        if (!(top.ratio > 1)) return blank(c, "全部浮盈");
         return cell(c, `${esc(riskPutLabel(top))} ${fmtX(top.ratio)}`, "",
           `平仓 ${fmtK(top.close)} / 权利金 ${fmtK(top.premium)}`, tip(top));
       }
@@ -590,12 +599,12 @@ function renderRiskTable(cols, cfg) {
     })));
   rows.push(row("正股较持仓成本", `≤ −${fmtPct(cfg.stock_drop_warn, 0)} 报警`, cols.map(c => {
     if (!c.stops) return blank(c, "—", "按账户判：成本按各账户自己的算");
-    const [top] = c.stops.stocks;
-    if (!top) return blank(c, "无");
-    if (!(top.ret < 0)) return blank(c, "全部浮盈");
     const hits = c.stops.stockHits;
     const tip = (s) => `${s.u}：成本价 ${fmtMoney(s.cost, 2)}，现价 ${fmtMoney(s.price, 2)}`;
     if (!hits.length) {
+      const [top] = c.stops.stocks;
+      if (!top) return blank(c, "无");
+      if (!(top.ret < 0)) return blank(c, "全部浮盈");
       return cell(c, `${esc(top.u)} ${fmtPct(top.ret, 1)}`, "",
         `成本 ${fmtMoney(top.cost, 2)} → ${fmtMoney(top.price, 2)}`, tip(top));
     }

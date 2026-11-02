@@ -429,6 +429,22 @@ test("卖 put 两档：压线那一下的浮点误差不改结论，两条线都
   assert.equal(R.riskUnderwater(book, looser).putHits.length, 0);
 });
 
+test("卖 put 两档：只填一边、跟另一边的默认值顺序反了，生效时并成一条线", () => {
+  // 只填预警 4：止损走默认 3，预警永远轮不到 —— 生效时并进止损线，3x 起都是红
+  const lone = R.riskConfig({ thresholds: { put_close_warn: 4 } });
+  assert.deepEqual([lone.put_close_warn, lone.put_close_stop], [3, 3]);
+  const at = (close) => R.riskUnderwater({ stocks: [],
+    options: [sold("VRT", "20NOV26", 200, -1, 100, close)] }, lone).puts[0].level;
+  assert.equal(at(350), "red");
+  assert.equal(at(250), "ok");
+  // 只填止损 1.5：预警默认 2 比它高，同样并成一条 1.5
+  const lowStop = R.riskConfig({ thresholds: { put_close_stop: 1.5 } });
+  assert.deepEqual([lowStop.put_close_warn, lowStop.put_close_stop], [1.5, 1.5]);
+  // 顺序本来就对的照用
+  const fine = R.riskConfig({ thresholds: { put_close_warn: 1.5, put_close_stop: 2.5 } });
+  assert.deepEqual([fine.put_close_warn, fine.put_close_stop], [1.5, 2.5]);
+});
+
 test("正股较持仓成本：正好 −20% 算到线；现金等价物、空头正股不判", () => {
   const u = R.riskUnderwater({ options: [], stocks: [
     lot("ETHU", 1000, -0.793),
