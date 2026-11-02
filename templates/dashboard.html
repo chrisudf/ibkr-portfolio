@@ -178,10 +178,10 @@
               <tr>
                 <th>标的</th>
                 <th class="num">敞口</th>
-                <th class="num">占总资产</th>
+                <th class="num sortable" data-sort="weight">占总资产 <span class="sort-ind"></span></th>
                 <th class="num">目标区间</th>
                 <th>位置</th>
-                <th>状态</th>
+                <th class="sortable" data-sort="status">状态 <span class="sort-ind"></span></th>
               </tr>
             </thead>
             <tbody id="core-body"></tbody>
@@ -196,8 +196,9 @@
           区间规则本身是<b>全局共享</b>的一套，同一个 5% – 10% 分别套在每本账上 ——
           所以一个标的只在另一个账号里持有时，这里会显示 0% 并打「本账号无持仓」。
           目标区间的两端都是你自己填的百分比：下限留空按 0% 算（不报欠配），上限留空按 100% 算
-          （不报超上限）。<b>核心持仓</b>不参与判定，只是热力图上的白圈和这张表的排序优先级 ——
+          （不报超上限）。<b>核心持仓</b>不参与判定，只是热力图上的白圈和这张表「按状态」排序时的优先级 ——
           下限既然是填出来的，再拿一个勾选框把它关掉只会让人填了数字却等不到提醒。
+          排序：点「状态」或「占总资产」表头，再点一次反向。默认按状态，超上限、欠配排在前面；选哪种记在当前浏览器。
           规则在右上角「核心持仓」里改，存在服务器上（<code>uploads/.position_settings.json</code>）。</div>
       </section>
 

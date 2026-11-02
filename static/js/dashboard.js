@@ -1984,6 +1984,44 @@ function exposureTip(r) {
   return bits.join(" + ") || "无投入资本";
 }
 
+// Row order on the panel, picked by clicking the 状态 or 占总资产 header and
+// flipped by clicking it again. 状态 (the default) puts what needs adjusting
+// first — over the cap, then under the floor — core holdings first within
+// each; 占总资产 ranks by weight. Each comparator gives the ▼ order; ties go
+// by ticker in either direction, so two renders that agree on the key never
+// reshuffle.
+const CORE_STATUS_RANK = { over: 0, under: 1, ok: 2 };
+const CORE_SORTS = {
+  status: (a, b) => (CORE_STATUS_RANK[a.status] ?? 3) - (CORE_STATUS_RANK[b.status] ?? 3)
+    || b.core - a.core || b.weight - a.weight,
+  weight: (a, b) => b.weight - a.weight,
+};
+const CORE_SORT_DEFAULT = { key: "status", dir: "desc" };
+// Which order is a per-device preference, like the risk gate's fold — a phone
+// and a desk may want different ones — so it lives in this browser.
+const CORE_SORT_KEY = "ibkr.coreTable.sort";
+const coreSort = { ...CORE_SORT_DEFAULT };
+// The scope label of the view on screen, so re-sorting redraws this panel alone.
+let coreScopeLabel = "";
+
+function coreRowOrder(state) {
+  const by = CORE_SORTS[state.key] || CORE_SORTS.status;
+  const dir = state.dir === "asc" ? -1 : 1;
+  return (a, b) => dir * by(a, b) || a.symbol.localeCompare(b.symbol);
+}
+
+// A saved order read back. Anything unreadable, or a key this build does not
+// know, falls back to the default.
+function coreSortFrom(raw) {
+  try {
+    const s = JSON.parse(raw);
+    if (Object.hasOwn(CORE_SORTS, s.key) && (s.dir === "asc" || s.dir === "desc")) {
+      return { key: s.key, dir: s.dir };
+    }
+  } catch (_) { /* not one of ours */ }
+  return { ...CORE_SORT_DEFAULT };
+}
+
 // One row per CONFIGURED symbol, scored against the account on screen.
 // Symbols with no position in this view keep their row: a core holding at 0%
 // here is the most extreme under-weight there is, and dropping the row would
@@ -2007,19 +2045,17 @@ function positionRows() {
       elsewhere: !bySymbol[sym] && universe.has(sym),
     };
   });
-  const rank = { over: 0, under: 1, ok: 2 };
-  rows.sort((a, b) =>
-    (rank[a.status] ?? 3) - (rank[b.status] ?? 3)
-    || (b.core - a.core)
-    || b.weight - a.weight);
+  rows.sort(coreRowOrder(coreSort));
   return { totalNav, rows };
 }
 
 function renderCorePositions(scopeLabel) {
+  coreScopeLabel = scopeLabel;
   const panel = $("core-panel");
   const { totalNav, rows } = positionRows();
   if (!rows.length) { panel.hidden = true; return; }
   panel.hidden = false;
+  updateSortIndicators("core-body", coreSort);
 
   const alerts = rows.filter(r => r.status === "over" || r.status === "under");
   const coreCount = rows.filter(r => r.core).length;
@@ -2305,6 +2341,20 @@ function wirePositionModal() {
     if (e.target.dataset.role !== "core") return;
     posDraft[e.target.closest("tr").dataset.sym].core = e.target.checked;
   });
+}
+
+function loadCoreSort() {
+  let raw = null;
+  try {
+    raw = localStorage.getItem(CORE_SORT_KEY);
+  } catch (_) { /* storage blocked: start on the default order */ }
+  Object.assign(coreSort, coreSortFrom(raw));
+}
+
+function saveCoreSort() {
+  try {
+    localStorage.setItem(CORE_SORT_KEY, JSON.stringify(coreSort));
+  } catch (_) { /* fine: it just won't be remembered */ }
 }
 
 function renderTreemap(stocks) {
@@ -2745,11 +2795,17 @@ function updateSortIndicators(tbodyId, state) {
   });
 }
 
+// Every table with clickable headers: the state it sorts by and how to redraw
+// it. Listed by name — the core table is a .holdings table too, and "not the
+// options table, so the stocks one" would sort the wrong table.
 function attachSorters(currentDataRef) {
-  document.querySelectorAll("table.holdings").forEach(table => {
-    const isOptions = table.querySelector("#options-body");
-    const state = isOptions ? optionsSort : stocksSort;
-    table.querySelectorAll("th.sortable").forEach(th => {
+  const tables = [
+    ["holdings-body", stocksSort, () => renderHoldings(currentDataRef.data.stocks)],
+    ["options-body", optionsSort, () => renderOptions(currentDataRef.data.options)],
+    ["core-body", coreSort, () => { saveCoreSort(); renderCorePositions(coreScopeLabel); }],
+  ];
+  for (const [bodyId, state, redraw] of tables) {
+    $(bodyId).closest("table").querySelectorAll("th.sortable").forEach(th => {
       th.addEventListener("click", () => {
         const key = th.dataset.sort;
         if (state.key === key) {
@@ -2758,11 +2814,10 @@ function attachSorters(currentDataRef) {
           state.key = key;
           state.dir = "desc";
         }
-        if (isOptions) renderOptions(currentDataRef.data.options);
-        else renderHoldings(currentDataRef.data.stocks);
+        redraw();
       });
     });
-  });
+  }
 }
 
 let rankMode = "underlying";
@@ -3288,6 +3343,7 @@ document.addEventListener("DOMContentLoaded", () => {
   $("refresh-btn").addEventListener("click", refreshFromIBKR);
   resumeRefreshWatch();
   wirePositionModal();
+  loadCoreSort();
 
   // Core-holding rules. Like the cluster fetch below, the first render may
   // land before this resolves, so re-render once it arrives.
