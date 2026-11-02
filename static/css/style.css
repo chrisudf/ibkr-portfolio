@@ -725,7 +725,7 @@ body.modal-open { overflow: hidden; }
    The verdict lines come first and carry the colour; the table under them is
    the evidence, so only the crossed cells are tinted there. */
 
-.risk-head-right, .core-head-right { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }
+.risk-head-right { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }
 .ghost-btn.risk-btn { padding: 6px 14px; font-size: 12px; }
 .risk-title { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
 .risk-title .panel-note { font-weight: 400; letter-spacing: 0; }
@@ -832,10 +832,8 @@ table.risk-table thead th.risk-active { color: var(--accent); }
 }
 
 @media (max-width: 600px) {
-  .panel-head:has(.risk-head-right), .panel-head:has(.core-head-right) {
-    flex-direction: column; align-items: flex-start; gap: 8px;
-  }
-  .risk-head-right, .core-head-right { justify-content: flex-start; }
+  .panel-head:has(.risk-head-right) { flex-direction: column; align-items: flex-start; gap: 8px; }
+  .risk-head-right { justify-content: flex-start; }
   table.risk-table th[scope="row"] { white-space: normal; min-width: 92px; max-width: 110px; }
   table.risk-table th, table.risk-table td { padding: 9px 8px; }
 }
