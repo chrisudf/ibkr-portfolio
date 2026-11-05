@@ -1340,6 +1340,32 @@ function positionTag(r) {
   return "";
 }
 
+// External money that landed inside a recap window. Same boundary rule as
+// navStats: a flow belongs to the first NAV point on or after its date, so one
+// dated on the baseline day is already inside navBase and one dated on the live
+// day is inside navNow but not navBase.
+function netFlowBetween(flows, afterDate, upToDate) {
+  return (flows || []).reduce(
+    (s, f) => (f.date > afterDate && f.date <= upToDate ? s + (f.amount || 0) : s), 0);
+}
+
+// The raw delta stays because it is what the account balance really did, but on
+// its own it reads as performance: a deposit landing in a losing window shrinks
+// the printed loss, with nothing to say the difference is not P&L.
+// Under a dollar is rounding on a converted wire, not a flow worth a clause.
+function weeklyNavStats(navDelta, netFlow) {
+  const signed = (v) => `${v >= 0 ? "+" : ""}${fmtMoney(v)}`;
+  const cls = (v) => (v >= 0 ? "up" : "down");
+  const hasFlow = Math.abs(netFlow) >= 1;
+  const flowNote = hasFlow
+    ? ` <span class="muted">（含净${netFlow > 0 ? "入金" : "出金"} ${signed(netFlow)}）</span>` : "";
+  const gain = navDelta - netFlow;
+  return `<span class="nav-stat"><span class="muted">净值变化</span> <b class="${cls(navDelta)}">`
+    + `${signed(navDelta)}</b>${flowNote}</span>`
+    + (hasFlow ? `<span class="nav-stat"><span class="muted">扣除出入金</span> `
+      + `<b class="${cls(gain)}">${signed(gain)}</b></span>` : "");
+}
+
 function renderWeekly(data, accounts, selected) {
   const panel = $("weekly-panel");
   const targets = selected === "ALL"
@@ -1353,7 +1379,12 @@ function renderWeekly(data, accounts, selected) {
   let fresh = 0;
   for (const a of targets) {
     const d = weeklyDiff(liveSnapshot(a), a.snapshots || []);
-    if (d) diffs.push(d); else if ((a.snapshots || []).length) fresh++;
+    if (d) {
+      // Per account, against that account's own window: baselines can differ
+      // by a day or two in the merged view.
+      d.netFlow = netFlowBetween(a.cash_flows, d.baseDate, d.liveDate);
+      diffs.push(d);
+    } else if ((a.snapshots || []).length) fresh++;
   }
   const winnersEl = $("weekly-winners"), losersEl = $("weekly-losers");
   if (!diffs.length) {
@@ -1453,9 +1484,9 @@ function renderWeekly(data, accounts, selected) {
   const stLabel = stParts.length
     ? `期间收益(剔除出入金 · ${stParts.join(" ")})` : "期间收益(剔除出入金)";
   const navDelta = navNow - navBase;
+  const netFlow = diffs.reduce((s, d) => s + d.netFlow, 0);
   $("weekly-summary").innerHTML =
-    `<span class="nav-stat"><span class="muted">净值变化</span> <b class="${navDelta >= 0 ? "up" : "down"}">`
-    + `${navDelta >= 0 ? "+" : ""}${fmtMoney(navDelta)}</b></span>`
+    weeklyNavStats(navDelta, netFlow)
     + (st ? `<span class="nav-stat"><span class="muted">${stLabel}</span> `
       + `<b class="${st.periodReturn >= 0 ? "up" : "down"}">${st.periodReturn >= 0 ? "+" : ""}`
       + `${fmtPct(st.periodReturn, 2)}</b></span>` : "")
