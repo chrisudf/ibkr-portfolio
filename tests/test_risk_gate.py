@@ -72,6 +72,8 @@ def test_position_alarm_lines():
     # here. riskConfig puts the effective pair in order where the default and
     # the override meet (test_risk_gate.mjs), so a lone 1.5 stop is one line.
     assert norm({"thresholds": {"put_close_stop": 1.5}})["thresholds"] == {"put_close_stop": 1.5}
+    assert norm({"thresholds": {"noncore_assigned_max": 0.15}})["thresholds"] == {
+        "noncore_assigned_max": 0.15}
     with pytest.raises(ValueError, match="put_close_stop"):
         norm({"thresholds": {"put_close_warn": 3, "put_close_stop": 2}})
 
@@ -88,6 +90,7 @@ def test_position_alarm_lines():
     {"thresholds": {"put_close_stop": 0.5}},           # under 1x the put is in profit: no stop
     {"thresholds": {"put_close_warn": 0.9}},
     {"thresholds": {"stock_drop_warn": 20}},           # percent typed as a fraction
+    {"thresholds": {"noncore_assigned_max": 10}},      # percent typed as a fraction
     {"thresholds": {"put_nav_max": True}},             # bool is not a number here
     {"thresholds": {"put_nav_max": "abc"}},
     {"thresholds": {"put_nav_max": float("nan")}},

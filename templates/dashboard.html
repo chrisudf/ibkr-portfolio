@@ -100,14 +100,20 @@
         <div class="risk-summary" id="risk-summary" hidden></div>
         <div id="risk-body">
           <div class="risk-verdict" id="risk-verdict"></div>
-          <div class="table-wrap">
-            <table class="holdings risk-table" id="risk-table"></table>
-          </div>
+          <!-- Folded: the cards above already name everything at a line. This
+               adds the figures still inside theirs, and the 合并 column. -->
+          <details class="risk-rules">
+            <summary>规则明细 <span class="muted">线内的比值、金额和合并列</span></summary>
+            <div class="table-wrap">
+              <table class="holdings risk-table" id="risk-table"></table>
+            </div>
+          </details>
           <div class="margin-foot" id="risk-table-note"></div>
           <div class="risk-sub-section" id="risk-cash" hidden></div>
           <ul class="risk-legend">
             <li><b>超线</b> → 只许替换，不许净新增。线是默认值、没正式采纳，在「设置」里改，账户类型也在那里标。</li>
             <li><b>卖 put 名义</b> = 行权价 × 股数：全部被行权要付的钱，不分价内外。</li>
+            <li><b>非核心线</b>：没勾「核心持仓」的标的，只要卖了 put，就算（正股 + 期权多头市值 + 全部卖 put 名义）÷ 净值，不超过 10% 或只开 1 张都算线内，否则标红。按账户判，合并列不判。</li>
             <li><b>AI 硬件簇</b> = 成员的正股市值 + LEAP 名义（正股价 × 股数）+ 卖 put 名义。</li>
             <li><b>回撤断路器</b>：−10% → 停卖 put（roll 不加张数和名义，闲置现金可以买正股和期权多头）；−20% → 只减不加。回撤剔除出入金，从窗口内最高点算。</li>
             <li><b>组合保证金线</b>：净值低于 US$100k，IBKR 只接受降低保证金的交易。<b>现金户</b>：每个到期周的卖 put 名义对比现金 + BOXX，累计列假设接来的股票不卖。</li>
@@ -196,7 +202,7 @@
           区间规则本身是<b>全局共享</b>的一套，同一个 5% – 10% 分别套在每本账上 ——
           所以一个标的只在另一个账号里持有时，这里会显示 0% 并打「本账号无持仓」。
           目标区间的两端都是你自己填的百分比：下限留空按 0% 算（不报欠配），上限留空按 100% 算
-          （不报超上限）。<b>核心持仓</b>不参与判定，只是热力图上的白圈和这张表「按状态」排序时的优先级 ——
+          （不报超上限）。<b>核心持仓</b>不参与区间判定（只决定风险闸门的非核心线算不算这只），在这里只是热力图上的白圈和这张表「按状态」排序时的优先级 ——
           下限既然是填出来的，再拿一个勾选框把它关掉只会让人填了数字却等不到提醒。
           排序：点「状态」或「占总资产」表头，再点一次反向。默认按状态，超上限、欠配排在前面；选哪种记在当前浏览器。
           规则在右上角「核心持仓」里改，存在服务器上（<code>uploads/.position_settings.json</code>）。</div>
@@ -455,7 +461,7 @@
         列出所有正股 + 期权持仓的标的。<b>仓位区间</b>=该标的<b>投入资本</b>（正股市值 + 期权多头市值）
         占全部账户总净值的目标区间，两个框都能随便填数字（支持小数）。
         <b>下限留空 = 0%</b>（不报欠配）、<b>上限留空 = 100%</b>（不报超上限），两个都空 = 不参与提醒。
-        <b>核心持仓</b>只是个标记（热力图上的白圈 + 排序），不影响判定 —— 下限填了多少就是多少。
+        <b>核心持仓</b>是个标记（热力图上的白圈 + 排序），不影响区间判定 —— 下限填了多少就是多少；没勾的标的要过风险闸门的非核心线。
         <br>标的列出的是<b>所有账号</b>持有的（规则全局共享），后面的百分比是<b>当前账号</b>的。
       </div>
       <div class="modal-tools">

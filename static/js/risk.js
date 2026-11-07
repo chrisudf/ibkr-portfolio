@@ -77,6 +77,7 @@ const RISK_DEFAULTS = {
   put_close_warn: 2.0,       // 卖 put 预警：平仓价达到卖出时收的权利金的 2 倍 → 黄
   put_close_stop: 3.0,       // 卖 put 止损：平仓价达到 3 倍 → 红
   stock_drop_warn: 0.20,     // 正股较持仓成本跌到 −20% → 黄
+  noncore_assigned_max: 0.10, // 非核心标的：全部 put 行权后的仓位 ÷ 净值
 };
 
 // Names that gap together on an AI-capex scare, gated as one position.
@@ -95,7 +96,11 @@ const RISK_EPS = 1e-9;
 // The lines in force: defaults, overlaid with whatever the settings file
 // holds. Anything unreadable falls back to the default rather than to 0 —
 // a line of 0 would turn the whole table red for no reason.
-function riskConfig(stored) {
+//
+// `positions` is the 核心持仓 settings. Without them (not loaded, or the read
+// failed) cfg.core is null and the non-core line is not judged: every name
+// would otherwise read as non-core and light up on a failed fetch.
+function riskConfig(stored, positions) {
   const s = stored || {};
   const cfg = { ...RISK_DEFAULTS };
   for (const [k, v] of Object.entries(s.thresholds || {})) {
@@ -111,6 +116,9 @@ function riskConfig(stored) {
   cfg.cluster = Array.isArray(s.cluster) ? s.cluster : RISK_CLUSTER;
   cfg.watch = Array.isArray(s.watch) ? s.watch : RISK_WATCH;
   cfg.accounts = s.accounts || {};
+  cfg.core = positions
+    ? new Set(Object.entries(positions.symbols || {}).filter(([, p]) => p && p.core).map(([u]) => u))
+    : null;
   return cfg;
 }
 
@@ -129,17 +137,24 @@ function riskNav(data) {
 // notional is the long calls' share-equivalent: spot × contracts × multiplier,
 // spot from the pooled price book; with no quote anywhere the strike stands
 // in and the contract is counted so the panel can say so.
+//
+// `held` is what is already in each name, on the 仓位区间 definition: stock
+// plus long options at market value. It is what an assignment would add to.
 function riskBook(data, cfg, priceBook) {
   const members = new Set(cfg.cluster);
-  const byU = {};
+  const byU = {}, held = {}, putQty = {};
   let putTotal = 0, unparsed = 0;
   let stockMV = 0, leap = 0, clusterPut = 0, leapAssumed = 0;
   for (const s of data.stocks || []) {
     if (members.has(s.symbol)) stockMV += s.value || 0;
+    held[s.symbol] = (held[s.symbol] || 0) + (s.value || 0);
   }
   for (const o of data.options || []) {
     const qty = Math.abs(o.quantity || 0);
     const shares = qty * (o.multiplier || CONTRACT_MULTIPLIER);
+    if (o.quantity > 0) {
+      held[o.underlying] = (held[o.underlying] || 0) + Math.max(o.value || 0, 0);
+    }
     if (o.quantity < 0) {
       // A short whose strike or right did not parse could be a put of any
       // size. Leave it out of the sums and count it, as the margin panel does.
@@ -151,6 +166,7 @@ function riskBook(data, cfg, priceBook) {
       const n = o.strike * shares;
       putTotal += n;
       byU[o.underlying] = (byU[o.underlying] || 0) + n;
+      putQty[o.underlying] = (putQty[o.underlying] || 0) + qty;
       if (members.has(o.underlying)) clusterPut += n;
     } else if (o.quantity > 0 && o.right === "C" && members.has(o.underlying)) {
       const spot = priceBook[o.underlying];
@@ -161,7 +177,7 @@ function riskBook(data, cfg, priceBook) {
   const cashEq = (data.stocks || []).reduce(
     (s, x) => s + (CASH_EQUIVALENTS.has(x.symbol) ? (x.value || 0) : 0), 0);
   return {
-    nav: riskNav(data), putTotal, byU, unparsed,
+    nav: riskNav(data), putTotal, byU, held, putQty, unparsed,
     cluster: { stockMV, leap, put: clusterPut, leapAssumed },
     cashLike: ((data.nav || {}).cash || 0) + cashEq,
   };
@@ -169,7 +185,7 @@ function riskBook(data, cfg, priceBook) {
 
 function mergeRiskBooks(books) {
   const out = {
-    nav: 0, putTotal: 0, byU: {}, unparsed: 0, cashLike: 0,
+    nav: 0, putTotal: 0, byU: {}, held: {}, putQty: {}, unparsed: 0, cashLike: 0,
     cluster: { stockMV: 0, leap: 0, put: 0, leapAssumed: 0 },
   };
   for (const b of books) {
@@ -178,6 +194,8 @@ function mergeRiskBooks(books) {
     out.unparsed += b.unparsed;
     out.cashLike += b.cashLike;
     for (const [u, n] of Object.entries(b.byU)) out.byU[u] = (out.byU[u] || 0) + n;
+    for (const [u, n] of Object.entries(b.held)) out.held[u] = (out.held[u] || 0) + n;
+    for (const [u, n] of Object.entries(b.putQty)) out.putQty[u] = (out.putQty[u] || 0) + n;
     for (const k of Object.keys(out.cluster)) out.cluster[k] += b.cluster[k] || 0;
   }
   return out;
@@ -198,8 +216,23 @@ function riskJudge(book, cfg) {
   const c = book.cluster;
   const clusterTotal = c.stockMV + c.leap + c.put;
   const putRatio = ratio(book.putTotal);
+  // A non-core name's size if every put on it were assigned. Only names with a
+  // short put: the question is what the puts would do, and a holding with none
+  // is the 仓位区间's business. NAV stays the divisor — assignment swaps cash
+  // for stock and leaves NAV where it was. One contract always passes: a single
+  // put on a high-priced name can't be sized any smaller. Crossed names sort
+  // first, so a big single contract can't take the top of the list from them.
+  const noncore = !cfg.core ? [] : Object.entries(book.byU)
+    .filter(([u]) => !cfg.core.has(u) && !CASH_EQUIVALENTS.has(u))
+    .map(([u, put]) => {
+      const held = book.held[u] || 0, r = ratio(held + put), contracts = book.putQty[u] || 0;
+      return { u, held, put, contracts, total: held + put, ratio: r,
+               over: contracts > 1 && over(r, cfg.noncore_assigned_max) };
+    })
+    .sort((a, b) => b.over - a.over || b.total - a.total || a.u.localeCompare(b.u));
   return {
     nav: book.nav,
+    noncore,
     put: { notional: book.putTotal, ratio: putRatio, over: over(putRatio, cfg.put_nav_max) },
     watch: cfg.watch.map(u => {
       const notional = book.byU[u] || 0;
@@ -324,9 +357,10 @@ function riskVerdict(judge, dd, pm, cashWeeks, cfg, stops) {
   const putStops = stops ? stops.putHits.filter(p => p.level === "red").length : 0;
   const putWarns = stops ? stops.putHits.length - putStops : 0;
   const stockDrops = stops ? stops.stockHits.length : 0;
+  const noncoreOver = judge.noncore.filter(n => n.over).length;
   return {
-    crossed, breaker, pmLevel, cashShort, putStops, putWarns, stockDrops,
-    level: breaker || crossed.length || pmLevel === "red" || cashShort || putStops ? "red"
+    crossed, breaker, pmLevel, cashShort, putStops, putWarns, stockDrops, noncoreOver,
+    level: breaker || crossed.length || noncoreOver || pmLevel === "red" || cashShort || putStops ? "red"
       : pmLevel === "amber" || putWarns || stockDrops ? "amber" : "ok",
   };
 }
@@ -347,6 +381,7 @@ function riskBrief(v, cfg) {
   if (v.breaker === 2) parts.push("只减不加");
   else if (v.breaker === 1) parts.push("停卖 put");
   if (v.crossed.length) parts.push(`超线 ${v.crossed.length} 项`);
+  if (v.noncoreOver) parts.push(`${v.noncoreOver} 只非核心超线`);
   if (v.pmLevel === "red") parts.push("PM 线下");
   else if (v.pmLevel === "amber") parts.push("PM 缓冲薄");
   if (v.cashShort) parts.push(`${v.cashShort} 周现金不够`);
@@ -393,7 +428,7 @@ function renderRiskGate() {
 
   const scope = riskScope(all, currentDataRef.selected);
   const ids = scope.ids;
-  const cfg = riskConfig(currentDataRef.riskSettings);
+  const cfg = riskConfig(currentDataRef.riskSettings, currentDataRef.positionSettings);
   // Prices stay pooled across every account even with one on screen: a spot
   // is a market fact, and a LEAP held here may be priced by stock held there.
   const book = buildPriceBook(accounts);
@@ -428,7 +463,8 @@ function renderRiskGate() {
   const asOf = asOfs.length ? `数据截至 ${asOfs.map(fmtMD).join(" / ")} 收盘 · ` : "";
   const settingsError = currentDataRef.riskSettingsError;
   const unkinded = accountCols.filter(c => !c.kind).length;
-  $("risk-note").textContent = asOf + (settingsError
+  const coreNote = cfg.core ? "" : "核心持仓没读到，非核心线未判 · ";
+  $("risk-note").textContent = asOf + coreNote + (settingsError
     ? `设置读取失败（${settingsError}），按默认线显示，账户类型未知`
     : unkinded
       ? `${unkinded} 个账户未设类型 —— 在「设置」里标出组合保证金户 / 现金户`
@@ -439,54 +475,90 @@ function renderRiskGate() {
   renderRiskCash(accountCols);
 }
 
+// An account-wide conclusion: nothing to list, so it reads as one line.
+function riskAlertHtml(tone, title, note = "") {
+  return `<div class="risk-alert"><b class="${tone}">${title}</b>`
+    + (note ? `<span class="risk-alert-note">${note}</span>` : "") + `</div>`;
+}
+
+// A rule and everything at its line, one name to a row, so the eye can run
+// down the names and the figures separately. `rows` are [name, figure, hover].
+function riskGroupHtml(tone, title, note, rows) {
+  return `<section class="risk-group"><b class="${tone}">${title}</b>`
+    + `<div class="risk-group-note">${note}</div><ul class="risk-group-rows">`
+    + rows.map(([name, figure, tip]) =>
+        `<li${tip ? ` title="${esc(tip)}"` : ""}><span>${esc(name)}</span>`
+        + `<span class="${tone}">${figure}</span></li>`).join("")
+    + `</ul></section>`;
+}
+
 function renderRiskVerdict(cols, cfg) {
-  const lines = cols.map(c => {
+  const cards = cols.map(c => {
     const v = c.verdict;
-    const parts = [];
+    const alerts = [];
+    const groups = [];
     const ddText = c.dd ? `近 ${cfg.drawdown_days} 个交易日回撤 ${fmtPct(c.dd.dd, 1)}` : "";
     if (v.breaker === 2) {
-      parts.push(`<b class="down">二级断路器：只减不加</b>（${ddText}，正股和期权多头也停）`);
+      alerts.push(riskAlertHtml("down", "二级断路器：只减不加", `${ddText}，正股和期权多头也停`));
     } else if (v.breaker === 1) {
-      parts.push(`<b class="down">断路器：不开新卖 put</b>`
-        + `（${ddText}；roll 不加张数和名义，闲置现金可以买正股和期权多头）`);
-    }
-    if (v.crossed.length) {
-      parts.push(`<b class="down">超线 ${v.crossed.length} 项：只许替换，不许净新增</b>`
-        + `（${v.crossed.map(esc).join("、")}）`);
+      alerts.push(riskAlertHtml("down", "断路器：不开新卖 put",
+        `${ddText}；roll 不加张数和名义，闲置现金可以买正股和期权多头`));
     }
     if (c.pm && c.pm.level === "red") {
-      parts.push(`<b class="down">净值低于组合保证金线 ${fmtK(-c.pm.gap)}</b>`
-        + `：IBKR 只接受降低保证金的交易`);
+      alerts.push(riskAlertHtml("down", `净值低于组合保证金线 ${fmtK(-c.pm.gap)}`,
+        "IBKR 只接受降低保证金的交易"));
     } else if (c.pm && c.pm.level === "amber") {
-      parts.push(`<b class="amber">离组合保证金线只剩 ${fmtK(c.pm.gap)}</b>`
-        + `（净值再跌 ${fmtPct(c.pm.pct, 1)} 就破线）`);
+      alerts.push(riskAlertHtml("amber", `离组合保证金线只剩 ${fmtK(c.pm.gap)}`,
+        `净值再跌 ${fmtPct(c.pm.pct, 1)} 就破线`));
     }
     if (v.cashShort) {
-      parts.push(`<b class="down">${v.cashShort} 个到期周的卖 put 名义超过现金 + BOXX</b>`);
+      alerts.push(riskAlertHtml("down", `${v.cashShort} 个到期周的卖 put 名义超过现金 + BOXX`));
+    }
+    if (v.crossed.length) {
+      // riskVerdict words each as "<name> <ratio>"; a name may itself hold a
+      // space ("卖 put", "AI 硬件簇"), so only the last one separates them.
+      const rows = v.crossed.map(s => {
+        const at = s.lastIndexOf(" ");
+        return [s.slice(0, at), s.slice(at + 1)];
+      });
+      groups.push(riskGroupHtml("down", `超线 ${v.crossed.length} 项`, "只许替换，不许净新增", rows));
+    }
+    if (v.noncoreOver) {
+      groups.push(riskGroupHtml("down", `非核心超线 ${v.noncoreOver} 只`,
+        `全部 put 行权后超净值 ${fmtPct(cfg.noncore_assigned_max, 0)}，且不止 1 张`,
+        c.judge.noncore.filter(n => n.over).map(n => [`${n.u} ×${n.contracts}`, fmtPct(n.ratio, 1),
+          `现有仓位 ${fmtMoney(n.held)} + 卖 put 名义 ${fmtMoney(n.put)}`])));
     }
     // Every position at a line is named, however many: these are the ones
     // to act on, and a count would leave the reader to go and find them.
     const putsAt = (lvl) => c.stops.putHits.filter(p => p.level === lvl)
-      .map(p => `${esc(riskPutLabel(p))} ${fmtX(p.ratio)}`).join("、");
+      .map(p => [riskPutLabel(p), fmtX(p.ratio),
+                 `平仓 ${fmtMoney(p.close)} ÷ 卖出时收的权利金 ${fmtMoney(p.premium)}`]);
     if (v.putStops) {
-      parts.push(`<b class="down">止损线：${v.putStops} 张卖 put 平仓价达到权利金的 `
-        + `${+cfg.put_close_stop.toFixed(2)} 倍</b>（${putsAt("red")}）`);
+      groups.push(riskGroupHtml("down", `止损线：${v.putStops} 张卖 put`,
+        `平仓价达到权利金的 ${+cfg.put_close_stop.toFixed(2)} 倍`, putsAt("red")));
     }
     if (v.putWarns) {
-      parts.push(`<b class="amber">预警：${v.putWarns} 张卖 put 平仓价达到权利金的 `
-        + `${+cfg.put_close_warn.toFixed(2)} 倍</b>，该复盘 / 考虑 roll（${putsAt("amber")}）`);
+      groups.push(riskGroupHtml("amber", `预警：${v.putWarns} 张卖 put`,
+        `平仓价达到权利金的 ${+cfg.put_close_warn.toFixed(2)} 倍，该复盘 / 考虑 roll`, putsAt("amber")));
     }
     if (v.stockDrops) {
-      parts.push(`<b class="amber">${v.stockDrops} 只正股较持仓成本跌 ≥ ${fmtPct(cfg.stock_drop_warn, 0)}</b>（`
-        + c.stops.stockHits.map(s => `${esc(s.u)} ${fmtPct(s.ret, 1)}`).join("、") + "）");
+      groups.push(riskGroupHtml("amber", `${v.stockDrops} 只正股`,
+        `较持仓成本跌 ≥ ${fmtPct(cfg.stock_drop_warn, 0)}`,
+        c.stops.stockHits.map(s => [s.u, fmtPct(s.ret, 1),
+          `成本价 ${fmtMoney(s.cost, 2)}，现价 ${fmtMoney(s.price, 2)}`])));
     }
-    if (!parts.length) parts.push(`<span class="up">全部在线内</span>`);
+    const clear = alerts.length || groups.length ? "" : ` <span class="up">全部在线内</span>`;
     const icon = v.level === "red" ? "⛔" : v.level === "amber" ? "⚠" : "✓";
     const kind = c.kind ? ` <span class="muted">${RISK_KIND_LABEL[c.kind] || ""}</span>` : "";
-    return `<div class="risk-verdict-line ${v.level}"><span class="risk-verdict-icon">${icon}</span>`
-      + `<span><b>${esc(c.label)}</b>${kind}：${parts.join("；")}</span></div>`;
+    return `<div class="risk-verdict-card ${v.level}">`
+      + `<div class="risk-verdict-head"><span class="risk-verdict-icon">${icon}</span>`
+      + `<span><b>${esc(c.label)}</b>${kind}${clear}</span></div>`
+      + (alerts.length ? `<div class="risk-alerts">${alerts.join("")}</div>` : "")
+      + (groups.length ? `<div class="risk-groups">${groups.join("")}</div>` : "")
+      + `</div>`;
   });
-  $("risk-verdict").innerHTML = lines.join("");
+  $("risk-verdict").innerHTML = cards.join("");
   // Rendered whether or not the panel is folded, so unfolding and folding
   // never shows a stale line.
   $("risk-summary").innerHTML = cols.map(c => {
@@ -502,7 +574,7 @@ function renderRiskTable(cols, cfg) {
   const on = (c) => (cols.length > 1 && c.id === active ? " risk-active" : "");
   const cell = (c, html, tone = "", sub = "", tip = "") =>
     `<td class="num${on(c)}${tone ? ` ${tone}` : ""}"${tip ? ` title="${esc(tip)}"` : ""}>`
-    + `<b>${html}</b>${sub ? `<div class="risk-sub">${sub}</div>` : ""}</td>`;
+    + `${sub ? `<span class="risk-sub">${sub}</span>` : ""}<b>${html}</b></td>`;
   const blank = (c, text = "—", tip = "") =>
     `<td class="num muted${on(c)}"${tip ? ` title="${esc(tip)}"` : ""}>${text}</td>`;
   const row = (label, line, cells) =>
@@ -534,6 +606,17 @@ function renderRiskTable(cols, cfg) {
         : fmtK(top.notional);
       return cell(c, `${esc(top.u)} ${fmtX(top.ratio)}`, top.over ? "down" : "", sub);
     })));
+  rows.push(row("非核心行权后最大", `≤ ${fmtPct(cfg.noncore_assigned_max, 0)} 或只开 1 张`, cols.map(c => {
+    if (!cfg.core) return blank(c, "—", "核心持仓没读到");
+    // Per account: two accounts holding one contract each are both within it.
+    if (c.merged) return blank(c, "—", "按账户判：只开 1 张是每户自己的");
+    const [top, ...rest] = c.judge.noncore;
+    if (!top) return blank(c, "无");
+    const more = rest.filter(n => n.over).length;
+    return cell(c, `${esc(top.u)} ×${top.contracts} ${fmtPct(top.ratio, 1)}`, top.over ? "down" : "",
+      more ? `另 ${more} 只超线` : fmtK(top.total),
+      `现有仓位 ${fmtMoney(top.held)} + 卖 put 名义 ${fmtMoney(top.put)}`);
+  })));
   rows.push(row("AI 硬件簇 ÷ 净值", `≤ ${fmtX(cfg.cluster_nav_max)}`, cols.map(c => {
     const k = c.judge.cluster;
     if (k.ratio == null) return blank(c);
@@ -559,58 +642,10 @@ function renderRiskTable(cols, cfg) {
     cols.map(c => {
       if (!c.dd) return blank(c, "—", "净值序列不足 5 个点");
       const step = riskBreaker(c.dd, cfg);
-      const tag = step === 2 ? "只减不加" : step === 1 ? "停卖 put" : "";
       const peak = c.dd.peakDate === c.dd.lastDate ? "在窗口高点" : `高点 ${fmtMD(c.dd.peakDate)}`;
-      return cell(c, c.dd.dd < -0.0005 ? fmtPct(c.dd.dd, 1) : "0%", step ? "down" : "",
-        tag && !c.merged ? `<span class="tag tag-over">${tag}</span> ${peak}` : peak,
+      return cell(c, c.dd.dd < -0.0005 ? fmtPct(c.dd.dd, 1) : "0%", step ? "down" : "", peak,
         `${c.dd.rows} 个 NAV 行，截至 ${c.dd.lastDate}，剔除出入金`);
     })));
-  // Per position: the household column has nothing of its own to add, the
-  // account columns already hold every contract and every lot. A cell lists
-  // every position at a line, one per line — hits first, always: a 1x put
-  // line or a 0% stock line puts a position that has lost nothing on the
-  // line, and 全部浮盈 must not hide it. Only with no hits does a cell fall
-  // back to the worst position and how far it is from the line.
-  // [html, tone] per position: one put cell can hold a stop and a warning.
-  const items = (list) => list.map(([html, tone]) =>
-    `<span class="risk-item${tone ? ` ${tone}` : ""}">${html}</span>`).join("");
-  const STEP = { red: "止损", amber: "预警" };
-  rows.push(row("卖 put 平仓价 ÷ 权利金",
-    `≥ ${fmtX(cfg.put_close_warn)} 预警 · ≥ ${fmtX(cfg.put_close_stop)} 止损`, cols.map(c => {
-      if (!c.stops) return blank(c, "—", "按账户判：每张合约只属于一个账户");
-      const hits = c.stops.putHits;
-      const tip = (p) => `${riskPutLabel(p)}：平仓 ${fmtMoney(p.close)} ÷ 卖出时收的权利金 `
-        + `${fmtMoney(p.premium)}${STEP[p.level] ? `（${STEP[p.level]}）` : ""}`;
-      if (!hits.length) {
-        const [top] = c.stops.puts;
-        if (!top) return blank(c, "无");
-        if (!(top.ratio > 1)) return blank(c, "全部浮盈");
-        return cell(c, `${esc(riskPutLabel(top))} ${fmtX(top.ratio)}`, "",
-          `平仓 ${fmtK(top.close)} / 权利金 ${fmtK(top.premium)}`, tip(top));
-      }
-      const red = hits.filter(p => p.level === "red").length;
-      return cell(c,
-        items(hits.map(p => [`${esc(riskPutLabel(p))} ${fmtX(p.ratio)}`,
-                             p.level === "red" ? "down" : "amber"])),
-        red ? "down" : "amber",
-        [red && `${red} 张止损`, hits.length - red && `${hits.length - red} 张预警`]
-          .filter(Boolean).join(" · "),
-        hits.map(tip).join("\n"));
-    })));
-  rows.push(row("正股较持仓成本", `≤ −${fmtPct(cfg.stock_drop_warn, 0)} 报警`, cols.map(c => {
-    if (!c.stops) return blank(c, "—", "按账户判：成本按各账户自己的算");
-    const hits = c.stops.stockHits;
-    const tip = (s) => `${s.u}：成本价 ${fmtMoney(s.cost, 2)}，现价 ${fmtMoney(s.price, 2)}`;
-    if (!hits.length) {
-      const [top] = c.stops.stocks;
-      if (!top) return blank(c, "无");
-      if (!(top.ret < 0)) return blank(c, "全部浮盈");
-      return cell(c, `${esc(top.u)} ${fmtPct(top.ret, 1)}`, "",
-        `成本 ${fmtMoney(top.cost, 2)} → ${fmtMoney(top.price, 2)}`, tip(top));
-    }
-    return cell(c, items(hits.map(s => [`${esc(s.u)} ${fmtPct(s.ret, 1)}`, ""])), "amber",
-      `${hits.length} 只到线`, hits.map(tip).join("\n"));
-  })));
   const head = cols.map(c => `<th class="num${on(c)}">${esc(c.label)}`
     + (c.kind ? `<span class="th-sub">${RISK_KIND_LABEL[c.kind] || ""}</span>` : "")
     + `</th>`).join("");
@@ -662,6 +697,7 @@ function renderRiskCash(cols) {
 const RISK_FIELDS = [
   { key: "put_nav_max", label: "卖 put 名义 ÷ 净值", unit: "x", scale: 1 },
   { key: "single_put_nav_max", label: "单标的卖 put 名义 ÷ 净值", unit: "x", scale: 1 },
+  { key: "noncore_assigned_max", label: "非核心标的 put 全部行权后 ÷ 净值（只开 1 张不判）", unit: "%", scale: 100 },
   { key: "cluster_nav_max", label: "AI 硬件簇 ÷ 净值", unit: "x", scale: 1 },
   { key: "pm_floor", label: "组合保证金净值线", unit: "US$", scale: 1 },
   { key: "pm_warn", label: "离线缓冲预警（占净值）", unit: "%", scale: 100 },
