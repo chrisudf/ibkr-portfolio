@@ -218,6 +218,27 @@ def test_corrupt_position_settings_degrade_to_empty(tmp_path, monkeypatch):
     assert res.get_json()["symbols"] == {}
 
 
+def test_position_settings_flag_a_broken_file_but_not_a_missing_one(tmp_path, monkeypatch):
+    # The risk gate's non-core line treats read_error as "core list unknown".
+    # Without it a broken file would read as "nothing is core" and turn every
+    # name red; a fresh install with no file is a real, empty configuration.
+    import app as app_mod
+
+    path = tmp_path / ".position_settings.json"
+    monkeypatch.setattr(app_mod, "POSITION_SETTINGS_FILE", path)
+    client = app_mod.app.test_client()
+    read_error = lambda: client.get("/api/settings/positions").get_json()["read_error"]
+
+    assert read_error() is False                                     # missing
+    for broken in ("not json", "[]", '{"symbols": {"NVDA": {"max": 999}}}'):
+        path.write_text(broken, encoding="utf-8")
+        assert read_error() is True, broken
+    res = client.put("/api/settings/positions", json={"symbols": {"NVDA": {"core": True}}})
+    assert res.get_json()["read_error"] is False
+    assert "read_error" not in json.loads(path.read_text(encoding="utf-8"))
+    assert read_error() is False                                     # repaired by the save
+
+
 def test_settings_file_is_not_mistaken_for_an_account(tmp_path, monkeypatch):
     """The leading dot is load-bearing: uploads/*.json is the account sweep."""
     import app as app_mod
@@ -236,7 +257,7 @@ def test_position_settings_response_shape_is_stable(tmp_path, monkeypatch):
     path = tmp_path / ".position_settings.json"
     monkeypatch.setattr(app_mod, "POSITION_SETTINGS_FILE", path)
     client = app_mod.app.test_client()
-    keys = {"version", "symbols", "updated_at"}
+    keys = {"version", "symbols", "updated_at", "read_error"}
 
     assert set(client.get("/api/settings/positions").get_json()) == keys   # missing
     path.write_text("not json", encoding="utf-8")

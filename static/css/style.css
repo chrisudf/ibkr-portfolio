@@ -744,8 +744,8 @@ body.modal-open { overflow: hidden; }
   display: inline-block; width: 12px; font-size: 12px; color: var(--text-dim);
   transition: transform 0.15s;
 }
-#risk-panel.risk-collapsed .risk-chevron { transform: rotate(-90deg); }
-#risk-panel.risk-collapsed .panel-head { margin-bottom: 10px; }
+.risk-collapsed .risk-chevron { transform: rotate(-90deg); }
+.risk-collapsed .panel-head { margin-bottom: 10px; }
 
 /* Folded: one line per account. display:flex would beat the hidden
    attribute, hence the explicit rule. */
@@ -762,18 +762,41 @@ body.modal-open { overflow: hidden; }
 }
 .risk-legend b { color: var(--text-dim); font-weight: 600; }
 
-.risk-verdict { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+.risk-verdict { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
 .risk-verdict:empty { display: none; }
-.risk-verdict-line {
-  display: flex; gap: 10px; align-items: baseline;
-  padding: 9px 12px; border-radius: 10px;
+.risk-verdict-card {
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 10px 14px 12px; border-radius: 10px;
   font-size: 13px; line-height: 1.6;
   background: var(--panel-2); border-left: 3px solid var(--border);
 }
-.risk-verdict-line.red { border-left-color: var(--red); background: rgba(248, 113, 113, 0.08); }
-.risk-verdict-line.amber { border-left-color: var(--amber); background: rgba(251, 191, 36, 0.08); }
-.risk-verdict-line.ok { border-left-color: var(--green); }
+.risk-verdict-card.red { border-left-color: var(--red); background: rgba(248, 113, 113, 0.08); }
+.risk-verdict-card.amber { border-left-color: var(--amber); background: rgba(251, 191, 36, 0.08); }
+.risk-verdict-card.ok { border-left-color: var(--green); }
+.risk-verdict-card.profit { border-left-color: var(--green); background: rgba(74, 222, 128, 0.07); }
+.risk-verdict-head { display: flex; gap: 8px; align-items: baseline; }
 .risk-verdict-icon { flex: none; }
+
+.risk-alerts { display: flex; flex-direction: column; gap: 2px; }
+.risk-alert { display: flex; flex-wrap: wrap; gap: 0 10px; align-items: baseline; }
+.risk-alert b, .risk-group > b { font-weight: 600; }
+.risk-alert-note, .risk-group-note { color: var(--text-dim); font-size: 12px; }
+
+/* As many columns as fit, never stretched: a lone group would otherwise push
+   its figures a screen away from their names. Rows stay one name each. */
+.risk-groups {
+  display: grid; gap: 10px;
+  grid-template-columns: repeat(auto-fill, minmax(min(280px, 100%), 1fr));
+  align-items: start;
+}
+.risk-group { min-width: 0; padding: 8px 10px; border-radius: 8px; background: rgba(255, 255, 255, 0.03); }
+.risk-group-note { line-height: 1.4; margin-bottom: 6px; }
+.risk-group-rows { list-style: none; margin: 0; padding: 0; }
+.risk-group-rows li {
+  display: flex; justify-content: space-between; gap: 12px;
+  padding: 2px 0; border-top: 1px solid rgba(255, 255, 255, 0.05);
+}
+.risk-group-rows li > :last-child { flex: none; font-variant-numeric: tabular-nums; }
 
 table.risk-table th[scope="row"] {
   color: var(--text); font-size: 12.5px; font-weight: 600;
@@ -791,11 +814,11 @@ table.risk-table thead th .th-sub {
 table.risk-table td.num b { font-size: 14px; font-weight: 600; }
 table.risk-table td.down b { color: var(--red); }
 table.risk-table td.amber b { color: var(--amber); }
-.risk-sub { margin-top: 3px; font-size: 11px; color: var(--text-faint); white-space: nowrap; }
-.risk-sub .tag { margin-right: 4px; }
-/* One position per line in the per-position rows; a contract never breaks
-   between its label and its ratio. */
-.risk-item { display: block; white-space: nowrap; }
+.risk-sub { margin-right: 10px; font-size: 11px; color: var(--text-faint); white-space: nowrap; }
+.risk-rules > summary { cursor: pointer; font-size: 12.5px; color: var(--text-dim); }
+.risk-rules > summary .muted { margin-left: 6px; font-size: 12px; }
+.risk-rules[open] > summary { margin-bottom: 8px; }
+table.risk-table tbody th, table.risk-table tbody td { padding-top: 6px; padding-bottom: 6px; }
 /* The tab you are on — a highlight, not a filter. */
 table.risk-table .risk-active { background: rgba(107, 215, 255, 0.06); }
 table.risk-table thead th.risk-active { color: var(--accent); }

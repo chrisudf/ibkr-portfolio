@@ -1890,7 +1890,9 @@ function renderNavHistory(data) {
  * Core holdings & position caps
  *
  * Two decisions per underlying, set in the modal behind the topbar button:
- *   核心持仓 — a label: the treemap ring, the tag, sort priority. Not a rule.
+ *   核心持仓 — a label: the treemap ring, the tag, sort priority. No part of the
+ *              bands below; the only rule it feeds is the risk gate's non-core
+ *              line (risk.js).
  *   仓位区间 — the share of total assets it should sit between, both ends
  *              typed as free percentages and either one optional
  *

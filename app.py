@@ -331,27 +331,33 @@ def _normalize_position_settings(raw: dict) -> dict[str, dict]:
 # Every response carries the same keys — an absent updated_at on the empty
 # path and a present one on the success path would push a shape check into
 # the client for no reason.
-def _blank_position_settings() -> dict:
-    return {"version": 1, "symbols": {}, "updated_at": ""}
+def _blank_position_settings(read_error: bool = False) -> dict:
+    return {"version": 1, "symbols": {}, "updated_at": "", "read_error": read_error}
 
 
 def _read_position_settings() -> dict:
+    """The stored rules. read_error separates "the file is broken" from "nothing
+    configured": both answer with no symbols, but the risk gate's non-core line
+    must not read a broken file as "nothing is core" and turn every name red.
+    """
     try:
         with open(POSITION_SETTINGS_FILE, "r", encoding="utf-8") as f:
             stored = json.load(f)
+    except FileNotFoundError:
+        return _blank_position_settings()  # a fresh install, not a failure
     except (OSError, json.JSONDecodeError):
-        return _blank_position_settings()
+        return _blank_position_settings(read_error=True)
     if not isinstance(stored, dict):
-        return _blank_position_settings()
+        return _blank_position_settings(read_error=True)
     try:
         symbols = _normalize_position_settings(stored)
     except ValueError:
         # A hand-edited file that no longer validates must not take the
         # dashboard down — fall back to "nothing configured" and say so.
         app.logger.warning("position settings file is invalid; ignoring it")
-        return _blank_position_settings()
+        return _blank_position_settings(read_error=True)
     return {"version": 1, "symbols": symbols,
-            "updated_at": stored.get("updated_at") or ""}
+            "updated_at": stored.get("updated_at") or "", "read_error": False}
 
 
 @app.get("/api/settings/positions")
@@ -374,7 +380,7 @@ def put_position_settings():
         "symbols": symbols,
     }
     _atomic_write_json(POSITION_SETTINGS_FILE, payload, indent=2)
-    return jsonify(payload)
+    return jsonify({**payload, "read_error": False})
 
 
 # --- Risk gate settings: the lines the 风险闸门 panel judges against ---------
@@ -411,6 +417,8 @@ _RISK_LIMITS = {
     "put_close_warn": (1.0, 50.0, False),  # 卖 put 预警：平仓价 ÷ 权利金
     "put_close_stop": (1.0, 50.0, False),  # 卖 put 止损：平仓价 ÷ 权利金
     "stock_drop_warn": (0.0, 1.0, False),  # 正股较持仓成本的跌幅
+    "noncore_assigned_max": (0.0, 1.0, False),  # 非核心标的 put 全部行权后 ÷ 净值
+    "profit_take": (0.0, 1.0, False),      # 止盈提醒：单笔盈利 ÷ 成本
 }
 _ACCOUNT_KINDS = ("pm", "margin", "cash")
 _RISK_LABEL_MAX = 24
