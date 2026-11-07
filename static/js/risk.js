@@ -78,6 +78,7 @@ const RISK_DEFAULTS = {
   put_close_stop: 3.0,       // 卖 put 止损：平仓价达到 3 倍 → 红
   stock_drop_warn: 0.20,     // 正股较持仓成本跌到 −20% → 黄
   noncore_assigned_max: 0.10, // 非核心标的：全部 put 行权后的仓位 ÷ 净值
+  profit_take: 0.10,         // 止盈提醒：单笔持仓盈利达到 10%
 };
 
 // Names that gap together on an AI-capex scare, gated as one position.
@@ -339,6 +340,35 @@ function riskUnderwater(data, cfg) {
   };
 }
 
+// Positions at the take-profit line, grouped by underlying, best name first.
+// The figure is the 回报 column of the holdings tables: unrealized P/L over the
+// absolute cost, so a short call's cost is the premium it was sold for. On
+// the line counts, like the other position alarms. Long stock only, and no
+// cash equivalents: BOXX earning its yield is not a position to close. Calls
+// only for now: how puts should be judged is an open question (TODO.md).
+function riskProfits(data, cfg) {
+  const byU = {};
+  const add = (u, label, pl, cost) => {
+    const ret = (pl || 0) / cost;
+    if (ret < cfg.profit_take - RISK_EPS) return;
+    (byU[u] || (byU[u] = [])).push({ label, ret, pl: pl || 0, cost });
+  };
+  for (const s of data.stocks || []) {
+    if (CASH_EQUIVALENTS.has(s.symbol) || !(s.quantity > 0) || !(s.cost_basis > 0)) continue;
+    add(s.symbol, "持股", s.unrealized_pl, s.cost_basis);
+  }
+  for (const o of data.options || []) {
+    const u = o.underlying || o.symbol;
+    if (o.right !== "C" || CASH_EQUIVALENTS.has(u) || !o.quantity || !o.cost_basis) continue;
+    const side = o.quantity < 0 ? "卖" : "买";
+    add(u, `${side} ${riskContract({ ...o, qty: Math.abs(o.quantity) })}`,
+        o.unrealized_pl, Math.abs(o.cost_basis));
+  }
+  return Object.entries(byU)
+    .map(([u, rows]) => ({ u, rows: rows.sort((a, b) => b.ret - a.ret) }))
+    .sort((a, b) => b.rows[0].ret - a.rows[0].ret || a.u.localeCompare(b.u));
+}
+
 // The verdict for one account column. `breaker` is the step reached (0–2);
 // `stops` is riskUnderwater's read of the same account. A put at its stop is
 // red like a crossed line. A put at its first step, and a stock under its
@@ -408,10 +438,15 @@ const fmtMD = (iso) => (iso ? `${+iso.slice(5, 7)}/${+iso.slice(8, 10)}` : "");
 // "SOXL 11/6 80P ×2": a put ladder puts several contracts on one name, and
 // the expiry and strike are what tell its rungs apart.
 function riskPutLabel(p) {
+  return `${p.u} ${riskContract(p)}`;
+}
+
+// "11/6 80P ×2": the part of a contract's name that follows the ticker.
+function riskContract(p) {
   const ts = parseExpiryTs(p.expiry);
   const when = ts == null ? (p.expiry || "?")
     : `${new Date(ts).getUTCMonth() + 1}/${new Date(ts).getUTCDate()}`;
-  return `${p.u} ${when} ${p.strike || "?"}P${p.qty > 1 ? ` ×${p.qty}` : ""}`;
+  return `${when} ${p.strike || "?"}${p.right || "P"}${p.qty > 1 ? ` ×${p.qty}` : ""}`;
 }
 
 function riskAccountLabel(id, cfg) {
@@ -423,8 +458,8 @@ function renderRiskGate() {
   const panel = $("risk-panel");
   const accounts = currentDataRef.allAccounts || {};
   const all = Object.keys(accounts).sort();
-  if (!all.length) { panel.hidden = true; return; }
-  panel.hidden = false;
+  panel.hidden = $("profit-panel").hidden = !all.length;
+  if (!all.length) return;
 
   const scope = riskScope(all, currentDataRef.selected);
   const ids = scope.ids;
@@ -443,7 +478,7 @@ function renderRiskGate() {
     const weeks = kind === "cash" ? riskCashWeeks(a.options, book, todayTs, b.cashLike) : null;
     const stops = riskUnderwater(a, cfg);
     return { id, label: riskAccountLabel(id, cfg), kind, book: b, judge, dd, pm, weeks, stops,
-             verdict: riskVerdict(judge, dd, pm, weeks, cfg, stops) };
+             profits: riskProfits(a, cfg), verdict: riskVerdict(judge, dd, pm, weeks, cfg, stops) };
   });
   if (scope.merged) {
     const merged = mergeAccounts(accounts);
@@ -471,6 +506,7 @@ function renderRiskGate() {
       : "线是默认值、未正式采纳，可在「设置」里改");
 
   renderRiskVerdict(accountCols, cfg);
+  renderProfitPanel(accountCols, cfg);
   renderRiskTable(cols, cfg);
   renderRiskCash(accountCols);
 }
@@ -485,11 +521,31 @@ function riskAlertHtml(tone, title, note = "") {
 // down the names and the figures separately. `rows` are [name, figure, hover].
 function riskGroupHtml(tone, title, note, rows) {
   return `<section class="risk-group"><b class="${tone}">${title}</b>`
-    + `<div class="risk-group-note">${note}</div><ul class="risk-group-rows">`
+    + (note ? `<div class="risk-group-note">${note}</div>` : "") + `<ul class="risk-group-rows">`
     + rows.map(([name, figure, tip]) =>
         `<li${tip ? ` title="${esc(tip)}"` : ""}><span>${esc(name)}</span>`
         + `<span class="${tone}">${figure}</span></li>`).join("")
     + `</ul></section>`;
+}
+
+// Its own panel, one card per account: a reminder that something can be closed,
+// which says nothing about whether the next order may go in.
+function renderProfitPanel(cols, cfg) {
+  const count = (c) => c.profits.reduce((s, p) => s + p.rows.length, 0);
+  const brief = (c) => (count(c) ? `${count(c)} 笔到线` : "没有持仓到线");
+  $("profit-note").textContent = `单笔盈利 ≥ ${fmtPct(cfg.profit_take, 0)}`;
+  $("profit-list").innerHTML = cols.map(c => {
+    const groups = c.profits.map(p => riskGroupHtml("up", esc(p.u), "",
+      p.rows.map(r => [r.label, `+${fmtPct(r.ret, 1)}`,
+                       `浮盈 ${fmtMoney(r.pl)} ÷ 成本 ${fmtMoney(r.cost)}`])));
+    return `<div class="risk-verdict-card profit">`
+      + `<div class="risk-verdict-head"><span class="risk-verdict-icon">◎</span>`
+      + `<span><b>${esc(c.label)}</b> <span class="${count(c) ? "up" : "muted"}">${brief(c)}</span></span></div>`
+      + (groups.length ? `<div class="risk-groups">${groups.join("")}</div>` : "")
+      + `</div>`;
+  }).join("");
+  $("profit-summary").innerHTML = cols.map(c =>
+    `<span class="risk-sum ok">◎ <b>${esc(c.label)}</b>：${brief(c)}</span>`).join("");
 }
 
 function renderRiskVerdict(cols, cfg) {
@@ -707,6 +763,7 @@ const RISK_FIELDS = [
   { key: "put_close_warn", label: "卖 put 预警（平仓价 ÷ 权利金）", unit: "x", scale: 1 },
   { key: "put_close_stop", label: "卖 put 止损（平仓价 ÷ 权利金）", unit: "x", scale: 1 },
   { key: "stock_drop_warn", label: "正股较持仓成本跌幅报警", unit: "%", scale: 100 },
+  { key: "profit_take", label: "止盈提醒（单笔盈利达到）", unit: "%", scale: 100 },
 ];
 
 // toFixed round-trips: 0.1 × 100 is 10.000000000000002 in binary floating
@@ -854,33 +911,33 @@ function wireRiskModal() {
 // Folded or open is a per-device preference — a phone may want the gate shut
 // and the desk want it open — so it lives in this browser, unlike the lines,
 // which must read the same everywhere and are kept on the server.
-const RISK_FOLD_KEY = "ibkr.riskGate.collapsed";
-
-function applyRiskFold(collapsed) {
-  $("risk-panel").classList.toggle("risk-collapsed", collapsed);
-  $("risk-body").hidden = collapsed;
-  $("risk-summary").hidden = !collapsed;
-  $("risk-toggle").setAttribute("aria-expanded", String(!collapsed));
-}
-
-function wireRiskToggle() {
+function wirePanelFold(prefix, storageKey) {
+  const panel = $(`${prefix}-panel`), body = $(`${prefix}-body`);
+  const summary = $(`${prefix}-summary`), toggle = $(`${prefix}-toggle`);
+  const apply = (collapsed) => {
+    panel.classList.toggle("risk-collapsed", collapsed);
+    body.hidden = collapsed;
+    summary.hidden = !collapsed;
+    toggle.setAttribute("aria-expanded", String(!collapsed));
+  };
   let collapsed = false;
   try {
-    collapsed = localStorage.getItem(RISK_FOLD_KEY) === "1";
+    collapsed = localStorage.getItem(storageKey) === "1";
   } catch (_) { /* storage blocked: start open */ }
-  applyRiskFold(collapsed);
-  $("risk-toggle").addEventListener("click", () => {
+  apply(collapsed);
+  toggle.addEventListener("click", () => {
     collapsed = !collapsed;
-    applyRiskFold(collapsed);
+    apply(collapsed);
     try {
-      localStorage.setItem(RISK_FOLD_KEY, collapsed ? "1" : "0");
+      localStorage.setItem(storageKey, collapsed ? "1" : "0");
     } catch (_) { /* fine: it just won't be remembered */ }
   });
 }
 
 document.addEventListener("DOMContentLoaded", () => {
   wireRiskModal();
-  wireRiskToggle();
+  wirePanelFold("risk", "ibkr.riskGate.collapsed");
+  wirePanelFold("profit", "ibkr.profitPanel.collapsed");
   // Same guard as the position rules: the 设置 button ships disabled and only
   // a successful read enables it, so a failed GET can never lead to a save
   // that writes blanks over the stored lines. The panel itself still renders

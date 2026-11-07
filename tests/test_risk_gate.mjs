@@ -53,7 +53,8 @@ const consts = [
 const DASH_FNS = ["parseExpiryTs", "groupExpiries", "fundedSeries", "navStats"];
 const RISK_FNS = ["riskConfig", "riskNav", "riskBook", "mergeRiskBooks", "riskJudge",
                   "riskPmBuffer", "riskDrawdown", "riskBreaker", "riskCashWeeks",
-                  "riskUnderwater", "riskVerdict", "riskScope", "riskBrief", "riskPutLabel"];
+                  "riskUnderwater", "riskProfits", "riskVerdict", "riskScope", "riskBrief",
+                  "riskPutLabel", "riskContract"];
 const R = new Function(
   `${consts}\n`
   + DASH_FNS.map(n => extract(dash, "dashboard.js", n)).join("\n") + "\n"
@@ -590,6 +591,44 @@ test("非核心超线是红，收起那一行也要说；合并列是金额之�
   const merged = R.riskJudge(R.mergeRiskBooks(
     [a, b].map(x => R.riskBook(x, CORE_CFG, {}))), CORE_CFG);
   near(merged.noncore[0].ratio, 25000 / 400000);
+});
+
+// --- take-profit reminder --------------------------------------------------------------
+
+test("止盈：正股、买方和卖方 call 都按 浮盈 ÷ |成本|，同一标的放一起，最赚的在前；put 不算", () => {
+  const got = R.riskProfits({
+    stocks: [
+      { symbol: "QQQ", quantity: 10, cost_basis: 1000, unrealized_pl: 150 },    // ETF +15%
+      { symbol: "ROKU", quantity: 10, cost_basis: 1000, unrealized_pl: 200 },   // +20%
+      { symbol: "PLTR", quantity: 10, cost_basis: 1000, unrealized_pl: 50 },    // +5%，不到线
+    ],
+    options: [
+      call("ROKU", "20NOV26", 60, -2, { cost_basis: -400, unrealized_pl: 300 }), // 卖方 +75%
+      call("ROKU", "15JAN27", 60, 1, { cost_basis: 500, unrealized_pl: -100 }), // 亏钱
+      call("TSLA", "15JAN27", 300, 1, { cost_basis: 1000, unrealized_pl: 500 }), // 买方 +50%
+      put("NFLX", "20NOV26", 50, -1, { cost_basis: -400, unrealized_pl: 300 }),  // 卖 put 不算
+      put("SPY", "20NOV26", 500, 1, { cost_basis: 400, unrealized_pl: 300 }),    // 买 put 不算
+    ],
+  }, CFG);
+  assert.deepEqual(got.map(g => g.u), ["ROKU", "TSLA", "QQQ"]);
+  assert.deepEqual(got[0].rows.map(r => r.label), ["卖 11/20 60C ×2", "持股"]);
+  near(got[0].rows[0].ret, 0.75);
+  assert.equal(got[1].rows[0].label, "买 1/15 300C");
+});
+
+test("止盈：正好到线算；线走配置；现金等价物、空头正股、没有成本的都不算", () => {
+  const stock = (symbol, pl, extra = {}) =>
+    ({ symbol, quantity: 10, cost_basis: 1000, unrealized_pl: pl, ...extra });
+  assert.equal(R.riskProfits({ stocks: [stock("ROKU", 100)] }, CFG).length, 1);
+  assert.equal(R.riskProfits({ stocks: [stock("ROKU", 99)] }, CFG).length, 0);
+  assert.equal(R.riskProfits({ stocks: [stock("ROKU", 100)] },
+    R.riskConfig({ thresholds: { profit_take: 0.2 } })).length, 0);
+  assert.deepEqual(R.riskProfits({
+    stocks: [stock("BOXX", 500), stock("ROKU", 500, { quantity: -10, cost_basis: -1000 }),
+             stock("PLTR", 500, { cost_basis: 0 })],
+    options: [call("BOXX", "20NOV26", 100, -1, { cost_basis: -10, unrealized_pl: 9 }),
+              call("VRT", "20NOV26", 100, -1, { cost_basis: 0, unrealized_pl: 9 })],
+  }, CFG), []);
 });
 
 // --- wiring ----------------------------------------------------------------------------

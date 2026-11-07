@@ -74,6 +74,7 @@ def test_position_alarm_lines():
     assert norm({"thresholds": {"put_close_stop": 1.5}})["thresholds"] == {"put_close_stop": 1.5}
     assert norm({"thresholds": {"noncore_assigned_max": 0.15}})["thresholds"] == {
         "noncore_assigned_max": 0.15}
+    assert norm({"thresholds": {"profit_take": 0.25}})["thresholds"] == {"profit_take": 0.25}
     with pytest.raises(ValueError, match="put_close_stop"):
         norm({"thresholds": {"put_close_warn": 3, "put_close_stop": 2}})
 
@@ -91,6 +92,7 @@ def test_position_alarm_lines():
     {"thresholds": {"put_close_warn": 0.9}},
     {"thresholds": {"stock_drop_warn": 20}},           # percent typed as a fraction
     {"thresholds": {"noncore_assigned_max": 10}},      # percent typed as a fraction
+    {"thresholds": {"profit_take": 10}},               # percent typed as a fraction
     {"thresholds": {"put_nav_max": True}},             # bool is not a number here
     {"thresholds": {"put_nav_max": "abc"}},
     {"thresholds": {"put_nav_max": float("nan")}},

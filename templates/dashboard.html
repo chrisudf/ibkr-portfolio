@@ -123,6 +123,25 @@
         </div>
       </section>
 
+      <!-- Take-profit reminders. Apart from the gate because they say what can
+           be closed, not whether the next order may go in. -->
+      <section class="panel" id="profit-panel" hidden>
+        <div class="panel-head">
+          <h2 class="risk-title">
+            <button id="profit-toggle" class="risk-toggle" type="button"
+                    aria-expanded="true" aria-controls="profit-body" title="收起 / 展开">
+              <span class="risk-chevron" aria-hidden="true">▾</span>止盈提醒
+            </button>
+            <span class="panel-note" id="profit-note"></span>
+          </h2>
+        </div>
+        <div class="risk-summary" id="profit-summary" hidden></div>
+        <div id="profit-body">
+          <div class="risk-verdict" id="profit-list"></div>
+          <div class="margin-foot">正股、ETF、call 按单笔持仓和账户判，盈利就是持仓表的「回报」，卖出的 call 按权利金算，put 暂不判。只是提醒，不改风险闸门的结论；线在风险闸门的「设置」里改。</div>
+        </div>
+      </section>
+
       <!-- NAV history -->
       <section class="panel" id="nav-history-panel" hidden>
         <div class="panel-head">

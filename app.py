@@ -412,6 +412,7 @@ _RISK_LIMITS = {
     "put_close_stop": (1.0, 50.0, False),  # 卖 put 止损：平仓价 ÷ 权利金
     "stock_drop_warn": (0.0, 1.0, False),  # 正股较持仓成本的跌幅
     "noncore_assigned_max": (0.0, 1.0, False),  # 非核心标的 put 全部行权后 ÷ 净值
+    "profit_take": (0.0, 1.0, False),      # 止盈提醒：单笔盈利 ÷ 成本
 }
 _ACCOUNT_KINDS = ("pm", "margin", "cash")
 _RISK_LABEL_MAX = 24
