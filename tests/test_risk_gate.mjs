@@ -578,6 +578,17 @@ test("核心持仓没读到就不判：不能因为读取失败把所有标的�
     options: [put("ROKU", "20NOV26", 50, -1)] }, R.riskConfig(null, null));
   assert.deepEqual(j.noncore, []);
   assert.equal(R.riskVerdict(j, null, null, null, CFG).noncoreOver, 0);
+  // 服务端读文件失败时也回 200 和空配置：read_error 不能被当成「什么都不是核心」
+  assert.equal(R.riskConfig(null, { symbols: {}, read_error: true }).core, null);
+  // 真的没配置就是空集合，所有标的都算非核心
+  assert.equal(R.riskConfig(null, { symbols: {}, read_error: false }).core.size, 0);
+});
+
+test("没有净值就没有比值：非核心线不报超线，比值留 null 而不是 0", () => {
+  const j = judgeNoncore({ nav: { total: 0 }, stocks: [],
+    options: [put("ROKU", "20NOV26", 25, -2)] });
+  assert.equal(j.noncore[0].ratio, null);
+  assert.equal(j.noncore[0].over, false);
 });
 
 test("非核心超线是红，收起那一行也要说；合并列是金额之和 ÷ 净值之和", () => {

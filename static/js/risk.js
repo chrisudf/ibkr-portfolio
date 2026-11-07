@@ -98,9 +98,10 @@ const RISK_EPS = 1e-9;
 // holds. Anything unreadable falls back to the default rather than to 0 —
 // a line of 0 would turn the whole table red for no reason.
 //
-// `positions` is the 核心持仓 settings. Without them (not loaded, or the read
-// failed) cfg.core is null and the non-core line is not judged: every name
-// would otherwise read as non-core and light up on a failed fetch.
+// `positions` is the 核心持仓 settings. Without them (not loaded, the request
+// failed, or the server could not read its file: read_error) cfg.core is null
+// and the non-core line is not judged: every name would otherwise read as
+// non-core and light up because of a broken file.
 function riskConfig(stored, positions) {
   const s = stored || {};
   const cfg = { ...RISK_DEFAULTS };
@@ -117,7 +118,7 @@ function riskConfig(stored, positions) {
   cfg.cluster = Array.isArray(s.cluster) ? s.cluster : RISK_CLUSTER;
   cfg.watch = Array.isArray(s.watch) ? s.watch : RISK_WATCH;
   cfg.accounts = s.accounts || {};
-  cfg.core = positions
+  cfg.core = positions && !positions.read_error
     ? new Set(Object.entries(positions.symbols || {}).filter(([, p]) => p && p.core).map(([u]) => u))
     : null;
   return cfg;
@@ -668,6 +669,7 @@ function renderRiskTable(cols, cfg) {
     if (c.merged) return blank(c, "—", "按账户判：只开 1 张是每户自己的");
     const [top, ...rest] = c.judge.noncore;
     if (!top) return blank(c, "无");
+    if (top.ratio == null) return blank(c);
     const more = rest.filter(n => n.over).length;
     return cell(c, `${esc(top.u)} ×${top.contracts} ${fmtPct(top.ratio, 1)}`, top.over ? "down" : "",
       more ? `另 ${more} 只超线` : fmtK(top.total),
