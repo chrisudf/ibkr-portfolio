@@ -134,11 +134,18 @@
             </button>
             <span class="panel-note" id="profit-note"></span>
           </h2>
+          <div class="risk-head-right">
+            <button id="target-btn" class="ghost-btn risk-btn" type="button" disabled title="读取目标价中…">目标价</button>
+          </div>
         </div>
         <div class="risk-summary" id="profit-summary" hidden></div>
         <div id="profit-body">
+          <div class="profit-nudge" id="profit-nudge" hidden>
+            <span>这些杠杆 ETF 没有待触发的目标价：<b id="profit-nudge-list"></b></span>
+            <button id="profit-nudge-btn" class="ghost-btn risk-btn" type="button">去设置</button>
+          </div>
           <div class="risk-verdict" id="profit-list"></div>
-          <div class="margin-foot">正股、ETF、call 按单笔持仓和账户判，盈利就是持仓表的「回报」，卖出的 call 按权利金算，put 暂不判。只是提醒，不改风险闸门的结论；线在风险闸门的「设置」里改。</div>
+          <div class="margin-foot">正股、ETF、call 按单笔持仓和账户判，盈利就是持仓表的「回报」，卖出的 call 按权利金算，put 暂不判。设了目标价的正股不走这条线：按收盘价判，到价后一直显示，直到这个账户减仓，或者在「目标价」里改掉、删掉这一档。只是提醒，不会下单，也不改风险闸门的结论；10% 线在风险闸门的「设置」里改。</div>
         </div>
       </section>
 
@@ -532,6 +539,45 @@
         <button id="risk-reset" class="ghost-btn" type="button">线全部恢复默认</button>
         <button id="risk-cancel" class="ghost-btn" type="button">取消</button>
         <button id="risk-save" class="primary-btn" type="button">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="target-modal" class="modal-backdrop" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="target-modal-title">
+      <div class="modal-head">
+        <h2 id="target-modal-title">止盈目标价</h2>
+        <button id="target-modal-close" class="modal-close" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-note">
+        填正股 / ETF 的价格，最多 3 档，从低到高，留空就是不设；所有账户共用一套。
+        <b>只按收盘价判</b>，到价后一直显示，直到这个账户减仓，或者你在这里改掉、删掉这一档。
+        改过的价格从今天重新算；清仓后这组目标价作废，再开仓要重填。
+        存在服务器上（<code>uploads/.profit_targets.json</code>），手机和电脑看到的是同一套。
+      </div>
+      <div class="modal-tools target-add">
+        <div class="risk-input">
+          <input type="text" id="target-add-symbol" maxlength="16" placeholder="代码" aria-label="添加标的代码" />
+        </div>
+        <button id="target-add" class="ghost-btn risk-btn" type="button">添加标的</button>
+        <span class="modal-tools-label">还没持有也能先填，下单时顺手写</span>
+      </div>
+      <div class="modal-body">
+        <table class="holdings pos-table target-table">
+          <thead>
+            <tr><th>标的<span class="th-sub">最新收盘价</span></th><th>第 1 档</th><th>第 2 档</th><th>第 3 档</th></tr>
+          </thead>
+          <tbody id="target-body"></tbody>
+        </table>
+        <h3 class="risk-form-title">杠杆 ETF 名单<span class="th-sub">这些标的持有却没有待触发的目标价时，面板会提醒；留空用默认名单</span></h3>
+        <div class="risk-form target-levered">
+          <textarea id="target-levered" class="risk-text" rows="2" aria-label="杠杆 ETF 名单"></textarea>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <span class="modal-status" id="target-status"></span>
+        <button id="target-cancel" class="ghost-btn" type="button">取消</button>
+        <button id="target-save" class="primary-btn" type="button">保存</button>
       </div>
     </div>
   </div>

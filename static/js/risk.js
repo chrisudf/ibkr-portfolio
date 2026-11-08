@@ -57,9 +57,9 @@
  * on it.
  *
  * Loaded after dashboard.js and leans on its helpers ($, esc, fmtMoney,
- * fmtPct, maskAccountId, currentDataRef, buildPriceBook, groupExpiries,
- * parseExpiryTs, fundedSeries, navStats, mergeAccounts, showToast, DAY_MS,
- * CASH_EQUIVALENTS, CONTRACT_MULTIPLIER).
+ * fmtPct, maskAccountId, currentDataRef, buildPriceBook, allUnderlyings,
+ * groupExpiries, parseExpiryTs, fundedSeries, navStats, mergeAccounts,
+ * showToast, DAY_MS, CASH_EQUIVALENTS, CONTRACT_MULTIPLIER).
  * ------------------------------------------------------------------------- */
 
 // The proposed lines. A blank box in the 设置 dialog means "this value".
@@ -86,6 +86,9 @@ const RISK_CLUSTER = ["SOXL", "SOXX", "SMH", "NVDA", "NVDL", "AVGO", "COHR",
                       "LITE", "LITX", "VRT", "MU", "TSM"];
 // Underlyings with a 单标的 row of their own, whatever their size.
 const RISK_WATCH = ["SOXL"];
+// Held without a take-profit target, these get called out in 止盈提醒: they give
+// a gain back fastest. A default, like the cluster; the 目标价 dialog replaces it.
+const PROFIT_LEVERED = ["CONL", "ECHX", "ETHU", "GGLL", "LITX", "METU", "NVDL", "SOXL"];
 
 const RISK_KIND_LABEL = { pm: "组合保证金", margin: "Reg-T 保证金", cash: "现金户" };
 
@@ -347,7 +350,12 @@ function riskUnderwater(data, cfg) {
 // the line counts, like the other position alarms. Long stock only, and no
 // cash equivalents: BOXX earning its yield is not a position to close. Calls
 // only for now: how puts should be judged is an open question (TODO.md).
-function riskProfits(data, cfg) {
+//
+// `planned` is the names with a live target plan here (riskTargets). Their
+// shares leave this line: a plan says where you mean to act, and a leveraged
+// ETF reaches 10% in a day, so the generic line would bury it. Calls stay on,
+// because the plan is written in the share price.
+function riskProfits(data, cfg, planned) {
   const byU = {};
   const add = (u, label, pl, cost) => {
     const ret = (pl || 0) / cost;
@@ -356,6 +364,7 @@ function riskProfits(data, cfg) {
   };
   for (const s of data.stocks || []) {
     if (CASH_EQUIVALENTS.has(s.symbol) || !(s.quantity > 0) || !(s.cost_basis > 0)) continue;
+    if (planned && planned.has(s.symbol)) continue;
     add(s.symbol, "持股", s.unrealized_pl, s.cost_basis);
   }
   for (const o of data.options || []) {
@@ -368,6 +377,72 @@ function riskProfits(data, cfg) {
   return Object.entries(byU)
     .map(([u, rows]) => ({ u, rows: rows.sort((a, b) => b.ret - a.ret) }))
     .sort((a, b) => b.rows[0].ret - a.rows[0].ret || a.u.localeCompare(b.u));
+}
+
+// One account's take-profit plans, read against what it holds today. The server
+// has done the history (parser/targets.py): which tiers have been reached since
+// they were set, and whether the account has sold since. What is left is today's
+// close against each tier, and what the panel should say about it.
+//
+// `known` false means the plans or their history could not be read. Nothing is
+// judged then, and every name stays on the 10% line, so a broken file cannot
+// silently take a position out of the reminders.
+//
+// Per tier: "hit" reached and still at or above it, "fell" reached and back
+// under it, "next" not reached. A tier this account has sold into is done and
+// drops out. A name is only listed once a tier has been reached, like every
+// other line here; the rest of its tiers come along to show what is left.
+//   active  plans still in play here: their shares leave the 10% line
+//   blocked plans on file that cannot be judged here, and say why
+//   missing leveraged ETFs held with nothing left to reach
+function riskTargets(data, acctId, plans, progress, levered) {
+  const out = { known: false, active: new Set(), groups: [], blocked: [], missing: [] };
+  if (!plans || plans.read_error) return out;
+  const symbols = plans.symbols || {};
+  if (progress == null && Object.keys(symbols).length) return out;
+  out.known = true;
+  const spots = {};
+  for (const s of data.stocks || []) {
+    if (s.quantity > 0) spots[s.symbol] = s.close_price;
+  }
+  const longCalls = new Set((data.options || [])
+    .filter(o => o.quantity > 0 && o.right === "C").map(o => o.underlying || o.symbol));
+  for (const [u, plan] of Object.entries(symbols)) {
+    const p = (progress || {})[u];
+    if (!p || p.state === "expired") continue;
+    if (p.state === "split") {
+      if (u in spots) out.blocked.push({ u, why: "split", on: p.split_on });
+      continue;
+    }
+    // Only an account holding the shares is judged. Calls here with no shares
+    // say so, or the plan would look like it was watching them.
+    if (!(u in spots)) {
+      if (longCalls.has(u)) out.blocked.push({ u, why: "no-stock" });
+      continue;
+    }
+    const spot = spots[u];
+    const read = (p.accounts || {})[acctId] || [];
+    const rows = (plan.tiers || []).map((t, i) => {
+      const r = read[i] || {};
+      const gap = spot > 0 ? spot / t.price - 1 : null;
+      return {
+        n: i + 1, price: t.price, reduced: !!r.reduced,
+        state: !r.reached ? "next" : gap != null && gap < -RISK_EPS ? "fell" : "hit",
+        gap, toGo: spot > 0 ? t.price / spot - 1 : null,
+        hitOn: r.hit_on, hitClose: r.hit_close, peakOn: r.peak_on, peakClose: r.peak_close,
+      };
+    }).filter(r => !r.reduced);
+    if (rows.length) out.active.add(u);
+    const hits = rows.filter(r => r.state !== "next").length;
+    if (hits) {
+      out.groups.push({ u, spot, rows, hits, fell: rows.filter(r => r.state === "fell").length });
+    }
+  }
+  out.groups.sort((a, b) => b.fell - a.fell || b.hits - a.hits || a.u.localeCompare(b.u));
+  const blocked = new Set(out.blocked.map(b => b.u));
+  out.missing = (levered || [])
+    .filter(u => u in spots && !out.active.has(u) && !blocked.has(u)).sort();
+  return out;
 }
 
 // The verdict for one account column. `breaker` is the step reached (0–2);
@@ -469,6 +544,8 @@ function renderRiskGate() {
   // is a market fact, and a LEAP held here may be priced by stock held there.
   const book = buildPriceBook(accounts);
   const todayTs = Date.now();
+  const plans = currentDataRef.profitTargets;
+  const levered = plans && Array.isArray(plans.levered) ? plans.levered : PROFIT_LEVERED;
   const cols = ids.map(id => {
     const a = accounts[id];
     const b = riskBook(a, cfg, book);
@@ -478,8 +555,10 @@ function renderRiskGate() {
     const pm = kind === "pm" ? riskPmBuffer(b.nav, cfg.pm_floor, cfg.pm_warn) : null;
     const weeks = kind === "cash" ? riskCashWeeks(a.options, book, todayTs, b.cashLike) : null;
     const stops = riskUnderwater(a, cfg);
+    const targets = riskTargets(a, id, plans, currentDataRef.targetProgress, levered);
     return { id, label: riskAccountLabel(id, cfg), kind, book: b, judge, dd, pm, weeks, stops,
-             profits: riskProfits(a, cfg), verdict: riskVerdict(judge, dd, pm, weeks, cfg, stops) };
+             targets, profits: riskProfits(a, cfg, targets.active),
+             verdict: riskVerdict(judge, dd, pm, weeks, cfg, stops) };
   });
   if (scope.merged) {
     const merged = mergeAccounts(accounts);
@@ -519,34 +598,95 @@ function riskAlertHtml(tone, title, note = "") {
 }
 
 // A rule and everything at its line, one name to a row, so the eye can run
-// down the names and the figures separately. `rows` are [name, figure, hover].
+// down the names and the figures separately. `rows` are [name, figure, hover],
+// with an optional tone of the row's own where a group holds more than one.
 function riskGroupHtml(tone, title, note, rows) {
   return `<section class="risk-group"><b class="${tone}">${title}</b>`
     + (note ? `<div class="risk-group-note">${note}</div>` : "") + `<ul class="risk-group-rows">`
-    + rows.map(([name, figure, tip]) =>
-        `<li${tip ? ` title="${esc(tip)}"` : ""}><span>${esc(name)}</span>`
-        + `<span class="${tone}">${figure}</span></li>`).join("")
+    + rows.map(([name, figure, tip, rowTone]) =>
+        `<li${tip ? ` title="${esc(tip)}"` : ""}${rowTone === "muted" ? ` class="muted"` : ""}>`
+        + `<span>${esc(name)}</span><span class="${rowTone || tone}">${figure}</span></li>`).join("")
     + `</ul></section>`;
+}
+
+// "$30", "$2.875": a target as it was typed, with no padding to two decimals.
+const fmtTarget = (v) => `$${+Number(v).toFixed(4)}`;
+
+// One tier as a row of its name's group.
+function riskTargetRow(r) {
+  const name = `第 ${r.n} 档 ${fmtTarget(r.price)}`;
+  if (r.state === "next") {
+    return [name, r.toGo == null ? "" : `还差 +${fmtPct(r.toGo, 1)}`, "", "muted"];
+  }
+  const first = r.hitOn ? `${fmtMD(r.hitOn)} 收盘 ${fmtTarget(r.hitClose)} 到价` : "已到价";
+  const peak = r.peakClose > r.hitClose
+    ? `，之后最高 ${fmtTarget(r.peakClose)}${r.peakOn ? `（${fmtMD(r.peakOn)}）` : ""}` : "";
+  const tip = `${first}${peak}。这一档一直显示，直到这个账户减仓，或者在「目标价」里改掉、删掉它`;
+  const label = r.hitOn ? `${name} · ${fmtMD(r.hitOn)} 到价` : `${name} · 已到价`;
+  return r.state === "fell"
+    ? [label, `已跌回 ${fmtPct(r.gap, 1)}`, tip, "amber"]
+    : [label, `高出 ${fmtPct(r.gap, 1)}`, tip, "up"];
+}
+
+// A plan on file this account cannot judge, as a row of its name's group.
+function riskBlockedRow(b) {
+  return b.why === "split"
+    ? ["目标价要重填", `${fmtMD(b.on)} 拆股`,
+       "拆股后价格单位变了，这组目标价不再判。到「目标价」里重填", "amber"]
+    : ["目标价未判", "这个账户没有正股",
+       "目标价只判持有正股 / ETF 的账户。这里只有 call，call 的盈利照旧走 10% 线", "muted"];
+}
+
+// Every name with something to say in one account. A name's tiers and its
+// positions at the 10% line share one group, tiers first: the plan you wrote
+// outranks the generic line, and a name that has fallen back past a reached
+// tier outranks everything, so those lead.
+function riskProfitGroups(c) {
+  const lines = new Map(c.profits.map(p => [p.u, p.rows]));
+  const lineRow = (r) => [r.label, `+${fmtPct(r.ret, 1)}`,
+                          `浮盈 ${fmtMoney(r.pl)} ÷ 成本 ${fmtMoney(r.cost)}`, "up"];
+  const take = (u) => {
+    const rows = lines.get(u) || [];
+    lines.delete(u);
+    return rows.map(lineRow);
+  };
+  const groups = c.targets.groups.map(g => riskGroupHtml(g.fell ? "amber" : "up", esc(g.u),
+    `现价 ${fmtMoney(g.spot, 2)}`, [...g.rows.map(riskTargetRow), ...take(g.u)]));
+  for (const b of c.targets.blocked) {
+    groups.push(riskGroupHtml(b.why === "split" ? "amber" : "up", esc(b.u), "",
+      [riskBlockedRow(b), ...take(b.u)]));
+  }
+  for (const p of c.profits) {
+    if (lines.has(p.u)) groups.push(riskGroupHtml("up", esc(p.u), "", take(p.u)));
+  }
+  return groups;
 }
 
 // Its own panel, one card per account: a reminder that something can be closed,
 // which says nothing about whether the next order may go in.
 function renderProfitPanel(cols, cfg) {
-  const count = (c) => c.profits.reduce((s, p) => s + p.rows.length, 0);
-  const brief = (c) => (count(c) ? `${count(c)} 笔到线` : "没有持仓到线");
-  $("profit-note").textContent = `单笔盈利 ≥ ${fmtPct(cfg.profit_take, 0)}`;
+  const lines = (c) => c.profits.reduce((s, p) => s + p.rows.length, 0);
+  const hits = (c) => c.targets.groups.reduce((s, g) => s + g.hits, 0);
+  const fell = (c) => c.targets.groups.some(g => g.fell);
+  const brief = (c) => [hits(c) && `${hits(c)} 档到价`, lines(c) && `${lines(c)} 笔到线`]
+    .filter(Boolean).join(" · ") || "没有持仓到线";
+  const tone = (c) => (fell(c) ? "amber" : hits(c) || lines(c) ? "up" : "muted");
+  const known = cols.every(c => c.targets.known);
+  $("profit-note").textContent = `单笔盈利 ≥ ${fmtPct(cfg.profit_take, 0)}`
+    + (known ? " · 目标价按收盘判" : " · 目标价没读到，未判");
+  const missing = known ? [...new Set(cols.flatMap(c => c.targets.missing))].sort() : [];
+  $("profit-nudge").hidden = !missing.length;
+  $("profit-nudge-list").textContent = missing.join("、");
   $("profit-list").innerHTML = cols.map(c => {
-    const groups = c.profits.map(p => riskGroupHtml("up", esc(p.u), "",
-      p.rows.map(r => [r.label, `+${fmtPct(r.ret, 1)}`,
-                       `浮盈 ${fmtMoney(r.pl)} ÷ 成本 ${fmtMoney(r.cost)}`])));
+    const groups = riskProfitGroups(c);
     return `<div class="risk-verdict-card profit">`
       + `<div class="risk-verdict-head"><span class="risk-verdict-icon">◎</span>`
-      + `<span><b>${esc(c.label)}</b> <span class="${count(c) ? "up" : "muted"}">${brief(c)}</span></span></div>`
+      + `<span><b>${esc(c.label)}</b> <span class="${tone(c)}">${brief(c)}</span></span></div>`
       + (groups.length ? `<div class="risk-groups">${groups.join("")}</div>` : "")
       + `</div>`;
   }).join("");
   $("profit-summary").innerHTML = cols.map(c =>
-    `<span class="risk-sum ok">◎ <b>${esc(c.label)}</b>：${brief(c)}</span>`).join("");
+    `<span class="risk-sum ${fell(c) ? "amber" : "ok"}">◎ <b>${esc(c.label)}</b>：${brief(c)}</span>`).join("");
 }
 
 function renderRiskVerdict(cols, cfg) {
@@ -908,6 +1048,219 @@ function wireRiskModal() {
   });
 }
 
+/* --- The take-profit target dialog ---------------------------------------- */
+
+// The dialog's draft: one row per symbol, each box exactly as typed. Rows keep
+// their order while it is open, so nothing moves under the cursor; nothing is
+// written until 保存.
+let targetDraft = null;
+
+const TARGET_TIERS = 3;
+const TARGET_SYMBOL_RE = /^[A-Z0-9][A-Z0-9.\-]{0,15}$/;
+
+// What is wrong with one row, or "". Blank boxes are fine, and a gap closes up:
+// typing only the first and third box is a plan of two tiers. The server refuses
+// the same cases, but a 400 is a worse way to find out than a line in the dialog.
+function targetRowProblem(sym, boxes) {
+  let last = 0;
+  for (let i = 0; i < boxes.length; i++) {
+    const t = String(boxes[i]).trim();
+    if (!t) continue;
+    const n = Number(t);
+    if (!Number.isFinite(n) || n <= 0) return `${sym}：第 ${i + 1} 档要填大于 0 的价格`;
+    if (n <= last) return `${sym}：第 ${i + 1} 档要比前一档高`;
+    last = n;
+  }
+  return "";
+}
+
+// A target at or under the market is legal, and it is reached the moment it is
+// saved. Worth saying while typing: it is also what a typo looks like.
+function targetRowWarning(sym, boxes, spot) {
+  if (!(spot > 0)) return "";
+  for (let i = 0; i < boxes.length; i++) {
+    const t = String(boxes[i]).trim();
+    if (t && Number(t) > 0 && Number(t) <= spot) {
+      return `${sym} 第 ${i + 1} 档 ${fmtTarget(t)} 不高于现价 ${fmtTarget(spot)}，保存后马上算到价`;
+    }
+  }
+  return "";
+}
+
+// A row's plan is live unless the position it was written for has ended.
+function targetIsLive(plan, progress) {
+  return !!plan && !["expired", "split"].includes((progress || {}).state);
+}
+
+// Every account holding the name has sold into every tier: the plan is still
+// valid, it just has nothing left to wait for.
+function targetAllReduced(progress) {
+  const reads = Object.values((progress || {}).accounts || {});
+  return reads.length > 0 && reads.every(tiers => tiers.length > 0 && tiers.every(t => t.reduced));
+}
+
+function openTargetModal() {
+  const stored = currentDataRef.profitTargets || {};
+  const symbols = stored.symbols || {};
+  const allProgress = currentDataRef.targetProgress || {};
+  const spots = buildPriceBook(currentDataRef.allAccounts || {});
+  const levered = new Set(Array.isArray(stored.levered) ? stored.levered : PROFIT_LEVERED);
+  // What still needs a decision comes first, then what has one, then the rest.
+  const rank = (u) => {
+    const live = targetIsLive(symbols[u], allProgress[u]);
+    const waiting = live && !targetAllReduced(allProgress[u]);
+    return levered.has(u) && spots[u] > 0 && !waiting ? 0 : live ? 1 : 2;
+  };
+  const universe = [...new Set([...allUnderlyings(), ...Object.keys(symbols)])];
+  targetDraft = universe
+    .sort((a, b) => rank(a) - rank(b) || a.localeCompare(b))
+    .map(sym => {
+      const live = targetIsLive(symbols[sym], allProgress[sym]);
+      const tiers = live ? symbols[sym].tiers : [];
+      return { sym, boxes: Array.from({ length: TARGET_TIERS },
+                                      (_, i) => (tiers[i] ? String(tiers[i].price) : "")) };
+    });
+  $("target-levered").value = (stored.levered || []).join(", ");
+  $("target-levered").placeholder = PROFIT_LEVERED.join(", ");
+  $("target-add-symbol").value = "";
+  renderTargetRows();
+  $("target-status").textContent = stored.read_error
+    ? "目标价文件读取失败，这里是空的；保存会覆盖它" : "";
+  $("target-modal").hidden = false;
+  document.body.classList.add("modal-open");
+  $("target-modal-close").focus();
+}
+
+function closeTargetModal() {
+  $("target-modal").hidden = true;
+  document.body.classList.remove("modal-open");
+  targetDraft = null;
+}
+
+// The line under a ticker: today's price, and anything standing in its way.
+function targetRowNote(sym, spot, plan, p) {
+  const px = spot > 0 ? fmtMoney(spot, 2) : "未持股，没有现价";
+  const last = plan ? plan.tiers.map(t => fmtTarget(t.price)).join(" / ") : "";
+  if (plan && p && p.state === "split") return `${px} · ${fmtMD(p.split_on)} 拆股，上次 ${last} 已作废`;
+  if (plan && p && p.state === "expired") return `${px} · 清仓过，上次 ${last} 已作废`;
+  if (plan && targetAllReduced(p)) return `${px} · 每档都减过仓，可以填新的`;
+  if (plan && !(spot > 0)) return "未持股 · 持股后才判";
+  return px;
+}
+
+// Rebuilt from the draft, never from the stored plans, so adding a row keeps
+// every box as typed.
+function renderTargetRows() {
+  const stored = currentDataRef.profitTargets || {};
+  const symbols = stored.symbols || {};
+  const allProgress = currentDataRef.targetProgress || {};
+  const spots = buildPriceBook(currentDataRef.allAccounts || {});
+  const levered = new Set(Array.isArray(stored.levered) ? stored.levered : PROFIT_LEVERED);
+  $("target-body").innerHTML = (targetDraft || []).map(({ sym, boxes }) => {
+    const live = targetIsLive(symbols[sym], allProgress[sym]);
+    const unset = levered.has(sym) && spots[sym] > 0 && !live
+      && !boxes.some(b => String(b).trim());
+    return `<tr data-sym="${esc(sym)}">
+      <td><b>${esc(sym)}</b>${unset ? ` <span class="amber target-unset">未设</span>` : ""}
+        <div class="pos-sub">${esc(targetRowNote(sym, spots[sym], symbols[sym], allProgress[sym]))}</div></td>
+      ${boxes.map((b, i) => `<td><div class="risk-input">
+        <input type="number" data-tier="${i}" inputmode="decimal" step="any" min="0"
+               placeholder="$" value="${esc(b)}" aria-label="${esc(sym)} 第 ${i + 1} 档" /></div></td>`).join("")}
+    </tr>`;
+  }).join("");
+}
+
+// Add a ticker nobody holds yet: the way to write the plan while placing the
+// order, a day before the statement can show the position.
+function addTargetRow() {
+  const input = $("target-add-symbol");
+  const sym = input.value.trim().toUpperCase();
+  if (!sym) return;
+  if (!TARGET_SYMBOL_RE.test(sym)) {
+    $("target-status").textContent = `${sym} 不像代码`;
+    return;
+  }
+  if (!targetDraft.some(r => r.sym === sym)) {
+    targetDraft.unshift({ sym, boxes: Array(TARGET_TIERS).fill("") });
+    renderTargetRows();
+  }
+  input.value = "";
+  $("target-status").textContent = "";
+  document.querySelector(`#target-body tr[data-sym="${CSS.escape(sym)}"] input`).focus();
+}
+
+function targetBody() {
+  const symbols = {};
+  for (const { sym, boxes } of targetDraft || []) {
+    const tiers = boxes.filter(b => String(b).trim()).map(b => ({ price: Number(b) }));
+    if (tiers.length) symbols[sym] = { tiers };
+  }
+  return { symbols, levered: riskListFromInput($("target-levered").value) };
+}
+
+async function saveProfitTargets() {
+  for (const { sym, boxes } of targetDraft || []) {
+    const bad = targetRowProblem(sym, boxes);
+    if (bad) { $("target-status").textContent = bad; return; }
+  }
+  const btn = $("target-save");
+  btn.disabled = true;
+  $("target-status").textContent = "保存中…";
+  try {
+    const res = await fetch("/api/settings/targets", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(targetBody()),
+    });
+    const j = await res.json();
+    if (!res.ok) {
+      // The dialog stays open with everything typed still in it.
+      $("target-status").textContent = j.error || `HTTP ${res.status}`;
+      return;
+    }
+    currentDataRef.profitTargets = j;
+    currentDataRef.targetProgress = j.progress;
+    closeTargetModal();
+    showToast("success", "已保存", `${Object.keys(j.symbols || {}).length} 个标的设了目标价`);
+    renderRiskGate();
+  } catch (exc) {
+    $("target-status").textContent = "";
+    showToast("error", "保存失败", String(exc));
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function wireTargetModal() {
+  $("target-btn").addEventListener("click", openTargetModal);
+  $("profit-nudge-btn").addEventListener("click", openTargetModal);
+  $("target-modal-close").addEventListener("click", closeTargetModal);
+  $("target-cancel").addEventListener("click", closeTargetModal);
+  $("target-save").addEventListener("click", saveProfitTargets);
+  $("target-add").addEventListener("click", addTargetRow);
+  $("target-add-symbol").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); addTargetRow(); }
+  });
+  $("target-modal").addEventListener("click", (e) => {
+    if (e.target === $("target-modal")) closeTargetModal();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("target-modal").hidden) closeTargetModal();
+  });
+  // Delegated: the rows are rebuilt on every open and on every added ticker.
+  $("target-body").addEventListener("input", (e) => {
+    const tier = e.target.dataset.tier;
+    if (tier === undefined) return;
+    const row = targetDraft.find(r => r.sym === e.target.closest("tr").dataset.sym);
+    row.boxes[+tier] = e.target.value;
+    const bad = targetRowProblem(row.sym, row.boxes);
+    // The whole row: fixing the box on one side clears the complaint about the other.
+    e.target.closest("tr").querySelectorAll("input").forEach(el => el.classList.toggle("bad", !!bad));
+    const spot = buildPriceBook(currentDataRef.allAccounts || {})[row.sym];
+    $("target-status").textContent = bad || targetRowWarning(row.sym, row.boxes, spot);
+  });
+}
+
 /* --- Folding ------------------------------------------------------------ */
 
 // Folded or open is a per-device preference — a phone may want the gate shut
@@ -938,6 +1291,7 @@ function wirePanelFold(prefix, storageKey) {
 
 document.addEventListener("DOMContentLoaded", () => {
   wireRiskModal();
+  wireTargetModal();
   wirePanelFold("risk", "ibkr.riskGate.collapsed");
   wirePanelFold("profit", "ibkr.profitPanel.collapsed");
   // Same guard as the position rules: the 设置 button ships disabled and only
@@ -957,5 +1311,17 @@ document.addEventListener("DOMContentLoaded", () => {
       currentDataRef.riskSettingsError = String(exc.message || exc);
       $("risk-btn").title = "设置读取失败，刷新页面重试";
     })
+    .then(() => { if (currentDataRef.allAccounts) renderRiskGate(); });
+  // The same guard again: a failed read leaves the dialog shut, so it can never
+  // save blanks over plans it could not see.
+  fetch("/api/settings/targets")
+    .then(r => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+    .then(cfg => {
+      currentDataRef.profitTargets = cfg;
+      const btn = $("target-btn");
+      btn.disabled = false;
+      btn.title = "给持仓设 2-3 档止盈目标价，还没持有的也能先填";
+    })
+    .catch(() => { $("target-btn").title = "目标价读取失败，刷新页面重试"; })
     .then(() => { if (currentDataRef.allAccounts) renderRiskGate(); });
 });

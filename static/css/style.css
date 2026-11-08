@@ -857,9 +857,32 @@ table.risk-table thead th.risk-active { color: var(--accent); }
   font-size: 11px; font-weight: 400; color: var(--text-faint);
 }
 
+/* Take-profit targets. display:flex would beat the hidden attribute. */
+.profit-nudge {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+  gap: 6px 12px; margin-bottom: 8px; padding: 8px 14px; border-radius: 10px;
+  font-size: 13px; color: var(--amber);
+  background: rgba(251, 191, 36, 0.08); border-left: 3px solid var(--amber);
+}
+.profit-nudge[hidden] { display: none; }
+.profit-nudge b { font-weight: 600; }
+.risk-group-rows li.muted { color: var(--text-faint); }
+/* A row wraps at its spaces, never through the middle of 到价. */
+.risk-group-rows li > :first-child { word-break: keep-all; }
+.target-unset { margin-left: 4px; font-size: 11px; white-space: nowrap; }
+.target-add { flex-wrap: wrap; }
+.target-add .risk-input input { width: 88px; text-align: left; text-transform: uppercase; }
+.target-add .risk-input input::placeholder { text-transform: none; }
+.target-table .risk-input input { width: 84px; }
+.target-table .risk-input input.bad { border-color: var(--red); }
+.target-levered { padding-bottom: 14px; }
+
 @media (max-width: 600px) {
   .panel-head:has(.risk-head-right) { flex-direction: column; align-items: flex-start; gap: 8px; }
   .risk-head-right { justify-content: flex-start; }
   table.risk-table th[scope="row"] { white-space: normal; min-width: 92px; max-width: 110px; }
   table.risk-table th, table.risk-table td { padding: 9px 8px; }
+  /* Four columns on a phone: the boxes give way before the table scrolls. */
+  .target-table th, .target-table td { padding-left: 4px; padding-right: 4px; }
+  .target-table .risk-input input { width: 56px; padding: 6px 5px; }
 }
