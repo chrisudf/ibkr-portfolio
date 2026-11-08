@@ -732,6 +732,11 @@ function render(data) {
   // Called last on purpose: it sits at the top of the page, but a throw in it
   // must not cost any panel rendered before it.
   renderRiskGate();
+
+  // Delta exposure (static/js/delta.js), after the gate for the same reason.
+  // Closes for names held only through options arrive async from
+  // /api/underlying-closes; the panel re-renders itself when they land.
+  renderDeltaExposure();
 }
 
 /* ---------------------------------------------------------------------------

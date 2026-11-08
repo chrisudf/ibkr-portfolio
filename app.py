@@ -26,6 +26,7 @@ from parser.flex_fetch import (FLEX_BUDGET_SEC, FLEX_CONFIG_NOTES,
                                FLEX_POLL_INTERVAL, FlexFetchError, fetch_one,
                                parse_accounts_env)
 from parser.dataroma import fetch_all as fetch_all_13f
+from parser.quotes import needed_closes, resolve_closes
 from parser.ibkr_flex_csv import describe_sections
 from parser.snapshots import load_snapshots, record_snapshot
 
@@ -159,7 +160,7 @@ def index():
     return render_template("dashboard.html")
 
 
-def _load_all_accounts() -> dict:
+def _load_all_accounts(with_snapshots: bool = True) -> dict:
     """Read every per-account uploads/*.json into a multi-account payload.
 
     Matches all JSON files (not just U*.json) so accounts saved under the
@@ -177,7 +178,8 @@ def _load_all_accounts() -> dict:
             continue
         # Attach the snapshot series (weekly recap baseline candidates).
         # Read-time attach keeps the account JSON itself snapshot-free.
-        accounts[path.stem]["snapshots"] = load_snapshots(UPLOAD_DIR, path.stem)
+        if with_snapshots:
+            accounts[path.stem]["snapshots"] = load_snapshots(UPLOAD_DIR, path.stem)
     # Backward compat: migrate the legacy single-portfolio file if present
     # and no per-account files exist yet.
     if not accounts and LEGACY_STATE_FILE.exists():
@@ -203,6 +205,57 @@ def get_portfolio():
         # since-disabled schedule must not keep advertising "每日".
         payload["sync"] = {**state, "mode": AUTO_SYNC}
     return jsonify(payload)
+
+
+# --- Underlying closes for the delta panel --------------------------------
+#
+# Names held only through options have no price in the statement, and a delta
+# cannot be had without one (parser/quotes.py has the full story). Asked for
+# by the page after it has rendered, never part of /api/portfolio: a slow or
+# unreachable Yahoo must cost the delta panel a few seconds, not the board.
+#
+# The server works out what to fetch from the saved statements — the page
+# cannot name a ticker, so this endpoint is no general-purpose quote proxy.
+# The lock keeps two page loads from fetching the same names twice; the
+# single gunicorn worker makes an in-process lock enough.
+
+QUOTES_CACHE = UPLOAD_DIR / ".quotes_cache.json"
+_quotes_lock = Lock()
+
+
+def _read_quotes_cache() -> dict:
+    try:
+        with QUOTES_CACHE.open(encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+@app.get("/api/underlying-closes")
+def underlying_closes():
+    dates, need = needed_closes(_load_all_accounts(with_snapshots=False))
+    with _quotes_lock:
+        cache = _read_quotes_cache()
+        closes, misses, new_cache = resolve_closes(need, cache)
+        if new_cache != cache:
+            try:
+                _atomic_write_json(QUOTES_CACHE, new_cache)
+            except OSError:
+                # Served either way; it only costs a refetch next time.
+                app.logger.exception("[quotes] cache write failed")
+    for day, syms in misses.items():
+        for sym, miss in syms.items():
+            app.logger.info("[quotes] no close for %s on %s: %s", sym, day, miss.get("error"))
+    return jsonify({
+        "source": "Yahoo Finance",
+        "dates": dates,
+        "closes": {day: {sym: {"close": c["close"], "bar": c["bar"]}
+                         for sym, c in syms.items()}
+                   for day, syms in closes.items()},
+        "missing": {day: {sym: m.get("error") or "" for sym, m in syms.items()}
+                    for day, syms in misses.items()},
+    })
 
 
 @app.post("/api/upload")

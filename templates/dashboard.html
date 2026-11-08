@@ -12,6 +12,8 @@
   <script src="/static/js/f13.js" defer></script>
   <!-- Risk gate: same arrangement — after dashboard.js, whose helpers it uses. -->
   <script src="/static/js/risk.js" defer></script>
+  <!-- Delta exposure: likewise. -->
+  <script src="/static/js/delta.js" defer></script>
 </head>
 <body>
   <header class="topbar">
@@ -191,6 +193,45 @@
           没有正股的标的不在地图上，看下面那张表。</div>
       </section>
 
+      <!-- Delta exposure: every position as the shares it moves like, sold puts included -->
+      <section class="panel" id="delta-panel" hidden>
+        <div class="panel-head">
+          <h2>Delta 敞口</h2>
+          <span class="panel-note" id="delta-note"></span>
+        </div>
+        <div class="delta-hero" id="delta-hero"></div>
+        <div class="delta-warn" id="delta-warn" hidden></div>
+        <div class="table-wrap">
+          <table class="holdings delta-table">
+            <thead>
+              <tr>
+                <th>标的</th>
+                <th class="num">收盘价</th>
+                <th class="num">正股</th>
+                <th class="num">卖 put</th>
+                <th class="num">其他期权</th>
+                <th class="num">合计 Δ 股数</th>
+                <th class="num">Delta 市值</th>
+                <th class="num">占净值</th>
+                <th class="delta-bar-cell"><span class="delta-key"><i class="delta-dot stock"></i>正股
+                  <i class="delta-dot shortPut"></i>卖 put <i class="delta-dot other"></i>其他期权</span></th>
+              </tr>
+            </thead>
+            <tbody id="delta-body"></tbody>
+          </table>
+        </div>
+        <div class="margin-foot">把每个持仓折成「跟着涨跌的股数」：<b>Delta 股数</b> = 正股股数 + 每张合约的 delta × 张数 × 合约乘数，
+          <b>Delta 市值</b> = Delta 股数 × 收盘价。<b>卖 put 的 delta 是正的</b> —— 跌的时候它跟正股一起亏，越价内越接近一张顶 100 股；
+          「核心持仓与仓位区间」按投入资本算，只卖 put 的标的在那里是 0%，在这里按 delta 算进来。
+          delta 用 Black-Scholes，隐含波动率从每张合约自己的收盘价反推（利率按 4%），崩盘日抬高的波动率已经在里面；
+          没算分红和美式提前行权，深度价内的 put 会少算一点（对过美式二叉树：多数差 0.01，期限长的深度价内 put 差到 0.05，合计约少 2%）。
+          正股价：有账户持有正股的用 IBKR 报表里的收盘价；只有期权的标的（价格旁标 <span class="delta-src">Y</span>）从 Yahoo 取<b>报表同一天</b>的收盘价，
+          不用之后的价格 —— 期权价是那天的，正股价也得是那天的。只把代码发给 Yahoo，不带数量和账户。
+          「每跌 1%」是线性估算；卖 put 越跌 delta 越大，跌得多时实际亏得比线性多，
+          「全线跌 10%」按原隐含波动率把每张合约重算了一遍，但真跌的时候隐含波动率通常会涨，所以仍是下界。
+          杠杆 ETF 按 ETF 自己的价格算，没再乘杠杆倍数；BOXX / SGOV 当现金，不计。点标的展开每张合约。</div>
+      </section>
+
       <!-- Core holdings vs caps -->
       <section class="panel" id="core-panel" hidden>
         <div class="panel-head">
@@ -216,7 +257,8 @@
           期权多头按<b>市值</b>而不是名义计入（LEAPS call 按 strike×100 会虚报成几倍的仓位）；
           卖方期权两边都不计 —— 卖 put 本身没投入资本（担保金已经算在现金里），
           卖 call 压的是上面已经算过的正股的上涨空间。所以<b>只卖 put 的标的在这里是 0%</b>，
-          那是定义本身，不是漏算：被行权风险是另一个问题，「保证金占用」和「卖方到期日历」两张表管它。
+          那是定义本身，不是漏算：被行权风险是另一个问题，「保证金占用」和「卖方到期日历」两张表管它；
+          把卖 put 按 delta 折成正股的敞口，看上面的「Delta 敞口」。
           分母是<b>当前账号</b>的总净值，切换账号这一列的数字会跟着变；「总账户」页签下算的是合并后的账。
           区间规则本身是<b>全局共享</b>的一套，同一个 5% – 10% 分别套在每本账上 ——
           所以一个标的只在另一个账号里持有时，这里会显示 0% 并打「本账号无持仓」。
