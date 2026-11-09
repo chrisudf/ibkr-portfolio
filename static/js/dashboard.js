@@ -569,6 +569,11 @@ async function loadPortfolio() {
   const accounts = payload.accounts || { [payload.account?.Account || "default"]: payload };
   currentDataRef.allAccounts = accounts;
   currentDataRef.sync = payload.sync || null;
+  // Take-profit plans and their progress come from one read on the server, so
+  // they always describe the same prices. null progress is "could not be
+  // worked out", which risk.js reports as not judged.
+  currentDataRef.profitTargets = payload.target_settings ?? null;
+  currentDataRef.targetProgress = payload.target_progress ?? null;
   currentDataRef._universe = null;    // memoized symbol list is now stale
   // Default to the alphabetically-first account (puts U17xxxx ahead of U22xxxx)
   // rather than the merged view — most viewing happens per-account.

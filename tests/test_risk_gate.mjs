@@ -48,13 +48,15 @@ const consts = [
   extractConst(risk, /const RISK_CLUSTER = \[[\s\S]*?\];/, "RISK_CLUSTER"),
   extractConst(risk, /const RISK_WATCH = [^;]+;/, "RISK_WATCH"),
   extractConst(risk, /const RISK_EPS = [^;]+;/, "RISK_EPS"),
+  extractConst(risk, /const fmtTarget = [^;]+;/, "fmtTarget"),
 ].join("\n");
 
 const DASH_FNS = ["parseExpiryTs", "groupExpiries", "fundedSeries", "navStats"];
 const RISK_FNS = ["riskConfig", "riskNav", "riskBook", "mergeRiskBooks", "riskJudge",
                   "riskPmBuffer", "riskDrawdown", "riskBreaker", "riskCashWeeks",
-                  "riskUnderwater", "riskProfits", "riskVerdict", "riskScope", "riskBrief",
-                  "riskPutLabel", "riskContract"];
+                  "riskUnderwater", "riskProfits", "riskTargets", "riskVerdict", "riskScope",
+                  "riskBrief", "riskPutLabel", "riskContract", "targetRowProblem",
+                  "targetRowWarning", "targetIsLive", "targetAllReduced"];
 const R = new Function(
   `${consts}\n`
   + DASH_FNS.map(n => extract(dash, "dashboard.js", n)).join("\n") + "\n"
@@ -640,6 +642,179 @@ test("止盈：正好到线算；线走配置；现金等价物、空头正股�
     options: [call("BOXX", "20NOV26", 100, -1, { cost_basis: -10, unrealized_pl: 9 }),
               call("VRT", "20NOV26", 100, -1, { cost_basis: 0, unrealized_pl: 9 })],
   }, CFG), []);
+});
+
+// --- take-profit targets ---------------------------------------------------------------
+
+const ID = "U1111111";
+const planOf = (...prices) => ({ tiers: prices.map(price => ({ price, set_on: "2026-09-01" })) });
+const reached = (extra = {}) => ({ reached: true, hit_on: "2026-09-22", hit_close: 31.84,
+                                   peak_on: "2026-09-24", peak_close: 35.39, reduced: false, ...extra });
+const open = { reached: false, reduced: false };
+const live = (...reads) => ({ state: "active", split_on: null, accounts: { [ID]: reads } });
+const holding = (symbol, close_price, extra = {}) => ({
+  symbol, quantity: 10, close_price, cost_basis: 100, unrealized_pl: 50, ...extra });
+
+test("目标价：到价后跌回去的排在前面，还没到的档跟着显示还差多少", () => {
+  const got = R.riskTargets(
+    { stocks: [holding("METU", 20.8), holding("MU", 650)] }, ID,
+    { symbols: { MU: planOf(600), METU: planOf(30, 35, 40) } },
+    { MU: live(reached()), METU: live(reached(), reached(), open) }, []);
+  assert.deepEqual(got.groups.map(g => [g.u, g.hits, g.fell]), [["METU", 2, 2], ["MU", 1, 0]]);
+  const [first, , third] = got.groups[0].rows;
+  assert.equal(first.state, "fell");
+  near(first.gap, 20.8 / 30 - 1);
+  assert.equal(third.state, "next");
+  near(third.toGo, 40 / 20.8 - 1);
+  assert.equal(got.groups[1].rows[0].state, "hit");
+});
+
+test("目标价：现价正好压在到过的档上不算跌回", () => {
+  const got = R.riskTargets({ stocks: [holding("METU", 30)] }, ID,
+    { symbols: { METU: planOf(30) } }, { METU: live(reached()) }, []);
+  assert.equal(got.groups[0].rows[0].state, "hit");
+});
+
+test("目标价：一档都没到不列出，但正股已经离开 10% 线，call 不离开", () => {
+  const data = {
+    stocks: [holding("METU", 20.8), holding("HOOD", 80)],                  // 都是 +50%
+    options: [call("METU", "15JAN27", 25, 1, { cost_basis: 100, unrealized_pl: 90 })],
+  };
+  const got = R.riskTargets(data, ID, { symbols: { METU: planOf(30) } }, { METU: live(open) }, []);
+  assert.deepEqual(got.groups, []);
+  assert.deepEqual([...got.active], ["METU"]);
+  const lines = R.riskProfits(data, CFG, got.active);
+  assert.deepEqual(lines.map(p => p.u), ["METU", "HOOD"]);
+  assert.deepEqual(lines[0].rows.map(r => r.label), ["买 1/15 25C"]);
+  assert.deepEqual(lines[1].rows.map(r => r.label), ["持股"]);
+});
+
+test("目标价：减过仓的档消失；全部减完，正股回到 10% 线，杠杆 ETF 也要重新设", () => {
+  const data = { stocks: [holding("METU", 32)] };
+  const one = R.riskTargets(data, ID, { symbols: { METU: planOf(30, 40) } },
+    { METU: live(reached({ reduced: true }), open) }, ["METU"]);
+  assert.deepEqual(one.groups, []);                 // 第 1 档处理完了，第 2 档还没到
+  assert.deepEqual([...one.active], ["METU"]);
+  assert.deepEqual(one.missing, []);
+  const all = R.riskTargets(data, ID, { symbols: { METU: planOf(30) } },
+    { METU: live(reached({ reduced: true })) }, ["METU"]);
+  assert.deepEqual([...all.active], []);
+  assert.deepEqual(all.missing, ["METU"]);
+  assert.equal(R.riskProfits(data, CFG, all.active).length, 1);
+});
+
+test("目标价：前一档减过仓后，第 2 档还叫第 2 档", () => {
+  const got = R.riskTargets({ stocks: [holding("METU", 36)] }, ID, { symbols: { METU: planOf(30, 35) } },
+    { METU: live(reached({ reduced: true }), reached()) }, []);
+  assert.deepEqual(got.groups[0].rows.map(r => [r.n, r.price]), [[2, 35]]);
+});
+
+test("目标价：清仓作废的不判，当作没设；杠杆 ETF 要重新提醒", () => {
+  const data = { stocks: [holding("METU", 40)] };
+  const got = R.riskTargets(data, ID, { symbols: { METU: planOf(30) } },
+    { METU: { state: "expired", split_on: null, accounts: {} } }, ["METU"]);
+  assert.deepEqual(got.groups, []);
+  assert.deepEqual([...got.active], []);
+  assert.deepEqual(got.missing, ["METU"]);
+});
+
+test("目标价：拆股后不判，直接说要重填，也不再重复提醒未设", () => {
+  const got = R.riskTargets({ stocks: [holding("CONL", 28.9)] }, ID, { symbols: { CONL: planOf(5) } },
+    { CONL: { state: "split", split_on: "2026-10-02", accounts: {} } }, ["CONL"]);
+  assert.deepEqual(got.blocked, [{ u: "CONL", why: "split", on: "2026-10-02" }]);
+  assert.deepEqual(got.missing, []);
+  assert.deepEqual([...got.active], []);
+});
+
+test("目标价：设得比保留的快照还早，提示重填，不判也不重复提醒未设", () => {
+  const got = R.riskTargets({ stocks: [holding("METU", 27)] }, ID, { symbols: { METU: planOf(30) } },
+    { METU: { state: "stale", split_on: null, accounts: {} } }, ["METU"]);
+  assert.deepEqual(got.blocked, [{ u: "METU", why: "stale", on: null }]);
+  assert.deepEqual([...got.active], []);
+  assert.deepEqual(got.missing, []);
+  assert.equal(R.targetIsLive(planOf(30), { state: "stale" }), false);
+});
+
+test("目标价：读数对不上这组价格就不用，正股留在 10% 线", () => {
+  const data = { stocks: [holding("METU", 20.8)] };
+  const progress = { METU: live(reached({ price: 25 }), { price: 35, ...open }) };
+  const got = R.riskTargets(data, ID, { symbols: { METU: planOf(30, 35) } }, progress, []);
+  assert.deepEqual(got.groups, []);
+  assert.deepEqual([...got.active], []);
+  assert.equal(R.riskProfits(data, CFG, got.active).length, 1);
+  // 价格对得上就照常判
+  const ok = R.riskTargets(data, ID, { symbols: { METU: planOf(30, 35) } },
+    { METU: live(reached({ price: 30 }), { price: 35, ...open }) }, []);
+  assert.deepEqual(ok.groups.map(g => g.u), ["METU"]);
+});
+
+test("目标价：没有正股的账户不判；有 call 就说一声，只卖 put 的不吵", () => {
+  const plans = { symbols: { NVDA: planOf(250), SOXL: planOf(100) } };
+  const progress = { NVDA: { state: "pending", accounts: {} }, SOXL: { state: "pending", accounts: {} } };
+  const got = R.riskTargets(
+    { stocks: [], options: [call("NVDA", "21JAN28", 220, 1), put("SOXL", "27NOV26", 75, -4)] },
+    ID, plans, progress, ["SOXL"]);
+  assert.deepEqual(got.blocked, [{ u: "NVDA", why: "no-stock" }]);
+  assert.deepEqual(got.missing, []);     // SOXL 没持股：不算「持有却没设」
+});
+
+test("目标价读不到就什么都不判：正股留在 10% 线，也不提醒未设", () => {
+  const data = { stocks: [holding("METU", 40)] };
+  const plans = { symbols: { METU: planOf(30) } };
+  for (const [p, progress] of [[null, {}], [{ symbols: {}, read_error: true }, {}], [plans, null]]) {
+    const got = R.riskTargets(data, ID, p, progress, ["METU"]);
+    assert.equal(got.known, false);
+    assert.deepEqual(got.missing, []);
+    assert.equal(R.riskProfits(data, CFG, got.active).length, 1);
+  }
+  // 一条目标价都没设时，没有进度也没什么要判的：提醒照常
+  const none = R.riskTargets(data, ID, { symbols: {} }, null, ["METU"]);
+  assert.equal(none.known, true);
+  assert.deepEqual(none.missing, ["METU"]);
+});
+
+test("未设目标价：只提醒名单里持有多头的，按字母排；线走传入的名单", () => {
+  const got = R.riskTargets({
+    stocks: [holding("NVDL", 22), holding("CONL", 3), holding("MSFT", 500),
+             holding("ETHU", 20, { quantity: -5 }), holding("METU", 20)],
+  }, ID, { symbols: { METU: planOf(30) } }, { METU: live(open) }, ["NVDL", "CONL", "ETHU", "METU", "SOXL"]);
+  assert.deepEqual(got.missing, ["CONL", "NVDL"]);
+});
+
+test("目标价输入：可以留空、可以跳档，但必须从低到高、大于 0", () => {
+  assert.equal(R.targetRowProblem("METU", ["", "", ""]), "");
+  assert.equal(R.targetRowProblem("METU", ["30", "", "40"]), "");
+  assert.equal(R.targetRowProblem("METU", ["30", "30", ""]), "METU：第 2 档要比前一档高");
+  assert.equal(R.targetRowProblem("METU", ["40", "", "30"]), "METU：第 3 档要比前一档高");
+  assert.equal(R.targetRowProblem("METU", ["0", "", ""]), "METU：第 1 档要填大于 0 的价格");
+  assert.equal(R.targetRowProblem("METU", ["-5", "", ""]), "METU：第 1 档要填大于 0 的价格");
+  assert.equal(R.targetRowProblem("METU", ["abc", "", ""]), "METU：第 1 档要填大于 0 的价格");
+});
+
+test("目标价输入：不高于现价的只提示不拦；没有现价就不提示", () => {
+  assert.equal(R.targetRowWarning("METU", ["20", "", ""], 20.8),
+               "METU 第 1 档 $20 不高于现价 $20.8，保存后马上算到价");
+  assert.equal(R.targetRowWarning("METU", ["30", "35", ""], 20.8), "");
+  assert.equal(R.targetRowWarning("SOXL", ["1", "", ""], undefined), "");
+});
+
+test("弹窗只把还活着的目标价填回去：清仓、拆股的要重填", () => {
+  assert.equal(R.targetIsLive(planOf(30), { state: "active" }), true);
+  assert.equal(R.targetIsLive(planOf(30), { state: "pending" }), true);
+  assert.equal(R.targetIsLive(planOf(30), undefined), true);
+  assert.equal(R.targetIsLive(planOf(30), { state: "expired" }), false);
+  assert.equal(R.targetIsLive(planOf(30), { state: "split" }), false);
+  assert.equal(R.targetIsLive(undefined, undefined), false);
+});
+
+test("弹窗说「每档都减过仓」要所有持有的账户都减完；一户没减完不算", () => {
+  const done = { reached: true, reduced: true };
+  const accounts = (a, b) => ({ state: "active", accounts: { A: a, B: b } });
+  assert.equal(R.targetAllReduced(accounts([done], [done])), true);
+  assert.equal(R.targetAllReduced(accounts([done], [reached()])), false);
+  assert.equal(R.targetAllReduced(accounts([done, open], [done])), false);
+  assert.equal(R.targetAllReduced({ state: "pending", accounts: {} }), false);
+  assert.equal(R.targetAllReduced(undefined), false);
 });
 
 // --- wiring ----------------------------------------------------------------------------

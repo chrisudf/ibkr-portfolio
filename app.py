@@ -27,7 +27,8 @@ from parser.flex_fetch import (FLEX_BUDGET_SEC, FLEX_CONFIG_NOTES,
                                parse_accounts_env)
 from parser.dataroma import fetch_all as fetch_all_13f
 from parser.ibkr_flex_csv import describe_sections
-from parser.snapshots import load_snapshots, record_snapshot
+from parser.snapshots import MAX_KEEP, load_snapshots, record_snapshot
+from parser.targets import evaluate_targets
 
 BASE_DIR = Path(__file__).parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -202,6 +203,13 @@ def get_portfolio():
         # The LIVE env decides the mode shown — a stale state file from a
         # since-disabled schedule must not keep advertising "每日".
         payload["sync"] = {**state, "mode": AUTO_SYNC}
+    # The plans and their progress travel with the statements, from one read
+    # of the file: progress is derived from both, and a page that paired fresh
+    # progress with plans it read earlier (another device has changed them
+    # since) would put a reached tier against the wrong price.
+    targets = _read_profit_targets()
+    payload["target_settings"] = targets
+    payload["target_progress"] = _target_progress(targets["symbols"], accounts)
     return jsonify(payload)
 
 
@@ -574,6 +582,172 @@ def put_risk_settings():
     }
     _atomic_write_json(RISK_SETTINGS_FILE, payload, indent=2)
     return jsonify(payload)
+
+
+# --- Take-profit targets: up to three prices per symbol ----------------------
+#
+# Its own file rather than a column in the position settings, because the two
+# live differently. A position band is a standing rule that outlasts any one
+# position; a target belongs to the position it was written for and ends with
+# it, so a plan left over from last year cannot judge a new position.
+#
+# The file stores what was decided: the prices, and the day each was set, which
+# is where its history starts (a close from before the target existed is not
+# the target being reached). set_on belongs to the server. A price that is kept
+# keeps its date, a changed price starts again from today, so raising a target
+# that was reached is how you say "not yet".
+#
+# Whether a tier has been reached is derived on every read: parser/targets.py.
+PROFIT_TARGETS_FILE = UPLOAD_DIR / ".profit_targets.json"
+
+_TARGET_MAX_TIERS = 3
+_TARGET_MAX_PRICE = 1_000_000.0
+_TARGET_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# The plan's prices no longer mean anything, or its history is gone, so a new
+# plan starts from today even when it types the same numbers.
+_TARGET_ENDED_STATES = ("expired", "split", "stale")
+
+
+def _target_tiers(key: str, raw, stored: bool) -> list[dict]:
+    """One symbol's tiers, lowest first. Only the stored form carries set_on."""
+    if not isinstance(raw, list):
+        raise ValueError(f"{key}: 'tiers' must be a list")
+    if len(raw) > _TARGET_MAX_TIERS:
+        raise ValueError(f"{key}: at most {_TARGET_MAX_TIERS} tiers")
+    tiers: list[dict] = []
+    for tier in raw:
+        if not isinstance(tier, dict):
+            raise ValueError(f"{key}: each tier must be an object")
+        price = tier.get("price")
+        # bool is an int to Python; true as a price is a client bug.
+        if isinstance(price, bool):
+            raise ValueError(f"{key}: tier price must be a number")
+        try:
+            val = float(price)
+        except (TypeError, ValueError):
+            raise ValueError(f"{key}: tier price must be a number") from None
+        if val != val or val in (float("inf"), float("-inf")):
+            raise ValueError(f"{key}: tier price must be a finite number")
+        val = round(val, 4)
+        if not 0.0 < val <= _TARGET_MAX_PRICE:
+            raise ValueError(f"{key}: tier price must be above 0 and at most "
+                             f"{_TARGET_MAX_PRICE:g}; got {price!r}")
+        if tiers and val <= tiers[-1]["price"]:
+            raise ValueError(f"{key}: each tier must be higher than the one before")
+        entry = {"price": val}
+        if stored:
+            set_on = tier.get("set_on")
+            if not (isinstance(set_on, str) and _TARGET_DATE_RE.match(set_on)):
+                raise ValueError(f"{key}: tier has no valid set_on")
+            entry["set_on"] = set_on
+        tiers.append(entry)
+    return tiers
+
+
+def _normalize_profit_targets(raw: dict, stored: bool = False) -> dict:
+    """Validate a {symbols, levered} body; raise ValueError on bad input.
+
+    A symbol with no tiers left is dropped, so clearing its boxes removes it.
+    `levered` follows the cluster list: null keeps the default in risk.js.
+    """
+    symbols = raw.get("symbols")
+    if not isinstance(symbols, dict):
+        raise ValueError("body must be an object with a 'symbols' map")
+    if len(symbols) > 500:
+        raise ValueError("too many symbols")
+    out: dict[str, dict] = {}
+    for sym, plan in symbols.items():
+        key = str(sym or "").strip().upper()
+        if not _SYMBOL_RE.match(key):
+            raise ValueError(f"invalid symbol {sym!r}")
+        if not isinstance(plan, dict):
+            raise ValueError(f"{key}: entry must be an object")
+        tiers = _target_tiers(key, plan.get("tiers"), stored)
+        if tiers:
+            out[key] = {"tiers": tiers}
+    return {"symbols": out, "levered": _risk_symbol_list("levered", raw.get("levered"), 100)}
+
+
+def _blank_profit_targets(read_error: bool = False) -> dict:
+    return {"version": 1, "symbols": {}, "levered": None, "updated_at": "",
+            "read_error": read_error}
+
+
+def _read_profit_targets() -> dict:
+    """The stored plans. read_error separates "the file is broken" from "none
+    set": the panel must not ask for targets you already typed because it could
+    not read them, nor put a held name back on the 10% line without saying so.
+    """
+    try:
+        with open(PROFIT_TARGETS_FILE, "r", encoding="utf-8") as f:
+            stored = json.load(f)
+    except FileNotFoundError:
+        return _blank_profit_targets()
+    except (OSError, json.JSONDecodeError):
+        return _blank_profit_targets(read_error=True)
+    if not isinstance(stored, dict):
+        return _blank_profit_targets(read_error=True)
+    try:
+        norm = _normalize_profit_targets(stored, stored=True)
+    except ValueError:
+        app.logger.warning("profit targets file is invalid; ignoring it")
+        return _blank_profit_targets(read_error=True)
+    return {"version": 1, **norm, "updated_at": stored.get("updated_at") or "",
+            "read_error": False}
+
+
+def _target_progress(symbols: dict, accounts: dict) -> dict | None:
+    """Every plan read against the full snapshot history, per parser/targets.py.
+
+    None when it could not be worked out, which the panel reports as "not
+    judged". A reminder must never take the dashboard down with it, and an
+    empty answer here would read as "nothing has been reached" — which is why
+    the snapshots are read strictly: an unreadable file is not an empty one.
+    """
+    if not symbols:
+        return {}
+    try:
+        snapshots = {acct_id: load_snapshots(UPLOAD_DIR, acct_id, limit=MAX_KEEP, strict=True)
+                     for acct_id in accounts}
+        return evaluate_targets(symbols, accounts, snapshots)
+    except Exception:
+        app.logger.exception("target progress failed")
+        return None
+
+
+@app.get("/api/settings/targets")
+def get_profit_targets():
+    return jsonify(_read_profit_targets())
+
+
+@app.put("/api/settings/targets")
+def put_profit_targets():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "expected a JSON object"}), 400
+    try:
+        norm = _normalize_profit_targets(body)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    previous = _read_profit_targets()["symbols"]
+    accounts = _load_all_accounts()
+    progress = _target_progress(previous, accounts) or {}
+    today = datetime.now(timezone.utc).date().isoformat()
+    for sym, plan in norm["symbols"].items():
+        ended = (progress.get(sym) or {}).get("state") in _TARGET_ENDED_STATES
+        kept = {} if ended else {
+            tier["price"]: tier["set_on"]
+            for tier in (previous.get(sym) or {}).get("tiers", [])}
+        for tier in plan["tiers"]:
+            tier["set_on"] = kept.get(tier["price"], today)
+    payload = {
+        "version": 1,
+        **norm,
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    _atomic_write_json(PROFIT_TARGETS_FILE, payload, indent=2)
+    return jsonify({**payload, "read_error": False,
+                    "progress": _target_progress(norm["symbols"], accounts)})
 
 
 # ---------------------------------------------------------------------------
