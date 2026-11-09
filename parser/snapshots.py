@@ -96,8 +96,13 @@ def build_snapshot(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _read_entries(path: Path) -> dict[str, dict[str, Any]]:
-    """date → entry, last line wins for a repeated date; bad lines skipped."""
+def _read_entries(path: Path, strict: bool = False) -> dict[str, dict[str, Any]]:
+    """date → entry, last line wins for a repeated date; bad lines skipped.
+
+    An unreadable file reads as no history, which suits the weekly recap. A
+    caller for whom "no history" would be a wrong answer passes strict and gets
+    the OSError instead (a missing file is still just no history).
+    """
     entries: dict[str, dict[str, Any]] = {}
     if not path.exists():
         return entries
@@ -114,6 +119,8 @@ def _read_entries(path: Path) -> dict[str, dict[str, Any]]:
                 if isinstance(e, dict) and e.get("date"):
                     entries[e["date"]] = e
     except OSError:
+        if strict:
+            raise
         return {}
     return entries
 
@@ -149,7 +156,7 @@ def record_snapshot(upload_dir: Path | str, acct_id: str, data: dict[str, Any]) 
 
 
 def load_snapshots(upload_dir: Path | str, acct_id: str,
-                   limit: int = 30) -> list[dict[str, Any]]:
-    """Newest `limit` snapshots, date-ascending."""
-    entries = _read_entries(_snap_path(upload_dir, acct_id))
+                   limit: int = 30, strict: bool = False) -> list[dict[str, Any]]:
+    """Newest `limit` snapshots, date-ascending. strict: see _read_entries."""
+    entries = _read_entries(_snap_path(upload_dir, acct_id), strict)
     return sorted(entries.values(), key=lambda e: e["date"])[-limit:]

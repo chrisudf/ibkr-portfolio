@@ -64,11 +64,25 @@ def test_a_reached_tier_stays_reached_after_the_price_falls_back():
     assert not first["reduced"] and not second["reduced"]
 
 
-def test_a_close_from_before_the_target_existed_does_not_count():
-    series = [snap("2026-09-24", METU=(100, 35.39)), snap("2026-10-30", METU=(100, 20.80))]
+def test_only_the_last_close_before_the_target_was_set_counts_from_before_it():
+    # 9/24 is history; 9/30 is the price the target was typed against.
+    series = [snap("2026-09-24", METU=(100, 35.39)), snap("2026-09-30", METU=(100, 28.0)),
+              snap("2026-10-30", METU=(100, 20.80))]
     got = evaluate_targets({"METU": plan("2026-10-01", 30)},
                            {A: acct(METU=(100, 20.80))}, {A: series})
-    assert not got["METU"]["accounts"][A][0]["reached"]
+    tier = got["METU"]["accounts"][A][0]
+    assert not tier["reached"] and tier["price"] == 30
+
+
+def test_a_target_saved_under_the_market_stays_reached_when_the_price_drops():
+    # Saved on 10/30 against the 10/29 close of $40; the next close is $25 and
+    # not a share was sold. Reached on save is reached for good.
+    series = [snap("2026-10-29", METU=(100, 40.0)), snap("2026-10-30", METU=(100, 25.0))]
+    got = evaluate_targets({"METU": plan("2026-10-30", 30)},
+                           {A: acct(as_of="2026-10-30", METU=(100, 25.0))}, {A: series})
+    tier = got["METU"]["accounts"][A][0]
+    assert tier["reached"] and tier["hit_on"] == "2026-10-29" and tier["qty_at_hit"] == 100
+    assert not tier["reduced"]
 
 
 def test_a_close_exactly_on_the_target_reaches_it():
@@ -105,6 +119,16 @@ def test_selling_before_the_tier_was_reached_does_not_close_it():
     got = evaluate_targets({"METU": plan("2026-09-01", 30)},
                            {A: acct(METU=(40, 31.0))}, {A: series})
     assert not got["METU"]["accounts"][A][0]["reduced"]
+
+
+def test_buying_back_after_selling_into_a_tier_keeps_it_handled():
+    # 100 when it was reached, 40 after the sale, 100 again later: the sale was
+    # the decision, and the old reminder must not come back with the shares.
+    series = [snap("2026-09-22", METU=(100, 31.0)), snap("2026-09-23", METU=(40, 32.0)),
+              snap("2026-10-01", METU=(100, 33.0))]
+    got = evaluate_targets({"METU": plan("2026-09-01", 30)},
+                           {A: acct(METU=(100, 33.0))}, {A: series})
+    assert got["METU"]["accounts"][A][0]["reduced"]
 
 
 def test_reinvested_dividends_never_read_as_a_sale_and_each_account_answers_for_itself():
@@ -189,6 +213,39 @@ def test_a_failed_sync_for_one_account_is_not_a_sale():
     assert got["METU"]["state"] == "active"
 
 
+def test_selling_out_right_after_the_plan_is_saved_still_ends_it():
+    # Saved on 10/02 while the 10/01 statement shows the shares; the first
+    # snapshot after it shows them gone. Buying back must not revive it.
+    series = [snap("2026-10-01", METU=(100, 21.0)), snap("2026-10-02")]
+    sold = evaluate_targets({"METU": plan("2026-10-02", 30)}, {A: acct()}, {A: series})
+    assert sold["METU"]["state"] == "expired"
+    rebought = evaluate_targets({"METU": plan("2026-10-02", 30)}, {A: acct(METU=(10, 25.0))},
+                                {A: [*series, snap("2026-10-20", METU=(10, 25.0))]})
+    assert rebought["METU"]["state"] == "expired"
+
+
+def test_a_plan_older_than_the_kept_snapshots_is_stale_not_misread(monkeypatch):
+    # The file keeps MAX_KEEP entries. Once it is full, what decided an older
+    # plan (here: the sale, then the buy-back) may have been cut, and the rest
+    # would read as a plan that is still alive.
+    import parser.targets as targets
+
+    monkeypatch.setattr(targets, "MAX_KEEP", 3)
+    kept = [snap("2026-10-20", METU=(10, 25.0)), snap("2026-10-21", METU=(10, 26.0)),
+            snap("2026-10-22", METU=(10, 27.0))]
+    got = targets.evaluate_targets({"METU": plan("2026-09-01", 30)},
+                                   {A: acct(METU=(10, 27.0))}, {A: kept})
+    assert got["METU"] == {"state": "stale", "split_on": None, "accounts": {}}
+    # A plan set inside what is kept is read as usual.
+    fresh = targets.evaluate_targets({"METU": plan("2026-10-21", 26)},
+                                     {A: acct(METU=(10, 27.0))}, {A: kept})
+    assert fresh["METU"]["state"] == "active"
+    # A file that has never filled up has not been cut: its start is all there is.
+    short = targets.evaluate_targets({"METU": plan("2026-09-01", 30)},
+                                     {A: acct(METU=(10, 27.0))}, {A: kept[:2]})
+    assert short["METU"]["state"] == "active"
+
+
 # --- splits ---------------------------------------------------------------------
 
 
@@ -207,6 +264,15 @@ def test_a_split_from_before_the_plan_does_not_touch_it():
     got = evaluate_targets({"CONL": plan("2026-10-02", 40)},
                            {A: acct(CONL=(40, 29.0))}, {A: series})["CONL"]
     assert got["state"] == "active"
+
+
+def test_a_split_on_the_first_close_after_the_plan_is_caught():
+    # Set on Sunday. Friday's snapshot is the baseline for Monday's, so a
+    # reverse split at Monday's open still voids the plan instead of reaching it.
+    series = [snap("2026-10-02", CONL=(400, 2.87, 5.0)), snap("2026-10-05", CONL=(40, 28.9, 5.0))]
+    got = evaluate_targets({"CONL": plan("2026-10-04", 5, 8)},
+                           {A: acct(CONL=(40, 28.9))}, {A: series})["CONL"]
+    assert got["state"] == "split" and got["split_on"] == "2026-10-05"
 
 
 def test_a_trim_that_happens_to_look_reciprocal_is_a_trade_not_a_split():
@@ -392,7 +458,7 @@ def test_a_broken_file_is_flagged_and_a_missing_one_is_not(client, tmp_path):
     assert read()["read_error"] is False                         # repaired by the save
 
 
-def test_portfolio_carries_the_progress_with_the_statements(client, tmp_path):
+def test_portfolio_carries_the_plans_and_their_progress_with_the_statements(client, tmp_path):
     store(tmp_path, {"METU": plan("2026-09-01", 30)})
     # The target was reached 31 snapshots ago: outside the 30 the browser gets.
     series = [snap("2026-09-01", METU=(100, 31.0))]
@@ -401,6 +467,23 @@ def test_portfolio_carries_the_progress_with_the_statements(client, tmp_path):
     payload = client.get("/api/portfolio").get_json()
     assert len(payload["accounts"][A]["snapshots"]) == 30
     assert payload["target_progress"]["METU"]["accounts"][A][0]["hit_on"] == "2026-09-01"
+    # The plans the progress was read for come in the same response, so a page
+    # can never pair it with plans another device has changed since.
+    assert payload["target_settings"] == client.get("/api/settings/targets").get_json()
+    assert payload["target_settings"]["symbols"]["METU"]["tiers"][0]["price"] == 30
+
+
+def test_an_unreadable_snapshot_file_is_not_judged_rather_than_read_as_empty(client, tmp_path):
+    # Empty history would turn a reached tier back into an unreached one. A
+    # directory where the file should be cannot be opened, like a locked file.
+    store(tmp_path, {"METU": plan("2026-09-01", 30)})
+    (tmp_path / f"{A}.json").write_text(json.dumps(acct(METU=(100, 21.0))), encoding="utf-8")
+    (tmp_path / f"{A}.snapshots.jsonl").mkdir()
+    res = client.get("/api/portfolio")
+    assert res.status_code == 200
+    payload = res.get_json()
+    assert payload["accounts"][A]["snapshots"] == []          # the weekly recap shrugs
+    assert payload["target_progress"] is None                  # the targets say "not judged"
 
 
 def test_with_no_plans_the_progress_is_empty_rather_than_unknown(client, tmp_path):

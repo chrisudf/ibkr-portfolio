@@ -6,14 +6,18 @@ over its target and slides back is the very case the plan exists for, and a
 check against the latest close alone goes quiet exactly then: METU closed above
 $35 on a single day in 2026-09, then lost 40% from there in six weeks.
 
-So each tier is read against every close since it was set, and it stays open
-until the account holds fewer shares than it did on the day it was reached.
+So each tier is read against every close since it was set, plus the last close
+before it, which is the price the plan was written against: a target saved at
+or under the market is reached from the start and stays reached. It stays open
+until the account has held fewer shares than it did on the day it was reached.
 
 All of this is derived, never stored. The settings file holds the prices and
 the day each one was set; a changed price simply re-reads the history, with no
 "reached" flag left behind to go stale. The browser only ever gets the newest
 30 snapshots, which is why this runs here: a target reached seven weeks ago
-must not fall out of a window and stop being reached.
+must not fall out of a window and stop being reached. The snapshot file itself
+keeps MAX_KEEP entries; a plan older than that is reported as stale rather
+than read from a history with its start cut off.
 
 Tiers are judged per account on that account's own snapshots, because the
 question is about a holding. A close over the target while this account held
@@ -26,7 +30,7 @@ from __future__ import annotations
 from itertools import groupby
 from typing import Any
 
-from .snapshots import _as_of_date
+from .snapshots import MAX_KEEP, _as_of_date
 
 # Exactly on a target counts as reaching it, whatever float noise says.
 _PRICE_EPS = 1e-9
@@ -94,13 +98,21 @@ def _plan_state(symbol: str, since: str, accounts: dict[str, dict[str, Any]],
 
     Each account's last known state carries across a date it has no snapshot
     for, so one account's failed sync does not read as that account selling.
+    The state carried into the day the plan was set counts as seen: a plan
+    written while the name is held, then sold out before the next snapshot, has
+    ended rather than gone back to waiting. The snapshots cannot tell that from
+    a plan written after a same-day sale, which ends too; that one is visible
+    in the dialog and costs a retype, where reviving the other would be silent.
     """
     events = sorted(
         (entry["date"], acct_id, _held(entry, symbol) is not None)
         for acct_id, entries in snapshots.items() for entry in entries)
     held: dict[str, bool] = {}
-    seen = False
+    seen = started = False
     for day, group in groupby(events, key=lambda event: event[0]):
+        if day >= since and not started:
+            started = True
+            seen = any(held.values())
         for _, acct_id, is_held in group:
             held[acct_id] = is_held
         if day < since:
@@ -109,17 +121,21 @@ def _plan_state(symbol: str, since: str, accounts: dict[str, dict[str, Any]],
             seen = True
         elif seen:
             return "expired"
+    if not started:
+        seen = any(held.values())
     if any(_live(account, symbol) for account in accounts.values()):
         return "active"
     return "expired" if seen else "pending"
 
 
 def _split_on(symbol: str, since: str, entries: list[dict[str, Any]]) -> str | None:
-    """The date of the first split-shaped move since the plan was set, if any.
+    """The date of the first split-shaped move after the plan was set, if any.
 
     After a split the plan's prices are in the old unit: a reverse split would
     read as every target reached at once and as the shares being sold, a
-    forward split as targets that can never be reached.
+    forward split as targets that can never be reached. The last snapshot from
+    before the plan is the baseline for the first one after it; a split already
+    in the price on the day the plan was set is the unit it was written in.
     """
     def realized(entry: dict[str, Any]) -> float:
         row = (entry.get("perf") or {}).get(symbol) or [0.0]
@@ -135,10 +151,8 @@ def _split_on(symbol: str, since: str, entries: list[dict[str, Any]]) -> str | N
 
     prev_entry, prev_row = None, None
     for entry in entries:
-        if entry["date"] < since:
-            continue
         row = _held(entry, symbol)
-        if row and prev_row and row[1] > 0 and prev_row[1] > 0:
+        if entry["date"] > since and row and prev_row and row[1] > 0 and prev_row[1] > 0:
             qty_ratio = row[0] / prev_row[0]
             price_ratio = prev_row[1] / row[1]
             cost_now, cost_before = cost(entry), cost(prev_entry)
@@ -154,32 +168,41 @@ def _split_on(symbol: str, since: str, entries: list[dict[str, Any]]) -> str | N
 
 def _read_tier(tier: dict[str, Any], run: list[tuple[str, float, float]],
                live: tuple[float, float], as_of: str) -> dict[str, Any]:
-    """One tier against one account's stretch of closes."""
+    """One tier against one account's stretch of closes.
+
+    The closes it is read against start with the last one before it was set:
+    the price on screen when it was typed, so a target saved at or under the
+    market is reached on that close, with that day's share count, for good.
+    """
     price, set_on = tier["price"], tier["set_on"]
     qty_now, close_now = live
+    first = next((i for i, (day, _, _) in enumerate(run) if day >= set_on), len(run))
+    closes = run[max(first - 1, 0):]
     since_hit: list[tuple[str, float, float]] = []
-    for i, (day, _, close) in enumerate(run):
-        if day >= set_on and close >= price - _PRICE_EPS:
-            since_hit = run[i:]
+    for i, (_, _, close) in enumerate(closes):
+        if close >= price - _PRICE_EPS:
+            since_hit = closes[i:]
             break
     if since_hit:
         hit_on, qty_at_hit, hit_close = since_hit[0]
     elif close_now >= price - _PRICE_EPS:
-        # No dated close since it was set has got there, but the newest one is
-        # there: a target typed at or under the market, or a statement that
-        # could not be snapshotted. Either way it is reached now.
+        # No dated close has got there, but the newest one is there: a
+        # statement that could not be snapshotted. It is reached now.
         hit_on, qty_at_hit, hit_close = as_of or None, qty_now, close_now
     else:
-        return dict(_NOT_REACHED)
+        return {"price": price, **_NOT_REACHED}
     peak_on, peak_close = hit_on, hit_close
     for day, _, close in since_hit:
         if close > peak_close:
             peak_on, peak_close = day, close
     if close_now > peak_close:
         peak_on, peak_close = as_of or None, close_now
-    return {"reached": True, "hit_on": hit_on, "hit_close": hit_close,
+    # Sold into it once, handled for good: buying the shares back later is a
+    # new decision, not the old reminder coming back.
+    lowest = min([qty for _, qty, _ in since_hit] + [qty_now])
+    return {"price": price, "reached": True, "hit_on": hit_on, "hit_close": hit_close,
             "peak_close": peak_close, "peak_on": peak_on, "qty_at_hit": qty_at_hit,
-            "reduced": qty_now < qty_at_hit - _QTY_EPS}
+            "reduced": lowest < qty_at_hit - _QTY_EPS}
 
 
 def evaluate_targets(symbols: dict[str, dict[str, Any]],
@@ -190,14 +213,27 @@ def evaluate_targets(symbols: dict[str, dict[str, Any]],
     `symbols` is the settings file's map, {SYM: {"tiers": [{"price", "set_on"}]}};
     `accounts` the current statement per account; `snapshots` each account's
     series, oldest first. Returns, per symbol, the plan's state and, for each
-    account holding it, one reading per tier in the plan's order.
+    account holding it, one reading per tier in the plan's order, each carrying
+    the price it was read for.
+
+    stale: the plan is older than what the snapshot files still hold. They keep
+    MAX_KEEP entries, and once one has been cut, the closes, the sale or the
+    split that decided this plan may be gone with it; reading what is left
+    could drop a reached tier or revive an ended plan. A file that has not
+    reached MAX_KEEP has not been cut, and whatever it starts with is all
+    there is.
     """
+    cut_from = max((entries[0]["date"] for entries in snapshots.values()
+                    if len(entries) >= MAX_KEEP), default=None)
     out: dict[str, dict[str, Any]] = {}
     for symbol, plan in symbols.items():
         tiers = plan.get("tiers") or []
         if not tiers:
             continue
         since = min(tier["set_on"] for tier in tiers)
+        if cut_from is not None and since <= cut_from:
+            out[symbol] = {"state": "stale", "split_on": None, "accounts": {}}
+            continue
         state = _plan_state(symbol, since, accounts, snapshots)
         split_on = None
         if state == "active":

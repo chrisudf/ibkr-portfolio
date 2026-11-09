@@ -410,8 +410,10 @@ function riskTargets(data, acctId, plans, progress, levered) {
   for (const [u, plan] of Object.entries(symbols)) {
     const p = (progress || {})[u];
     if (!p || p.state === "expired") continue;
-    if (p.state === "split") {
-      if (u in spots) out.blocked.push({ u, why: "split", on: p.split_on });
+    // Its prices (split) or its history (stale) no longer hold: say so where
+    // the shares are, rather than judge on them.
+    if (p.state === "split" || p.state === "stale") {
+      if (u in spots) out.blocked.push({ u, why: p.state, on: p.split_on });
       continue;
     }
     // Only an account holding the shares is judged. Calls here with no shares
@@ -422,6 +424,10 @@ function riskTargets(data, acctId, plans, progress, levered) {
     }
     const spot = spots[u];
     const read = (p.accounts || {})[acctId] || [];
+    // Read for these prices or not used at all: a reading of other prices
+    // would put a reached tier against the wrong one. The shares stay on the
+    // 10% line until the two agree again.
+    if (read.some((r, i) => r.price != null && r.price !== ((plan.tiers || [])[i] || {}).price)) continue;
     const rows = (plan.tiers || []).map((t, i) => {
       const r = read[i] || {};
       const gap = spot > 0 ? spot / t.price - 1 : null;
@@ -546,6 +552,12 @@ function renderRiskGate() {
   const todayTs = Date.now();
   const plans = currentDataRef.profitTargets;
   const levered = plans && Array.isArray(plans.levered) ? plans.levered : PROFIT_LEVERED;
+  // The plans arrive with the statements (loadPortfolio), and the dialog opens
+  // only on plans that were read: never on blanks it could save over them.
+  const targetBtn = $("target-btn");
+  targetBtn.disabled = !plans;
+  targetBtn.title = plans ? "给持仓设 2-3 档止盈目标价，还没持有的也能先填"
+    : "目标价读取失败，刷新页面重试";
   const cols = ids.map(id => {
     const a = accounts[id];
     const b = riskBook(a, cfg, book);
@@ -630,11 +642,17 @@ function riskTargetRow(r) {
 
 // A plan on file this account cannot judge, as a row of its name's group.
 function riskBlockedRow(b) {
-  return b.why === "split"
-    ? ["目标价要重填", `${fmtMD(b.on)} 拆股`,
-       "拆股后价格单位变了，这组目标价不再判。到「目标价」里重填", "amber"]
-    : ["目标价未判", "这个账户没有正股",
-       "目标价只判持有正股 / ETF 的账户。这里只有 call，call 的盈利照旧走 10% 线", "muted"];
+  if (b.why === "split") {
+    return ["目标价要重填", `${fmtMD(b.on)} 拆股`,
+            "拆股后价格单位变了，这组目标价不再判。到「目标价」里重填", "amber"];
+  }
+  if (b.why === "stale") {
+    return ["目标价要重填", "设得太久",
+            "快照只保留最近 400 个，这组目标价设得比它们还早，到价和清仓的记录可能已经不全，"
+            + "所以不再判。到「目标价」里重填", "amber"];
+  }
+  return ["目标价未判", "这个账户没有正股",
+          "目标价只判持有正股 / ETF 的账户。这里只有 call，call 的盈利照旧走 10% 线", "muted"];
 }
 
 // Every name with something to say in one account. A name's tiers and its
@@ -653,7 +671,7 @@ function riskProfitGroups(c) {
   const groups = c.targets.groups.map(g => riskGroupHtml(g.fell ? "amber" : "up", esc(g.u),
     `现价 ${fmtMoney(g.spot, 2)}`, [...g.rows.map(riskTargetRow), ...take(g.u)]));
   for (const b of c.targets.blocked) {
-    groups.push(riskGroupHtml(b.why === "split" ? "amber" : "up", esc(b.u), "",
+    groups.push(riskGroupHtml(b.why === "no-stock" ? "up" : "amber", esc(b.u), "",
       [riskBlockedRow(b), ...take(b.u)]));
   }
   for (const p of c.profits) {
@@ -1087,9 +1105,10 @@ function targetRowWarning(sym, boxes, spot) {
   return "";
 }
 
-// A row's plan is live unless the position it was written for has ended.
+// A row's plan is live unless the position it was written for has ended, or
+// its history has.
 function targetIsLive(plan, progress) {
-  return !!plan && !["expired", "split"].includes((progress || {}).state);
+  return !!plan && !["expired", "split", "stale"].includes((progress || {}).state);
 }
 
 // Every account holding the name has sold into every tier: the plan is still
@@ -1143,6 +1162,7 @@ function targetRowNote(sym, spot, plan, p) {
   const last = plan ? plan.tiers.map(t => fmtTarget(t.price)).join(" / ") : "";
   if (plan && p && p.state === "split") return `${px} · ${fmtMD(p.split_on)} 拆股，上次 ${last} 已作废`;
   if (plan && p && p.state === "expired") return `${px} · 清仓过，上次 ${last} 已作废`;
+  if (plan && p && p.state === "stale") return `${px} · 设得太久，快照已不全，上次 ${last} 已作废`;
   if (plan && targetAllReduced(p)) return `${px} · 每档都减过仓，可以填新的`;
   if (plan && !(spot > 0)) return "未持股 · 持股后才判";
   return px;
@@ -1311,17 +1331,5 @@ document.addEventListener("DOMContentLoaded", () => {
       currentDataRef.riskSettingsError = String(exc.message || exc);
       $("risk-btn").title = "设置读取失败，刷新页面重试";
     })
-    .then(() => { if (currentDataRef.allAccounts) renderRiskGate(); });
-  // The same guard again: a failed read leaves the dialog shut, so it can never
-  // save blanks over plans it could not see.
-  fetch("/api/settings/targets")
-    .then(r => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
-    .then(cfg => {
-      currentDataRef.profitTargets = cfg;
-      const btn = $("target-btn");
-      btn.disabled = false;
-      btn.title = "给持仓设 2-3 档止盈目标价，还没持有的也能先填";
-    })
-    .catch(() => { $("target-btn").title = "目标价读取失败，刷新页面重试"; })
     .then(() => { if (currentDataRef.allAccounts) renderRiskGate(); });
 });

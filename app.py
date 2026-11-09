@@ -203,10 +203,13 @@ def get_portfolio():
         # The LIVE env decides the mode shown — a stale state file from a
         # since-disabled schedule must not keep advertising "每日".
         payload["sync"] = {**state, "mode": AUTO_SYNC}
-    # Sent with the statements rather than with the settings: it is derived from
-    # them, so a refresh brings the two together with nothing else to re-fetch.
-    payload["target_progress"] = _target_progress(
-        _read_profit_targets()["symbols"], accounts)
+    # The plans and their progress travel with the statements, from one read
+    # of the file: progress is derived from both, and a page that paired fresh
+    # progress with plans it read earlier (another device has changed them
+    # since) would put a reached tier against the wrong price.
+    targets = _read_profit_targets()
+    payload["target_settings"] = targets
+    payload["target_progress"] = _target_progress(targets["symbols"], accounts)
     return jsonify(payload)
 
 
@@ -600,9 +603,9 @@ PROFIT_TARGETS_FILE = UPLOAD_DIR / ".profit_targets.json"
 _TARGET_MAX_TIERS = 3
 _TARGET_MAX_PRICE = 1_000_000.0
 _TARGET_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-# The plan's prices no longer mean anything, so a new plan starts from today
-# even when it types the same numbers.
-_TARGET_ENDED_STATES = ("expired", "split")
+# The plan's prices no longer mean anything, or its history is gone, so a new
+# plan starts from today even when it types the same numbers.
+_TARGET_ENDED_STATES = ("expired", "split", "stale")
 
 
 def _target_tiers(key: str, raw, stored: bool) -> list[dict]:
@@ -698,12 +701,13 @@ def _target_progress(symbols: dict, accounts: dict) -> dict | None:
 
     None when it could not be worked out, which the panel reports as "not
     judged". A reminder must never take the dashboard down with it, and an
-    empty answer here would read as "nothing has been reached".
+    empty answer here would read as "nothing has been reached" — which is why
+    the snapshots are read strictly: an unreadable file is not an empty one.
     """
     if not symbols:
         return {}
     try:
-        snapshots = {acct_id: load_snapshots(UPLOAD_DIR, acct_id, limit=MAX_KEEP)
+        snapshots = {acct_id: load_snapshots(UPLOAD_DIR, acct_id, limit=MAX_KEEP, strict=True)
                      for acct_id in accounts}
         return evaluate_targets(symbols, accounts, snapshots)
     except Exception:

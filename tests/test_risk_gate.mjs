@@ -726,6 +726,28 @@ test("目标价：拆股后不判，直接说要重填，也不再重复提醒�
   assert.deepEqual([...got.active], []);
 });
 
+test("目标价：设得比保留的快照还早，提示重填，不判也不重复提醒未设", () => {
+  const got = R.riskTargets({ stocks: [holding("METU", 27)] }, ID, { symbols: { METU: planOf(30) } },
+    { METU: { state: "stale", split_on: null, accounts: {} } }, ["METU"]);
+  assert.deepEqual(got.blocked, [{ u: "METU", why: "stale", on: null }]);
+  assert.deepEqual([...got.active], []);
+  assert.deepEqual(got.missing, []);
+  assert.equal(R.targetIsLive(planOf(30), { state: "stale" }), false);
+});
+
+test("目标价：读数对不上这组价格就不用，正股留在 10% 线", () => {
+  const data = { stocks: [holding("METU", 20.8)] };
+  const progress = { METU: live(reached({ price: 25 }), { price: 35, ...open }) };
+  const got = R.riskTargets(data, ID, { symbols: { METU: planOf(30, 35) } }, progress, []);
+  assert.deepEqual(got.groups, []);
+  assert.deepEqual([...got.active], []);
+  assert.equal(R.riskProfits(data, CFG, got.active).length, 1);
+  // 价格对得上就照常判
+  const ok = R.riskTargets(data, ID, { symbols: { METU: planOf(30, 35) } },
+    { METU: live(reached({ price: 30 }), { price: 35, ...open }) }, []);
+  assert.deepEqual(ok.groups.map(g => g.u), ["METU"]);
+});
+
 test("目标价：没有正股的账户不判；有 call 就说一声，只卖 put 的不吵", () => {
   const plans = { symbols: { NVDA: planOf(250), SOXL: planOf(100) } };
   const progress = { NVDA: { state: "pending", accounts: {} }, SOXL: { state: "pending", accounts: {} } };
