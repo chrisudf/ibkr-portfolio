@@ -337,12 +337,19 @@ function ensureDeltaQuotes(accounts) {
 
 const deltaOpen = new Set();     // expanded underlyings, kept across re-renders
 
+// One decimal at most. A delta share count is rarely whole (3 short puts at a
+// −0.652 delta are 195.6 shares), and printing it to the whole share made the
+// column disagree with Delta 市值 when multiplied out by hand: SOXL's 697.774
+// shown as 698 is $9 at $40.87. Whole counts (stock) still print bare.
 const deltaFmtShares = (v) => {
-  if (!v) return "0";
-  const digits = Math.abs(v) >= 10 ? 0 : 1;
-  const s = Math.abs(v).toLocaleString("en-US", { maximumFractionDigits: digits, minimumFractionDigits: 0 });
-  return (v > 0 ? "+" : "-") + s;
+  const s = Math.abs(v).toLocaleString("en-US", { maximumFractionDigits: 1 });
+  return s === "0" ? "0" : (v > 0 ? "+" : "-") + s;
 };
+// The multiplication behind a Delta 市值 cell, to a thousandth of a share —
+// enough to check by hand to the dollar, which the 0.1-share column is not
+// (0.05 of a share is already $8 at $170).
+const deltaValueTip = (shares, spot, value) =>
+  (spot > 0 ? `${shares.toFixed(3)} 股 × ${fmtMoney(spot, 2)} ≈ ${fmtMoney(value)}` : "");
 const deltaTone = (v) => (v > 0.5 ? "up" : v < -0.5 ? "down" : "muted");
 
 const DELTA_LEG_LABEL = {
@@ -431,7 +438,7 @@ function deltaDetailHtml(r, merged) {
       <td class="num">${ivText}</td>
       <td class="num">${c.delta.toFixed(2)}</td>
       <td class="num ${deltaTone(c.shares)}">${deltaFmtShares(c.shares)}</td>
-      <td class="num">${fmtMoney(c.shares * (r.spot || 0))}</td>
+      <td class="num" title="${esc(deltaValueTip(c.shares, r.spot, c.shares * (r.spot || 0)))}">${fmtMoney(c.shares * (r.spot || 0))}</td>
       <td class="num">${Math.round(c.T * 365)}</td></tr>`);
   }
   return `
@@ -472,13 +479,31 @@ function deltaRowHtml(r, scale, merged, q) {
       <td class="num">${cell(L.shortPut)}</td>
       <td class="num" title="${esc(otherTip)}">${cell(other)}</td>
       <td class="num"><b>${deltaFmtShares(r.deltaShares)}</b></td>
-      <td class="num"><b class="${r.deltaValue < -0.5 ? "down" : ""}">${fmtMoney(r.deltaValue)}</b></td>
+      <td class="num" title="${esc(deltaValueTip(r.deltaShares, r.spot, r.deltaValue))}"><b class="${r.deltaValue < -0.5 ? "down" : ""}">${fmtMoney(r.deltaValue)}</b></td>
       <td class="num">${fmtPct(r.weight, 1)}</td>
       <td class="delta-bar-cell">${deltaBarHtml(r, scale)}</td>
     </tr>
     <tr class="delta-detail" data-delta-for="${esc(r.symbol)}"${open ? "" : " hidden"}>
       <td colspan="9">${deltaDetailHtml(r, merged)}</td>
     </tr>`;
+}
+
+// The line a folded panel keeps. Rendered whether or not the panel is folded,
+// so unfolding and folding never shows a stale line.
+function deltaSummaryHtml(book, q) {
+  const t = book.totals, nav = book.totalNav;
+  const per1 = -t.deltaValue * 0.01;
+  const parts = [
+    `Delta 市值 <b>${fmtMoney(t.deltaValue)}</b>`
+      + (nav > 0 ? `，净值的 <b>${(t.deltaValue / nav).toFixed(2)} 倍</b>` : ""),
+    `每跌 1% ≈ <b class="${deltaTone(per1)}">${fmtMoney(per1)}</b>`,
+  ];
+  if (t.deltaValue && Math.abs(t.legValue.shortPut) >= 0.5) {
+    parts.push(`卖 put 占 <b>${fmtPct(t.legValue.shortPut / t.deltaValue, 0)}</b>`);
+  }
+  if (q.state === "loading") parts.push(`<span class="muted">正在取收盘价…</span>`);
+  else if (t.unpriced) parts.push(`<span class="amber">${t.unpriced} 张缺正股价，没算进去</span>`);
+  return parts.map(p => `<span class="delta-sum">${p}</span>`).join("");
 }
 
 function renderDeltaExposure() {
@@ -510,6 +535,7 @@ function renderDeltaExposure() {
     yahoo.length ? `${yahoo.join("、")} 的正股价来自 Yahoo` : "",
   ].filter(Boolean).join(" · ");
 
+  $("delta-summary").innerHTML = deltaSummaryHtml(book, q);
   $("delta-hero").innerHTML = deltaHeroHtml(book);
 
   const t = book.totals;
@@ -525,11 +551,12 @@ function renderDeltaExposure() {
   warnEl.textContent = warn.join("；");
 
   const scale = book.rows.reduce((m, r) => Math.max(m, Math.abs(r.deltaValue)), 0);
-  $("delta-body").innerHTML = book.rows.map(r => deltaRowHtml(r, scale, merged, q)).join("");
+  $("delta-rows").innerHTML = book.rows.map(r => deltaRowHtml(r, scale, merged, q)).join("");
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-  const body = $("delta-body");
+  // #delta-body is the fold wrapper wirePanelFold wants; the rows are #delta-rows.
+  const body = $("delta-rows");
   if (!body) return;
   // Delegated: the rows are rebuilt on every render.
   body.addEventListener("click", (e) => {
@@ -543,4 +570,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const detail = [...body.querySelectorAll("tr.delta-detail")].find(tr => tr.dataset.deltaFor === sym);
     if (detail) detail.hidden = !open;
   });
+  // The title folds the panel, the same switch as 风险闸门 / 止盈提醒 (the
+  // helper lives in risk.js, which loads first); remembered per browser.
+  wirePanelFold("delta", "ibkr.deltaPanel.collapsed");
 });

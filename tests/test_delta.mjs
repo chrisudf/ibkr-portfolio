@@ -50,11 +50,18 @@ const DASH_FNS = ["parseExpiryTs", "computeExposures"];
 const DELTA_FNS = ["deltaNormCdf", "bsValue", "bsDelta", "impliedVol", "optionDelta", "deltaAsOf",
                    "deltaDayTs", "deltaNeeds", "deltaPricer", "blankDeltaRow", "finishDeltaBook",
                    "deltaBook", "mergeDeltaBooks"];
+const FMT = [
+  extractConst(dash, /const fmtMoney = \(v, digits = 0\) => \{[\s\S]*?\n\};/, "fmtMoney"),
+  extractConst(delta, /const deltaFmtShares = \(v\) => \{[\s\S]*?\n\};/, "deltaFmtShares"),
+  extractConst(delta, /const deltaValueTip = [\s\S]*?: ""\);/, "deltaValueTip"),
+].join("\n");
+
 const D = new Function(
-  `${consts}\n`
+  `${consts}\n${FMT}\n`
   + DASH_FNS.map(n => extract(dash, "dashboard.js", n)).join("\n") + "\n"
   + DELTA_FNS.map(n => extract(delta, "delta.js", n)).join("\n")
-  + `\nreturn { ${[...DASH_FNS, ...DELTA_FNS, "DELTA_RATE", "DELTA_SHOCK"].join(", ")} };`)();
+  + `\nreturn { ${[...DASH_FNS, ...DELTA_FNS, "DELTA_RATE", "DELTA_SHOCK",
+                   "deltaFmtShares", "deltaValueTip"].join(", ")} };`)();
 
 const near = (a, b, eps, what = "") =>
   assert.ok(Math.abs(a - b) <= eps, `${what} expected ${b} ± ${eps}, got ${a}`);
@@ -279,6 +286,22 @@ test("总账户 = 各账户分别算再相加，合约带上账户", () => {
   near(soxl.weight, soxl.deltaValue / 170000, 1e-12);
 });
 
+// --- display --------------------------------------------------------------------
+
+test("股数显示到 0.1 股，整数不带小数；悬停的乘式能手算对到美元", () => {
+  // 真实的一行：SOXL 折 697.774 股。按整股显示成 698，698 × 40.87 比面板多出 $9。
+  assert.equal(D.deltaFmtShares(697.7744426180117), "+697.8");
+  assert.equal(D.deltaFmtShares(34), "+34");
+  assert.equal(D.deltaFmtShares(-195.5599), "-195.6");
+  assert.equal(D.deltaFmtShares(2190.62), "+2,190.6");
+  assert.equal(D.deltaFmtShares(0.04), "0");
+  assert.equal(D.deltaFmtShares(-0.04), "0");
+  assert.equal(D.deltaFmtShares(0), "0");
+  assert.equal(D.deltaValueTip(697.7744426180117, 40.869998931884766, 28518.040724494633),
+               "697.774 股 × $40.87 ≈ $28,518");
+  assert.equal(D.deltaValueTip(10, null, 0), "");
+});
+
 // --- wiring ---------------------------------------------------------------------
 
 test("delta.js 用到的每个元素 id 都在模板里，脚本在 dashboard.js 之后加载", () => {
@@ -292,4 +315,22 @@ test("delta.js 用到的每个元素 id 都在模板里，脚本在 dashboard.js
   const render = extract(dash, "dashboard.js", "render");
   assert.ok(render.indexOf("renderDeltaExposure()") > render.indexOf("renderRiskGate()"),
             "render() 要在风险闸门之后调 renderDeltaExposure");
+});
+
+test("面板能收起：跟风险闸门同一个开关，四个 id 齐全，risk.js 先加载", () => {
+  assert.match(delta, /wirePanelFold\("delta", "ibkr\.deltaPanel\.collapsed"\)/);
+  for (const id of ["delta-panel", "delta-toggle", "delta-summary", "delta-body"]) {
+    assert.ok(html.includes(`id="${id}"`), `templates/dashboard.html 里没有 #${id}`);
+  }
+  assert.ok(html.includes('aria-controls="delta-body"'));
+  assert.ok(html.indexOf("/static/js/delta.js") > html.indexOf("/static/js/risk.js"),
+            "wirePanelFold 在 risk.js 里，delta.js 要在它之后加载");
+});
+
+test("模板里的 id 不重复", () => {
+  // 重复的 id 不报错：getElementById 静静地拿第一个。收起用的 #delta-body 一度跟
+  // 表格的 tbody 同名，渲染行时会把整个面板的内容冲掉。
+  const ids = [...html.matchAll(/\bid="([^"]+)"/g)].map(m => m[1]);
+  const dupes = ids.filter((id, i) => ids.indexOf(id) !== i);
+  assert.deepEqual(dupes, []);
 });

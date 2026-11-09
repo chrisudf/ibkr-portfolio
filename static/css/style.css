@@ -591,6 +591,11 @@ table.holdings tr.delta-detail:hover td { padding: 0 12px 14px; background: rgba
 }
 .delta-sub th { color: var(--text-faint); font-weight: 500; font-size: 11px; }
 .delta-sub .num { text-align: right; font-variant-numeric: tabular-nums; }
+/* The line a folded panel keeps (layout from .risk-summary). */
+.delta-sum { color: var(--text-dim); }
+.delta-sum b { color: var(--text); font-variant-numeric: tabular-nums; }
+.delta-sum b.down { color: var(--red); }
+.delta-sum b.up { color: var(--green); }
 @media (max-width: 800px) { .delta-hero { grid-template-columns: 1fr; } }
 /* A phone keeps the columns that answer the panel's question — how big, how
    much of it from sold puts — and drops the ones the expanded row repeats

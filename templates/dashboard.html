@@ -196,40 +196,51 @@
       <!-- Delta exposure: every position as the shares it moves like, sold puts included -->
       <section class="panel" id="delta-panel" hidden>
         <div class="panel-head">
-          <h2>Delta 敞口</h2>
+          <h2 class="risk-title">
+            <button id="delta-toggle" class="risk-toggle" type="button"
+                    aria-expanded="true" aria-controls="delta-body" title="收起 / 展开">
+              <span class="risk-chevron" aria-hidden="true">▾</span>Delta 敞口
+            </button>
+          </h2>
           <span class="panel-note" id="delta-note"></span>
         </div>
-        <div class="delta-hero" id="delta-hero"></div>
-        <div class="delta-warn" id="delta-warn" hidden></div>
-        <div class="table-wrap">
-          <table class="holdings delta-table">
-            <thead>
-              <tr>
-                <th>标的</th>
-                <th class="num">收盘价</th>
-                <th class="num">正股</th>
-                <th class="num">卖 put</th>
-                <th class="num">其他期权</th>
-                <th class="num">合计 Δ 股数</th>
-                <th class="num">Delta 市值</th>
-                <th class="num">占净值</th>
-                <th class="delta-bar-cell"><span class="delta-key"><i class="delta-dot stock"></i>正股
-                  <i class="delta-dot shortPut"></i>卖 put <i class="delta-dot other"></i>其他期权</span></th>
-              </tr>
-            </thead>
-            <tbody id="delta-body"></tbody>
-          </table>
+        <!-- Folded, one line stays: the total, its multiple of NAV, a 1% drop. -->
+        <div class="risk-summary" id="delta-summary" hidden></div>
+        <div id="delta-body">
+          <div class="delta-hero" id="delta-hero"></div>
+          <div class="delta-warn" id="delta-warn" hidden></div>
+          <div class="table-wrap">
+            <table class="holdings delta-table">
+              <thead>
+                <tr>
+                  <th>标的</th>
+                  <th class="num">收盘价</th>
+                  <th class="num">正股</th>
+                  <th class="num">卖 put</th>
+                  <th class="num">其他期权</th>
+                  <th class="num">合计 Δ 股数</th>
+                  <th class="num">Delta 市值</th>
+                  <th class="num">占净值</th>
+                  <th class="delta-bar-cell"><span class="delta-key"><i class="delta-dot stock"></i>正股
+                    <i class="delta-dot shortPut"></i>卖 put <i class="delta-dot other"></i>其他期权</span></th>
+                </tr>
+              </thead>
+              <tbody id="delta-rows"></tbody>
+            </table>
+          </div>
+          <div class="margin-foot">把每个持仓折成「跟着涨跌的股数」：<b>Delta 股数</b> = 正股股数 + 每张合约的 delta × 张数 × 合约乘数，
+            <b>Delta 市值</b> = Delta 股数 × 收盘价。<b>卖 put 的 delta 是正的</b> —— 跌的时候它跟正股一起亏，越价内越接近一张顶 100 股；
+            「核心持仓与仓位区间」按投入资本算，只卖 put 的标的在那里是 0%，在这里按 delta 算进来。
+            delta 用 Black-Scholes，隐含波动率从每张合约自己的收盘价反推（利率按 4%），崩盘日抬高的波动率已经在里面；
+            没算分红和美式提前行权，深度价内的 put 会少算一点（对过美式二叉树：多数差 0.01，期限长的深度价内 put 差到 0.05，合计约少 2%）。
+            正股价：有账户持有正股的用 IBKR 报表里的收盘价；只有期权的标的（价格旁标 <span class="delta-src">Y</span>）从 Yahoo 取<b>报表同一天</b>的收盘价，
+            不用之后的价格 —— 期权价是那天的，正股价也得是那天的。只把代码发给 Yahoo，不带数量和账户。
+            「每跌 1%」是线性估算；卖 put 越跌 delta 越大，跌得多时实际亏得比线性多，
+            「全线跌 10%」按原隐含波动率把每张合约重算了一遍，但真跌的时候隐含波动率通常会涨，所以仍是下界。
+            杠杆 ETF 按 ETF 自己的价格算，没再乘杠杆倍数；BOXX / SGOV 当现金，不计。点标的展开每张合约。
+            股数显示到 0.1 股，Delta 市值用的是没取整的股数，拿表里的股数手算会差一点；鼠标停在 Delta 市值上看精确的乘式。
+            点标题可以收起，收起后留一行合计（收起状态记在当前浏览器）。</div>
         </div>
-        <div class="margin-foot">把每个持仓折成「跟着涨跌的股数」：<b>Delta 股数</b> = 正股股数 + 每张合约的 delta × 张数 × 合约乘数，
-          <b>Delta 市值</b> = Delta 股数 × 收盘价。<b>卖 put 的 delta 是正的</b> —— 跌的时候它跟正股一起亏，越价内越接近一张顶 100 股；
-          「核心持仓与仓位区间」按投入资本算，只卖 put 的标的在那里是 0%，在这里按 delta 算进来。
-          delta 用 Black-Scholes，隐含波动率从每张合约自己的收盘价反推（利率按 4%），崩盘日抬高的波动率已经在里面；
-          没算分红和美式提前行权，深度价内的 put 会少算一点（对过美式二叉树：多数差 0.01，期限长的深度价内 put 差到 0.05，合计约少 2%）。
-          正股价：有账户持有正股的用 IBKR 报表里的收盘价；只有期权的标的（价格旁标 <span class="delta-src">Y</span>）从 Yahoo 取<b>报表同一天</b>的收盘价，
-          不用之后的价格 —— 期权价是那天的，正股价也得是那天的。只把代码发给 Yahoo，不带数量和账户。
-          「每跌 1%」是线性估算；卖 put 越跌 delta 越大，跌得多时实际亏得比线性多，
-          「全线跌 10%」按原隐含波动率把每张合约重算了一遍，但真跌的时候隐含波动率通常会涨，所以仍是下界。
-          杠杆 ETF 按 ETF 自己的价格算，没再乘杠杆倍数；BOXX / SGOV 当现金，不计。点标的展开每张合约。</div>
       </section>
 
       <!-- Core holdings vs caps -->
