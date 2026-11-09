@@ -685,6 +685,10 @@ function render(data) {
   // Position rules are judged against THIS view — recompute before the
   // treemap reads it per tile.
   currentDataRef._exposures = computeExposures(data);
+  // So is the sold puts' delta (static/js/delta.js): it keeps a name its puts
+  // already fill from reading 欠配. Guarded — a failure there must not cost
+  // the panels below; they then judge on capital alone, as before.
+  currentDataRef._delta = typeof computeDeltaView === "function" ? computeDeltaView() : null;
 
   // Treemap (tiles carry the core-holding ring / over-under badge)
   renderTreemap(stocks);
@@ -783,8 +787,11 @@ const MARK_ITM_RATIO = 0.10;
 
 // Underlying mark prices, pooled across every loaded account — a price is a
 // market fact, not account data, so a stock held only in U22 still prices a
-// U17 short put. Populated from stock positions; underlyings we hold no
-// shares of simply aren't in here.
+// U17 short put. Populated from stock positions first; a name held only
+// through options, which no statement prices, takes the statement-date close
+// the delta panel fetched (fetchedCloses). Until that lands, or if it fails,
+// such a name simply isn't in here and the panels fall back to their
+// estimates (at-the-money margin, "价?" in the expiry calendar).
 function buildPriceBook(accounts) {
   const px = {};
   for (const a of Object.values(accounts || {})) {
@@ -792,7 +799,38 @@ function buildPriceBook(accounts) {
       if (s.close_price > 0 && !(s.symbol in px)) px[s.symbol] = s.close_price;
     }
   }
+  for (const [sym, c] of Object.entries(fetchedCloses())) {
+    if (!(sym in px)) px[sym] = c.close;
+  }
   return px;
+}
+
+// The closes /api/underlying-closes returned, one per name like the stock
+// marks: the latest statement date's when accounts differ. {} until they
+// arrive. static/js/delta.js keeps on currentDataRef.underlyingCloses only
+// the (date, name) pairs the LOADED statements asked for, so these are the
+// same day as the option marks on screen — never a later price, even when the
+// server's files moved on between the two requests.
+function fetchedCloses() {
+  const q = typeof currentDataRef === "object" ? currentDataRef.underlyingCloses : null;
+  const out = {};
+  if (!q || !q.closes) return out;
+  for (const day of Object.keys(q.closes).sort()) {
+    for (const [sym, c] of Object.entries(q.closes[day] || {})) {
+      if (c && c.close > 0) out[sym] = c;
+    }
+  }
+  return out;
+}
+
+// Names the price book prices from a fetched close rather than a statement
+// mark — the panels tag those prices so it is clear where they came from.
+function closePricedSymbols(accounts) {
+  const marked = new Set();
+  for (const a of Object.values(accounts || {})) {
+    for (const s of a.stocks || []) if (s.close_price > 0) marked.add(s.symbol);
+  }
+  return new Set(Object.keys(fetchedCloses()).filter(sym => !marked.has(sym)));
 }
 
 // Reg-T requirement for one short contract, per share of underlying.
@@ -1041,19 +1079,24 @@ function renderMargin(data, accounts) {
     + "做空正股不是抵押品 —— 卖出所得已 100% 记在现金里，Reg-T 再加约 30% "
     + "维持保证金，故按 130% 扣减。";
 
+  const fromCloses = closePricedSymbols(accounts);
+  const closeNames = [...new Set(m.rows.map(r => r.underlying))].filter(u => fromCloses.has(u));
   const note = $("margin-note");
   note.textContent = (m.assumedContracts > 0
     ? `Reg-T 估算 · ${m.assumedContracts} 张合约无正股报价，按平值估算`
       + `（占估算额 ${fmtPct(m.assumedShare, 0)}）`
-    : "Reg-T 估算 · 正股价格取自当前持仓")
+    : closeNames.length
+      ? `Reg-T 估算 · 正股价取自持仓，只有期权的 ${closeNames.join("、")} 用报表当天的收盘价（Yahoo）`
+      : "Reg-T 估算 · 正股价格取自当前持仓")
     + (m.unparsedContracts > 0
       ? ` · ${m.unparsedContracts} 张合约读不出行权价/方向，其权利金负债`
         + `（${fmtMoney(m.unparsedMv)}）已计入并从剩余流动性扣除，`
         + `Reg-T 腿未计 —— 实际占用高于显示`
       : "");
   note.title = m.assumedContracts > 0
-    ? "平值假设对价外的卖put偏保守 —— 实际保证金通常低于此。"
-      + "买入这些标的的正股后，价格会自动接入，数字随之收紧。"
+    ? "平值假设对卖put偏保守 —— 实际保证金通常低于此。"
+      + "只有期权的标的，报表当天的收盘价（Delta 敞口面板从 Yahoo 取）一到就自动接入，数字随之收紧；"
+      + "取价失败时一分钟后切换账号或刷新页面会再试。"
     : "";
 
   // Gap stress: same estimator, spot and stock sleeve shocked together.
@@ -1095,11 +1138,13 @@ function renderMargin(data, accounts) {
   for (const r of m.rows) {
     const kinds = [r.puts ? `${r.puts} PUT` : "", r.calls ? `${r.calls} CALL` : ""].filter(Boolean).join(" · ");
     const priceTag = r.priceKnown ? "" : ` <span class="tag tag-short">估算价</span>`;
+    const srcTag = fromCloses.has(r.underlying)
+      ? ` <span class="delta-src" title="报表里没有这只正股，用的是 Yahoo 报表当天的收盘价">Y</span>` : "";
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td><b>${r.underlying}</b>${priceTag}</td>
       <td>${kinds}${r.covered ? ` <span class="tag tag-flow-in">${r.covered} 张有正股覆盖</span>` : ""}</td>
-      <td class="num">${fmtMoney(r.spot, 2)}</td>
+      <td class="num">${fmtMoney(r.spot, 2)}${srcTag}</td>
       <td class="num muted">${r.notional ? fmtMoney(r.notional, 0) : "—"}</td>
       <td class="num">${fmtMoney(r.premium, 0)}</td>
       <td class="num"><b>${fmtMoney(r.requirement, 0)}</b></td>
@@ -1743,7 +1788,7 @@ function renderExpiries(data, accounts) {
               + `权利金已超行权价的 ${fmtPct(MARK_ITM_RATIO, 0)}，几乎不可能是纯时间价值">`
               + `<b>可能 ${w.likelyItm}</b></span>`
             : "",
-          `<span class="muted" title="组合里没有该标的正股，无法用现价判定价内外">`
+          `<span class="muted" title="组合里没有该标的正股，报表当天的收盘价也还没取到（或取价失败），判定不了价内外">`
             + `价? ${w.unpriced}</span>`,
         ].filter(Boolean).join(" · ")
       : (w.itm ? `<span class="down"><b>${w.itm}</b></span>` : "0");
@@ -2013,24 +2058,48 @@ function positionStatus(weight, cfg) {
   return "ok";
 }
 
-const POS_STATUS_LABEL = { over: "超上限", under: "欠配", ok: "区间内" };
+// The status a row is shown with. 仓位区间 stays judged on capital — what you
+// mean to hold — and sold puts are not capital: most are written for the
+// premium, not to be assigned. But a name whose sold puts already carry more
+// delta than the band's upper bound is no room to add, whatever its capital
+// says: 0% capital and 40% of NAV in put delta would otherwise read 欠配,
+// an invitation the book cannot take. Only 欠配 gives way — it is the one
+// status that says "add". putWeight is the puts' delta $ ÷ the view's NAV.
+function coreStatus(weight, cfg, putWeight) {
+  const status = positionStatus(weight, cfg);
+  if (status !== "under" || !(putWeight > 0)) return status;
+  const [, hi] = resolveBounds(cfg);
+  return weight + putWeight > hi ? "putfilled" : status;
+}
+
+// The sold puts' delta for the view on screen as a share of its NAV, from the
+// delta book render() computed (static/js/delta.js); 0 when there is none.
+function putWeightOf(symbol) {
+  const v = currentDataRef._delta;
+  return (v && v.putWeight && v.putWeight[symbol]) || 0;
+}
+
+const POS_STATUS_LABEL = { over: "超上限", putfilled: "卖 put 已折过上限", under: "欠配", ok: "区间内" };
 
 function exposureTip(r) {
   const bits = [];
   if (r.stockMV) bits.push(`正股 ${fmtMoney(r.stockMV, 0)}`);
   if (r.longOptMV) bits.push(`期权多头 ${fmtMoney(r.longOptMV, 0)}`);
-  return bits.join(" + ") || "无投入资本";
+  const capital = bits.join(" + ") || "无投入资本";
+  return r.putWeight > 0
+    ? `${capital}；另有卖 put 按 delta 折净值的 ${fmtPct(r.putWeight, 1)}（不算投入资本）`
+    : capital;
 }
 
 // Row order on the panel, picked by clicking the 状态 or 占总资产 header and
-// flipped by clicking it again. 状态 (the default) puts what needs adjusting
-// first — over the cap, then under the floor — core holdings first within
-// each; 占总资产 ranks by weight. Each comparator gives the ▼ order; ties go
-// by ticker in either direction, so two renders that agree on the key never
-// reshuffle.
-const CORE_STATUS_RANK = { over: 0, under: 1, ok: 2 };
+// flipped by clicking it again. 状态 (the default) puts what needs attention
+// first — over the cap, then names whose sold puts already fill the band,
+// then under the floor — core holdings first within each; 占总资产 ranks by
+// weight. Each comparator gives the ▼ order; ties go by ticker in either
+// direction, so two renders that agree on the key never reshuffle.
+const CORE_STATUS_RANK = { over: 0, putfilled: 1, under: 2, ok: 3 };
 const CORE_SORTS = {
-  status: (a, b) => (CORE_STATUS_RANK[a.status] ?? 3) - (CORE_STATUS_RANK[b.status] ?? 3)
+  status: (a, b) => (CORE_STATUS_RANK[a.status] ?? 4) - (CORE_STATUS_RANK[b.status] ?? 4)
     || b.core - a.core || b.weight - a.weight,
   weight: (a, b) => b.weight - a.weight,
 };
@@ -2074,11 +2143,13 @@ function positionRows() {
   const rows = Object.keys(cfg).map(sym => {
     const ex = bySymbol[sym] || empty;
     const c = cfg[sym];
+    const putWeight = putWeightOf(sym);
     return {
       symbol: sym, ...ex,
       core: !!c.core,
       min: c.min, max: c.max,
-      status: positionStatus(ex.weight, c),
+      putWeight,
+      status: coreStatus(ex.weight, c, putWeight),
       held: !!bySymbol[sym],
       elsewhere: !bySymbol[sym] && universe.has(sym),
     };
@@ -2096,11 +2167,15 @@ function renderCorePositions(scopeLabel) {
   updateSortIndicators("core-body", coreSort);
 
   const alerts = rows.filter(r => r.status === "over" || r.status === "under");
+  const filled = rows.filter(r => r.status === "putfilled").length;
   const coreCount = rows.filter(r => r.core).length;
-  $("core-note").textContent =
-    `${coreCount} 个核心持仓 · ${rows.length} 条规则 · `
-    + (alerts.length ? `${alerts.length} 项需要调整` : "全部在区间内")
-    + ` · 口径 ${scopeLabel || "当前账号"}（总净值 ${fmtMoney(totalNav)}）`;
+  $("core-note").textContent = [
+    `${coreCount} 个核心持仓`,
+    `${rows.length} 条规则`,
+    alerts.length ? `${alerts.length} 项需要调整` : filled ? "" : "全部在区间内",
+    filled ? `${filled} 只欠配但卖 put 已折过上限` : "",
+    `口径 ${scopeLabel || "当前账号"}（总净值 ${fmtMoney(totalNav)}）`,
+  ].filter(Boolean).join(" · ");
 
   const tbody = $("core-body");
   tbody.innerHTML = "";
@@ -2126,6 +2201,11 @@ function renderCorePositions(scopeLabel) {
     let verdict = '<span class="muted">未设区间</span>';
     if (r.status === "over") {
       verdict = `<span class="tag tag-over">超上限 +${((r.weight - hi) * 100).toFixed(1)}pp</span>`;
+    } else if (r.status === "putfilled") {
+      verdict = `<span class="tag tag-short" title="${esc(
+        `按投入资本是欠配 −${((lo - r.weight) * 100).toFixed(1)}pp；但卖 put 按 delta 已折净值的 `
+        + `${fmtPct(r.putWeight, 1)}，加上现有仓位超过了上限 ${fmtPct(hi, 1)}，不算可以加仓`)}">`
+        + `卖 put 已折 ${fmtPct(r.putWeight, 1)}</span>`;
     } else if (r.status === "under") {
       verdict = `<span class="tag tag-under">欠配 −${((lo - r.weight) * 100).toFixed(1)}pp</span>`;
     } else if (r.status === "ok") {
@@ -2166,7 +2246,8 @@ function tileFlag(symbol) {
   if (!cfg) return { core: false, status: null };
   const row = currentExposures().bySymbol[symbol];
   const weight = row ? row.weight : 0;
-  const status = positionStatus(weight, cfg);
+  const putWeight = putWeightOf(symbol);
+  const status = coreStatus(weight, cfg, putWeight);
   const scope = currentDataRef.selected === "ALL" ? "全账户合并" : "本账号";
   const parts = [cfg.core ? "核心持仓" : "已设区间", `${scope}敞口占比 ${fmtPct(weight, 1)}`];
   if (cfg.min != null || cfg.max != null) {
@@ -2175,6 +2256,8 @@ function tileFlag(symbol) {
       : `目标区间 ${fmtPct(cfg.min, 1)} – ${fmtPct(cfg.max, 1)}`);
   }
   if (status === "over" || status === "under") parts.push(POS_STATUS_LABEL[status]);
+  // No badge: the tile is not under-weight in any sense that invites adding.
+  if (status === "putfilled") parts.push(`卖 put 按 delta 已折 ${fmtPct(putWeight, 1)}，不算欠配`);
   return {
     core: !!cfg.core,
     status,

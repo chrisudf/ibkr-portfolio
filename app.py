@@ -26,7 +26,7 @@ from parser.flex_fetch import (FLEX_BUDGET_SEC, FLEX_CONFIG_NOTES,
                                FLEX_POLL_INTERVAL, FlexFetchError, fetch_one,
                                parse_accounts_env)
 from parser.dataroma import fetch_all as fetch_all_13f
-from parser.quotes import needed_closes, resolve_closes
+from parser.quotes import needed_closes, refresh_after, resolve_closes
 from parser.ibkr_flex_csv import describe_sections
 from parser.snapshots import load_snapshots, record_snapshot
 
@@ -249,12 +249,20 @@ def underlying_closes():
             app.logger.info("[quotes] no close for %s on %s: %s", sym, day, miss.get("error"))
     return jsonify({
         "source": "Yahoo Finance",
+        # What the server read off the statements, for diagnosis only. The page
+        # values each account on the date of the statement IT loaded: this
+        # request reads the files separately, and a sync landing between the
+        # two would otherwise pair one day's option marks with the next day's
+        # spot.
         "dates": dates,
         "closes": {day: {sym: {"close": c["close"], "bar": c["bar"]}
                          for sym, c in syms.items()}
                    for day, syms in closes.items()},
         "missing": {day: {sym: m.get("error") or "" for sym, m in syms.items()}
                     for day, syms in misses.items()},
+        # When asking again could change the answer (a miss past its back-off,
+        # a provisional bar past its TTL); null when nothing in it will.
+        "retry_after": refresh_after(closes, misses, time.time()),
     })
 
 

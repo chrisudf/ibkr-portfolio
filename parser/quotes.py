@@ -41,6 +41,7 @@ droplet and a home connection), so the request carries a browser UA.
 from __future__ import annotations
 
 import json
+import math
 import time
 import urllib.error
 import urllib.parse
@@ -255,3 +256,21 @@ def resolve_closes(need: dict[str, list[str]], cache: dict[str, Any] | None, *,
 
     new_cache = {"version": 1, "closes": closes, "misses": misses}
     return closes, misses, new_cache
+
+
+def refresh_after(closes: dict, misses: dict, now: float) -> int | None:
+    """Seconds until part of this answer would come out differently, or None.
+
+    A miss is retried after MISS_RETRY_SEC and a provisional bar refetched
+    after PROVISIONAL_TTL_SEC; asking any sooner gets the cached answer back.
+    The page keeps its copy until then — without this it would keep a name
+    Yahoo missed once for as long as the tab stays open, since a partial
+    answer is still a 200.
+    """
+    due = [(m.get("at") or 0) + MISS_RETRY_SEC
+           for syms in misses.values() for m in syms.values()]
+    due += [(c.get("at") or 0) + PROVISIONAL_TTL_SEC
+            for syms in closes.values() for c in syms.values() if not c.get("final")]
+    if not due:
+        return None
+    return max(0, math.ceil(min(due) - now))

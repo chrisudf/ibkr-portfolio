@@ -267,13 +267,18 @@ function deltaBook(data, price, asOfTs, acct = "") {
     if (qty > 0) r.capital += Math.max(o.value || 0, 0);
     const p = price(sym);
     const g = optionDelta(o, p ? p.px : null, asOfTs);
-    r.contracts.push({ o, acct, ...g });
+    // The spot and dollars this contract was valued at — its own account's
+    // statement date. The merged view's detail rows print these: the row's
+    // spot is one account's, and on another date it would price the rest wrong.
+    const c = { o, acct, ...g, spot: p ? p.px : null, value: 0 };
+    r.contracts.push(c);
     if (g.status === "unparsed") { r.unparsed += Math.abs(qty); continue; }
     if (g.status === "unpriced") { r.unpriced += Math.abs(qty); continue; }
     if (g.status === "nosolve") r.nosolve += Math.abs(qty);
     const kind = (qty < 0 ? "short" : "long") + (o.right === "P" ? "Put" : "Call");
+    c.value = g.shares * p.px;
     r.legs[kind] += g.shares;
-    r.legValue[kind] += g.shares * p.px;
+    r.legValue[kind] += c.value;
     r.shockPnl += g.shockPnl;
   }
   for (const r of Object.values(rows)) {
@@ -308,29 +313,117 @@ function mergeDeltaBooks(books) {
 
 /* ---- loading ------------------------------------------------------------ */
 
-let deltaQuotes = { key: null, state: "idle", data: null, at: 0, error: "" };
+let deltaQuotes = { key: null, state: "idle", data: null, at: 0, error: "",
+                    retryAt: Infinity, inflight: false };
+
+// Only the (date, name) pairs the loaded statements asked for. The endpoint
+// reads the statements on its own, so right after a sync it can answer for a
+// newer date than the page holds — and a close from another day must not
+// price these option marks. Such a name stays unpriced (缺价) instead.
+function deltaPickCloses(closes, needs) {
+  const out = {};
+  for (const k of needs) {
+    const cut = k.indexOf(" ");
+    const day = k.slice(0, cut), sym = k.slice(cut + 1);
+    const c = closes && closes[day] && closes[day][sym];
+    if (c && c.close > 0) (out[day] || (out[day] = {}))[sym] = c;
+  }
+  return out;
+}
+
+// Whether the answer on hand for the same names should be asked for again:
+// the last ask failed (after DELTA_RETRY_MS), or the server said part of it
+// would come out differently by now (retry_after — a name Yahoo missed, past
+// its back-off; a bar taken mid-session, past its TTL). A partial answer is
+// still a 200, so without this a miss would stick for as long as the tab is
+// open. Never while an ask is in flight.
+function deltaRefreshDue(q, now) {
+  if (q.inflight) return false;
+  if (q.state === "error") return now - q.at > DELTA_RETRY_MS;
+  return now >= q.retryAt;
+}
 
 // Asks /api/underlying-closes once per distinct set of names the statements
-// need, and re-renders when the answer lands. No names to fetch → no request.
+// need, and again when deltaRefreshDue says so. No names → no request. The
+// answer goes on currentDataRef.underlyingCloses, where buildPriceBook
+// (dashboard.js) reads it, so margin, the expiry calendar and the risk gate
+// price option-only names from it too — hence the whole view redraws.
 function ensureDeltaQuotes(accounts) {
   const needs = deltaNeeds(accounts, (id) => deltaAsOf(accounts[id]));
   const key = needs.join("|");
-  if (!needs.length) return { key, state: "ok", data: null, needs };
-  const cur = deltaQuotes;
-  const retry = cur.state === "error" && Date.now() - cur.at > DELTA_RETRY_MS;
-  if (cur.key === key && !retry) return { ...cur, needs };
-  const mine = { key, state: "loading", data: null, at: Date.now(), error: "" };
-  deltaQuotes = mine;
+  let q = deltaQuotes;
+  if (q.key !== key) {
+    // A different set of names (new statements): closes fetched for the old
+    // set must not price anything until this set's answer is in.
+    currentDataRef.underlyingCloses = null;
+    q = deltaQuotes = { key, state: needs.length ? "loading" : "ok", data: null,
+                        at: Date.now(), error: "", retryAt: Infinity, inflight: false };
+    if (needs.length) fetchDeltaQuotes(q, needs);
+  } else if (needs.length && deltaRefreshDue(q, Date.now())) {
+    // Same names again: the answer on hand keeps pricing until the new one lands.
+    fetchDeltaQuotes(q, needs);
+  }
+  return { ...q, needs };
+}
+
+function fetchDeltaQuotes(q, needs) {
+  q.inflight = true;
   fetch("/api/underlying-closes")
     .then(r => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
-    .then(d => { mine.state = "ok"; mine.data = d; })
-    .catch(exc => {
-      mine.state = "error";
-      mine.error = String(exc.message || exc);
-      mine.at = Date.now();
+    .then(d => {
+      Object.assign(q, { state: "ok", data: d, error: "",
+        retryAt: typeof d.retry_after === "number" ? Date.now() + d.retry_after * 1000 : Infinity });
     })
-    .then(() => { if (deltaQuotes === mine && currentDataRef.allAccounts) renderDeltaExposure(); });
-  return { ...mine, needs };
+    .catch(exc => {
+      q.error = String(exc.message || exc);
+      // A failed first ask has nothing to show; a failed refresh keeps the
+      // answer it had and tries again after the same back-off.
+      if (q.data) q.retryAt = Date.now() + DELTA_RETRY_MS;
+      else q.state = "error";
+    })
+    .then(() => {
+      q.inflight = false;
+      q.at = Date.now();
+      if (deltaQuotes !== q) return;
+      currentDataRef.underlyingCloses = q.data ? { closes: deltaPickCloses(q.data.closes, needs) } : null;
+      if (currentDataRef.allAccounts) renderSelected();
+    });
+}
+
+// The delta book for the account tab on screen. render() calls this once per
+// pass, before the core table and the treemap read the sold puts' delta from
+// it (putWeight: each name's short-put delta $ ÷ the view's NAV), and
+// renderDeltaExposure draws it. null when it cannot be had: the panels that
+// read it then judge as they did before this panel existed, rather than not
+// at all.
+function computeDeltaView() {
+  try {
+    const accounts = currentDataRef.allAccounts || {};
+    const all = Object.keys(accounts).sort();
+    const sel = currentDataRef.selected;
+    const ids = sel && sel !== "ALL" && accounts[sel] ? [sel] : all;
+    if (!ids.length) return null;
+    const q = ensureDeltaQuotes(accounts);
+    // Valued on each loaded statement's own date, always: its option marks
+    // are that day's. The closes are only the pairs these statements asked
+    // for (deltaPickCloses), so a reply dated otherwise prices nothing here.
+    const closes = (currentDataRef.underlyingCloses || {}).closes || {};
+    const dayOf = (id) => deltaAsOf(accounts[id]);
+    const merged = ids.length > 1;
+    const books = ids.map(id => deltaBook(accounts[id],
+      deltaPricer(accounts, closes, dayOf(id), dayOf), deltaDayTs(dayOf(id)), merged ? id : ""));
+    const book = merged ? mergeDeltaBooks(books) : books[0];
+    const putWeight = {};
+    if (book.totalNav > 0) {
+      for (const r of book.rows) {
+        if (r.legValue.shortPut > 0) putWeight[r.symbol] = r.legValue.shortPut / book.totalNav;
+      }
+    }
+    return { book, q, ids, merged, dayOf, putWeight };
+  } catch (exc) {
+    console.error("[delta] view failed", exc);
+    return null;
+  }
 }
 
 /* ---- rendering ---------------------------------------------------------- */
@@ -339,8 +432,8 @@ const deltaOpen = new Set();     // expanded underlyings, kept across re-renders
 
 // One decimal at most. A delta share count is rarely whole (3 short puts at a
 // −0.652 delta are 195.6 shares), and printing it to the whole share made the
-// column disagree with Delta 市值 when multiplied out by hand: SOXL's 697.774
-// shown as 698 is $9 at $40.87. Whole counts (stock) still print bare.
+// column disagree with Delta 市值 when multiplied out by hand — a quarter of a
+// share is $10 on a $40 stock. Whole counts (stock) still print bare.
 const deltaFmtShares = (v) => {
   const s = Math.abs(v).toLocaleString("en-US", { maximumFractionDigits: 1 });
   return s === "0" ? "0" : (v > 0 ? "+" : "-") + s;
@@ -438,7 +531,7 @@ function deltaDetailHtml(r, merged) {
       <td class="num">${ivText}</td>
       <td class="num">${c.delta.toFixed(2)}</td>
       <td class="num ${deltaTone(c.shares)}">${deltaFmtShares(c.shares)}</td>
-      <td class="num" title="${esc(deltaValueTip(c.shares, r.spot, c.shares * (r.spot || 0)))}">${fmtMoney(c.shares * (r.spot || 0))}</td>
+      <td class="num" title="${esc(deltaValueTip(c.shares, c.spot, c.value))}">${fmtMoney(c.value)}</td>
       <td class="num">${Math.round(c.T * 365)}</td></tr>`);
   }
   return `
@@ -462,9 +555,13 @@ function deltaRowHtml(r, scale, merged, q) {
   if (r.unpriced) {
     const sym = r.symbol;
     const missing = q.data && q.data.missing ? Object.values(q.data.missing).map(m => m[sym]).find(Boolean) : "";
+    // Answered, yet neither priced nor reported missing: the reply was for a
+    // different statement date than the page holds (a sync landed mid-load).
+    const why = missing || q.error
+      || (q.data ? "取到的收盘价不是这份报表那天的（服务器上的报表可能刚更新过），刷新页面" : "没有正股价");
     tags.push(q.state === "loading"
       ? `<span class="tag tag-gone">取价中</span>`
-      : `<span class="tag tag-over" title="${esc(missing || q.error || "没有正股价")}">缺价 ${r.unpriced} 张未计</span>`);
+      : `<span class="tag tag-over" title="${esc(why)}">缺价 ${r.unpriced} 张未计</span>`);
   }
   if (r.nosolve) tags.push(`<span class="tag tag-under" title="期权价和正股价对不上，按到期内在价值算">${r.nosolve} 张价不符</span>`);
   const srcTip = r.src === "yahoo"
@@ -506,23 +603,13 @@ function deltaSummaryHtml(book, q) {
   return parts.map(p => `<span class="delta-sum">${p}</span>`).join("");
 }
 
+// Draws the view render() computed this pass (currentDataRef._delta).
 function renderDeltaExposure() {
   const panel = $("delta-panel");
   if (!panel) return;
-  const accounts = currentDataRef.allAccounts || {};
-  const all = Object.keys(accounts).sort();
-  const sel = currentDataRef.selected;
-  const ids = sel && sel !== "ALL" && accounts[sel] ? [sel] : all;
-  if (!ids.length) { panel.hidden = true; return; }
-
-  const q = ensureDeltaQuotes(accounts);
-  const qd = q.data || {};
-  const dayOf = (id) => (qd.dates && qd.dates[id]) || deltaAsOf(accounts[id]);
-  const merged = ids.length > 1;
-  const books = ids.map(id => deltaBook(accounts[id],
-    deltaPricer(accounts, qd.closes, dayOf(id), dayOf), deltaDayTs(dayOf(id)), merged ? id : ""));
-  const book = merged ? mergeDeltaBooks(books) : books[0];
-  if (!book.rows.length) { panel.hidden = true; return; }
+  const view = currentDataRef._delta;
+  if (!view || !view.book.rows.length) { panel.hidden = true; return; }
+  const { book, q, ids, merged, dayOf } = view;
   panel.hidden = false;
 
   const days = [...new Set(ids.map(dayOf).filter(Boolean))].sort();
@@ -541,8 +628,13 @@ function renderDeltaExposure() {
   const t = book.totals;
   const warn = [];
   if (t.unpriced && q.state !== "loading") {
+    // When the next ask happens: a failed one after DELTA_RETRY_MS, a partial
+    // answer when the server's retry_after says it could change.
+    const at = q.state === "error" ? q.at + DELTA_RETRY_MS : q.retryAt;
+    const mins = Number.isFinite(at) ? Math.max(1, Math.ceil((at - Date.now()) / 60000)) : null;
     warn.push(`${t.unpriced} 张合约（${t.unpricedNames.join("、")}）缺正股价，没算进上面的数`
-      + (q.state === "error" ? `：取价失败（${q.error}），过一分钟切换账号或刷新页面会再试` : ""));
+      + (q.state === "error" ? `：取价失败（${q.error}）` : "")
+      + (mins ? `，约 ${mins} 分钟后切换账号或刷新页面会再取` : "，刷新页面再试"));
   }
   if (t.unparsed) warn.push(`${t.unparsed} 张合约读不出行权价 / 方向 / 到期日，没算`);
   if (t.nosolve) warn.push(`${t.nosolve} 张合约的期权价跟正股价对不上，按到期内在价值算 delta`);

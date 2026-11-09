@@ -44,12 +44,13 @@ const consts = [
   extractConst(delta, /const DELTA_VOL_MIN = [^;]+;/, "DELTA_VOL_MIN"),
   extractConst(delta, /const DELTA_YEAR_MS = [^;]+;/, "DELTA_YEAR_MS"),
   extractConst(delta, /const DELTA_SHOCK = [^;]+;/, "DELTA_SHOCK"),
+  extractConst(delta, /const DELTA_RETRY_MS = [^;]+;/, "DELTA_RETRY_MS"),
 ].join("\n");
 
 const DASH_FNS = ["parseExpiryTs", "computeExposures"];
 const DELTA_FNS = ["deltaNormCdf", "bsValue", "bsDelta", "impliedVol", "optionDelta", "deltaAsOf",
                    "deltaDayTs", "deltaNeeds", "deltaPricer", "blankDeltaRow", "finishDeltaBook",
-                   "deltaBook", "mergeDeltaBooks"];
+                   "deltaBook", "mergeDeltaBooks", "deltaPickCloses", "deltaRefreshDue"];
 const FMT = [
   extractConst(dash, /const fmtMoney = \(v, digits = 0\) => \{[\s\S]*?\n\};/, "fmtMoney"),
   extractConst(delta, /const deltaFmtShares = \(v\) => \{[\s\S]*?\n\};/, "deltaFmtShares"),
@@ -60,7 +61,7 @@ const D = new Function(
   `${consts}\n${FMT}\n`
   + DASH_FNS.map(n => extract(dash, "dashboard.js", n)).join("\n") + "\n"
   + DELTA_FNS.map(n => extract(delta, "delta.js", n)).join("\n")
-  + `\nreturn { ${[...DASH_FNS, ...DELTA_FNS, "DELTA_RATE", "DELTA_SHOCK",
+  + `\nreturn { ${[...DASH_FNS, ...DELTA_FNS, "DELTA_RATE", "DELTA_SHOCK", "DELTA_RETRY_MS",
                    "deltaFmtShares", "deltaValueTip"].join(", ")} };`)();
 
 const near = (a, b, eps, what = "") =>
@@ -289,17 +290,101 @@ test("总账户 = 各账户分别算再相加，合约带上账户", () => {
 // --- display --------------------------------------------------------------------
 
 test("股数显示到 0.1 股，整数不带小数；悬停的乘式能手算对到美元", () => {
-  // 真实的一行：SOXL 折 697.774 股。按整股显示成 698，698 × 40.87 比面板多出 $9。
-  assert.equal(D.deltaFmtShares(697.7744426180117), "+697.8");
+  // 编的一行：折 312.734 股、股价 $40.25。按整股显示成 313，313 × 40.25 会比 Delta 市值多出 $10.7。
+  assert.equal(D.deltaFmtShares(312.7341), "+312.7");
   assert.equal(D.deltaFmtShares(34), "+34");
   assert.equal(D.deltaFmtShares(-195.5599), "-195.6");
   assert.equal(D.deltaFmtShares(2190.62), "+2,190.6");
   assert.equal(D.deltaFmtShares(0.04), "0");
   assert.equal(D.deltaFmtShares(-0.04), "0");
   assert.equal(D.deltaFmtShares(0), "0");
-  assert.equal(D.deltaValueTip(697.7744426180117, 40.869998931884766, 28518.040724494633),
-               "697.774 股 × $40.87 ≈ $28,518");
+  assert.equal(D.deltaValueTip(312.7341, 40.25, 312.7341 * 40.25), "312.734 股 × $40.25 ≈ $12,588");
   assert.equal(D.deltaValueTip(10, null, 0), "");
+});
+
+// --- the shared price book --------------------------------------------------------
+
+// buildPriceBook 读 currentDataRef.underlyingCloses：在一个自己的作用域里给它一份。
+const P = new Function([
+  "const currentDataRef = { underlyingCloses: null };",
+  extract(dash, "dashboard.js", "fetchedCloses"),
+  extract(dash, "dashboard.js", "buildPriceBook"),
+  extract(dash, "dashboard.js", "closePricedSymbols"),
+  "return { buildPriceBook, closePricedSymbols, set: (q) => { currentDataRef.underlyingCloses = q; } };",
+].join("\n"))();
+
+test("价格簿：报表里的正股价优先，只有期权的标的用取到的收盘价；没取到时跟以前一样", () => {
+  const accounts = {
+    U1111111: { stocks: [stock("NVDA", 15, 181.6), { symbol: "ZERO", quantity: 1, close_price: 0, value: 0 }] },
+    U2222222: { stocks: [stock("SOFI", 330, 16.04)] },
+  };
+  P.set(null);
+  assert.deepEqual(P.buildPriceBook(accounts), { NVDA: 181.6, SOFI: 16.04 });
+  assert.equal(P.closePricedSymbols(accounts).size, 0);
+
+  P.set({ closes: { [ASOF]: { SOXL: { close: 40.87, bar: ASOF }, NVDA: { close: 999, bar: ASOF } } } });
+  const book = P.buildPriceBook(accounts);
+  assert.equal(book.SOXL, 40.87);
+  assert.equal(book.NVDA, 181.6, "报表价优先");
+  assert.deepEqual([...P.closePricedSymbols(accounts)], ["SOXL"]);
+  P.set(null);
+});
+
+test("价格簿：两个账户报表日期不同时，用较新那天的收盘价", () => {
+  P.set({ closes: { "2026-11-04": { SOXL: { close: 66.68, bar: "2026-11-04" }, COHR: { close: 195.09, bar: "2026-11-04" } },
+                    [ASOF]: { SOXL: { close: 40.87, bar: ASOF } } } });
+  const book = P.buildPriceBook({});
+  assert.equal(book.SOXL, 40.87);
+  assert.equal(book.COHR, 195.09);       // 只有旧日期有的，照用
+  P.set(null);
+});
+
+// --- Copilot 审查（PR #36）提的三处 -------------------------------------------------
+
+test("估值日期只用页面上报表自己的：接口回了别的日期的价，这些名字算缺价", () => {
+  // 页面上是 11/5 的报表，接口在两次请求之间读到了刚同步的 11/6 —— 11/6 的价不能配 11/5 的期权价
+  const reply = { "2026-11-06": { SOXL: { close: 45.97, bar: "2026-11-06" } },
+                  [ASOF]: { COHR: { close: 169.76, bar: ASOF }, ORCL: { close: 115.16, bar: ASOF } } };
+  const picked = D.deltaPickCloses(reply, [`${ASOF} COHR`, `${ASOF} SOXL`, `${ASOF} BRK B`]);
+  assert.deepEqual(Object.keys(picked), [ASOF]);
+  assert.deepEqual(Object.keys(picked[ASOF]).sort(), ["COHR"]);      // ORCL 没要，SOXL 只有别的日期的
+  assert.deepEqual(D.deltaPickCloses({ [ASOF]: { "BRK B": { close: 480, bar: ASOF } } }, [`${ASOF} BRK B`]),
+                   { [ASOF]: { "BRK B": { close: 480, bar: ASOF } } });   // 代码里带空格也认
+  // computeDeltaView 不再读接口回的 dates
+  assert.doesNotMatch(extract(delta, "delta.js", "computeDeltaView"), /\.dates\b/);
+});
+
+test("同一批名字什么时候再问：失败等一分钟，部分缺价 / 临时价等接口说的 retry_after，在途时不重复问", () => {
+  const t0 = 1_000_000;
+  const ok = (retryAt) => ({ state: "ok", at: t0, retryAt, inflight: false });
+  assert.equal(D.deltaRefreshDue(ok(Infinity), t0 + 10 ** 9), false);   // 全是收完盘的价：不再问
+  assert.equal(D.deltaRefreshDue(ok(t0 + 900e3), t0 + 899e3), false);
+  assert.equal(D.deltaRefreshDue(ok(t0 + 900e3), t0 + 900e3), true);
+  const err = { state: "error", at: t0, retryAt: Infinity, inflight: false };
+  assert.equal(D.deltaRefreshDue(err, t0 + D.DELTA_RETRY_MS), false);
+  assert.equal(D.deltaRefreshDue(err, t0 + D.DELTA_RETRY_MS + 1), true);
+  assert.equal(D.deltaRefreshDue({ ...ok(t0), inflight: true }, t0 + 10 ** 9), false);
+});
+
+test("总账户的明细：每张合约用它自己账户那天的价，明细加起来等于汇总", () => {
+  // 两个账户报表日期不同，同一只票价格不同；合并后的行只能显示一个价，明细不能拿它重算
+  const a = { ...navTo(ASOF, 50000), stocks: [stock("XYZ", 100, 40)],
+              options: [opt("XYZ", "18DEC26", 45, "P", -2, 7)] };
+  const b = { ...navTo("2026-11-04", 80000), stocks: [stock("XYZ", 50, 44)],
+              options: [opt("XYZ", "18DEC26", 45, "P", -3, 5)] };
+  const pa = () => ({ px: 40, src: "ibkr", bar: ASOF });
+  const pb = () => ({ px: 44, src: "ibkr", bar: "2026-11-04" });
+  const m = D.mergeDeltaBooks([D.deltaBook(a, pa, ASOF_TS, "U1111111"),
+                               D.deltaBook(b, pb, Date.UTC(2026, 10, 4), "U2222222")]);
+  const r = m.rows.find(x => x.symbol === "XYZ");
+  assert.deepEqual(r.contracts.map(c => [c.acct, c.spot]), [["U1111111", 40], ["U2222222", 44]]);
+  for (const c of r.contracts) near(c.value, c.shares * c.spot, 1e-9);
+  const parts = r.stockLines.reduce((s, l) => s + l.value, 0) + r.contracts.reduce((s, c) => s + c.value, 0);
+  near(parts, r.deltaValue, 1e-6, "明细之和");
+  // 显示明细的地方用的是合约自己的 spot / value，不是行上的 r.spot
+  const detail = extract(delta, "delta.js", "deltaDetailHtml");
+  assert.match(detail, /deltaValueTip\(c\.shares, c\.spot, c\.value\)/);
+  assert.doesNotMatch(detail, /c\.shares \* \(r\.spot/);
 });
 
 // --- wiring ---------------------------------------------------------------------
@@ -315,6 +400,21 @@ test("delta.js 用到的每个元素 id 都在模板里，脚本在 dashboard.js
   const render = extract(dash, "dashboard.js", "render");
   assert.ok(render.indexOf("renderDeltaExposure()") > render.indexOf("renderRiskGate()"),
             "render() 要在风险闸门之后调 renderDeltaExposure");
+});
+
+test("render() 先算 delta 再画持仓地图和仓位区间；收盘价到了整页重画", () => {
+  const render = extract(dash, "dashboard.js", "render");
+  const at = (s) => render.indexOf(s);
+  assert.ok(at("currentDataRef._delta =") > at("currentDataRef._exposures ="));
+  assert.ok(at("currentDataRef._delta =") < at("renderTreemap("), "持仓地图的角标要读卖 put 的 delta");
+  assert.ok(at("currentDataRef._delta =") < at("renderCorePositions("), "仓位区间要读卖 put 的 delta");
+  assert.ok(at("currentDataRef._delta =") < at("renderMargin("), "保证金要在 delta 取价之后画");
+  // 收盘价进 currentDataRef（buildPriceBook 读它）—— 只放页面上报表要的那些 ——
+  // 然后整页重画，不只是 Delta 面板
+  const fetchQ = extract(delta, "delta.js", "fetchDeltaQuotes");
+  assert.match(fetchQ, /currentDataRef\.underlyingCloses = q\.data \? \{ closes: deltaPickCloses\(q\.data\.closes, needs\) \}/);
+  assert.match(fetchQ, /renderSelected\(\)/);
+  assert.match(extract(dash, "dashboard.js", "buildPriceBook"), /fetchedCloses\(\)/);
 });
 
 test("面板能收起：跟风险闸门同一个开关，四个 id 齐全，risk.js 先加载", () => {

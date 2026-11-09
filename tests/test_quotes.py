@@ -17,7 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from parser import quotes  # noqa: E402
 from parser.quotes import (  # noqa: E402
     MAX_BAR_GAP_DAYS, MISS_RETRY_SEC, PROVISIONAL_TTL_SEC, QuoteError,
-    close_on_or_before, needed_closes, parse_daily_closes, resolve_closes, yahoo_symbol,
+    close_on_or_before, needed_closes, parse_daily_closes, refresh_after, resolve_closes,
+    yahoo_symbol,
 )
 
 NY_WINTER = -5 * 3600     # gmtoffset Yahoo reports for New York after DST ends
@@ -211,6 +212,20 @@ def test_a_corrupt_cache_is_treated_as_empty():
         assert closes["2026-11-05"]["SOXL"]["close"] == 40.87
 
 
+# --- when the page should ask again ------------------------------------------------
+
+def test_refresh_after_says_when_a_miss_or_provisional_bar_could_change():
+    final = {"2026-11-05": {"SOXL": {"close": 40.87, "final": True, "at": 1000.0}}}
+    assert refresh_after(final, {}, now=5000.0) is None           # nothing will change
+    miss = {"2026-11-05": {"COHR": {"error": "HTTP 404", "at": 1000.0}}}
+    assert refresh_after(final, miss, now=1000.0) == MISS_RETRY_SEC
+    provisional = {"2026-11-09": {"SOXL": {"close": 45.0, "final": False, "at": 1000.0}}}
+    assert refresh_after(provisional, {}, now=1100.0) == PROVISIONAL_TTL_SEC - 100
+    # the earlier of the two, and never negative
+    assert refresh_after(provisional, miss, now=1000.0) == min(MISS_RETRY_SEC, PROVISIONAL_TTL_SEC)
+    assert refresh_after(provisional, miss, now=10**9) == 0
+
+
 # --- endpoint -------------------------------------------------------------------
 
 def test_endpoint_serves_closes_for_option_only_names(tmp_path, monkeypatch):
@@ -234,12 +249,32 @@ def test_endpoint_serves_closes_for_option_only_names(tmp_path, monkeypatch):
     assert body["closes"] == {"2026-11-05": {"COHR": {"close": 169.76, "bar": "2026-11-05"},
                                              "SOXL": {"close": 40.87, "bar": "2026-11-05"}}}
     assert body["missing"] == {}
+    assert body["retry_after"] is None            # every close final: nothing to ask again for
     # The cache is a dot-file: never mistaken for an account by the uploads/*.json sweep.
     assert (tmp_path / ".quotes_cache.json").exists()
     assert sorted(app_mod._load_all_accounts()) == ["U1111111", "U2222222"]
 
     app_mod.app.test_client().get("/api/underlying-closes")
     assert len(fetch.calls) == 2                  # second load: all from the cache
+
+
+def test_endpoint_tells_the_page_when_a_miss_is_worth_asking_again(tmp_path, monkeypatch):
+    # A partial answer is still a 200; retry_after is what keeps the page from
+    # holding a miss for as long as the tab is open.
+    import app as app_mod
+
+    monkeypatch.setattr(app_mod, "UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(app_mod, "QUOTES_CACHE", tmp_path / ".quotes_cache.json")
+    (tmp_path / "U1111111.json").write_text(
+        json.dumps(_acct("2026-11-05", options=["SOXL", "ZZZZ"])), encoding="utf-8")
+    fetch = FakeFetch(TABLE, fail={"ZZZZ": QuoteError("HTTP 404")})
+    real = quotes.resolve_closes
+    monkeypatch.setattr(app_mod, "resolve_closes",
+                        lambda need, cache: real(need, cache, fetch=fetch, today="2026-11-09"))
+
+    body = app_mod.app.test_client().get("/api/underlying-closes").get_json()
+    assert body["missing"] == {"2026-11-05": {"ZZZZ": "HTTP 404"}}
+    assert 0 < body["retry_after"] <= MISS_RETRY_SEC
 
 
 def test_loading_accounts_without_snapshots(tmp_path, monkeypatch):
