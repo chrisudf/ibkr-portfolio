@@ -303,26 +303,9 @@ ul.rank .sym { font-weight: 600; }
   color: #0a0c12; font-weight: 600;
 }
 
-/* Margin panel */
-.margin-hero {
-  display: flex; justify-content: space-between; align-items: flex-end;
-  gap: 20px; margin-bottom: 14px;
-}
-.margin-hero-label { color: var(--text-dim); font-size: 13px; font-weight: 600; }
-.margin-hero-pct { margin-top: 6px; font-size: 34px; font-weight: 800; color: var(--amber); line-height: 1; }
-.margin-hero-pct small { font-size: 13px; font-weight: 500; color: var(--text-dim); margin-left: 10px; }
-.margin-hero-amount { font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums; }
-.margin-gauge {
-  width: 100%; height: 10px; border-radius: 6px; overflow: hidden;
-  background: var(--panel-2);
-}
-.margin-gauge-fill { height: 100%; border-radius: 6px; transition: width 0.3s ease; }
-.margin-gauge-note { margin-top: 8px; font-size: 12px; color: var(--text-dim); }
-.margin-basis { margin-top: 4px; font-size: 12px; color: var(--text-faint); }
+/* Panel footnote — every panel's, despite the name (it began on the margin
+   panel, which is gone). */
 .margin-foot { margin-top: 10px; font-size: 12px; color: var(--text-faint); }
-@media (max-width: 600px) {
-  .margin-hero { flex-direction: column; align-items: flex-start; gap: 8px; }
-}
 
 /* Dividends panel */
 .div-empty p { color: var(--text-dim); font-size: 13px; margin: 0 0 8px; line-height: 1.7; }
@@ -370,15 +353,6 @@ ul.rank .sym { font-weight: 600; }
 .nav-stat b { color: var(--text); font-weight: 600; margin-left: 4px; }
 .nav-stat b.up { color: var(--green); }
 .nav-stat b.down { color: var(--red); }
-
-/* Margin gap-stress table */
-.margin-stress { margin-top: 14px; }
-.stress-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-.stress-table th, .stress-table td { padding: 7px 10px; text-align: left; }
-.stress-table th { color: var(--text-faint); font-weight: 600; font-size: 12px; border-bottom: 1px solid var(--border); }
-.stress-table td { border-bottom: 1px solid rgba(35,42,66,0.5); }
-.stress-table .num { text-align: right; font-variant-numeric: tabular-nums; }
-.stress-table tr.stress-bust td { color: var(--red); font-weight: 600; }
 
 /* Cluster exposure */
 .holdings td.amber, .holdings td.amber b { color: var(--amber); }

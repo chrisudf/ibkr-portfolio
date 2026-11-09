@@ -309,8 +309,7 @@ const P = new Function([
   "const currentDataRef = { underlyingCloses: null };",
   extract(dash, "dashboard.js", "fetchedCloses"),
   extract(dash, "dashboard.js", "buildPriceBook"),
-  extract(dash, "dashboard.js", "closePricedSymbols"),
-  "return { buildPriceBook, closePricedSymbols, set: (q) => { currentDataRef.underlyingCloses = q; } };",
+  "return { buildPriceBook, set: (q) => { currentDataRef.underlyingCloses = q; } };",
 ].join("\n"))();
 
 test("价格簿：报表里的正股价优先，只有期权的标的用取到的收盘价；没取到时跟以前一样", () => {
@@ -320,13 +319,11 @@ test("价格簿：报表里的正股价优先，只有期权的标的用取到�
   };
   P.set(null);
   assert.deepEqual(P.buildPriceBook(accounts), { NVDA: 181.6, SOFI: 16.04 });
-  assert.equal(P.closePricedSymbols(accounts).size, 0);
 
   P.set({ closes: { [ASOF]: { SOXL: { close: 40.87, bar: ASOF }, NVDA: { close: 999, bar: ASOF } } } });
   const book = P.buildPriceBook(accounts);
   assert.equal(book.SOXL, 40.87);
   assert.equal(book.NVDA, 181.6, "报表价优先");
-  assert.deepEqual([...P.closePricedSymbols(accounts)], ["SOXL"]);
   P.set(null);
 });
 
@@ -408,7 +405,6 @@ test("render() 先算 delta 再画持仓地图和仓位区间；收盘价到了�
   assert.ok(at("currentDataRef._delta =") > at("currentDataRef._exposures ="));
   assert.ok(at("currentDataRef._delta =") < at("renderTreemap("), "持仓地图的角标要读卖 put 的 delta");
   assert.ok(at("currentDataRef._delta =") < at("renderCorePositions("), "仓位区间要读卖 put 的 delta");
-  assert.ok(at("currentDataRef._delta =") < at("renderMargin("), "保证金要在 delta 取价之后画");
   // 收盘价进 currentDataRef（buildPriceBook 读它）—— 只放页面上报表要的那些 ——
   // 然后整页重画，不只是 Delta 面板
   const fetchQ = extract(delta, "delta.js", "fetchDeltaQuotes");

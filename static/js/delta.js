@@ -32,7 +32,7 @@
  * day's, and a vol solved against another day's spot is a wrong vol.
  *
  * Follows the account tab. 总账户 computes each account on its own statement
- * date and sums, the way the margin panel merges.
+ * date and sums.
  * ------------------------------------------------------------------------- */
 
 // Risk-free rate for the Black-Scholes solve. Delta hardly notices it: moving
@@ -346,8 +346,8 @@ function deltaRefreshDue(q, now) {
 // Asks /api/underlying-closes once per distinct set of names the statements
 // need, and again when deltaRefreshDue says so. No names → no request. The
 // answer goes on currentDataRef.underlyingCloses, where buildPriceBook
-// (dashboard.js) reads it, so margin, the expiry calendar and the risk gate
-// price option-only names from it too — hence the whole view redraws.
+// (dashboard.js) reads it, so the expiry calendar, the risk gate and the core
+// table price option-only names from it too — hence the whole view redraws.
 function ensureDeltaQuotes(accounts) {
   const needs = deltaNeeds(accounts, (id) => deltaAsOf(accounts[id]));
   const key = needs.join("|");

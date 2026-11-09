@@ -6,9 +6,10 @@ A delta needs the underlying's price. The Flex statement carries a mark only
 for what an account holds, so a name traded purely through options has no
 price anywhere in it — on the 2026-11-05 book that was SOXL, COHR, ORCL and
 RKLB, which between them carry most of the short-put notional. The other
-panels get by without one (margin assumes at-the-money, the expiry calendar
-guesses ITM from the option's own mark); a delta cannot, because how far in
-or out of the money the strike sits is the whole of what it measures.
+panels could get by without one (the expiry calendar guesses ITM from the
+option's own mark); a delta cannot, because how far in or out of the money
+the strike sits is the whole of what it measures. Once fetched, the closes
+price those panels too (static/js/dashboard.js buildPriceBook).
 
 Same day as the statement, never "latest"
 -----------------------------------------
