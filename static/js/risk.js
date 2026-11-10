@@ -57,7 +57,7 @@
  * on it.
  *
  * Loaded after dashboard.js and leans on its helpers ($, esc, fmtMoney,
- * fmtPct, maskAccountId, currentDataRef, buildPriceBook, allUnderlyings,
+ * fmtPct, maskAccountId, currentDataRef, buildPriceBook, stockMarks, allUnderlyings,
  * groupExpiries, parseExpiryTs, fundedSeries, navStats, mergeAccounts,
  * showToast, DAY_MS, CASH_EQUIVALENTS, CONTRACT_MULTIPLIER).
  * ------------------------------------------------------------------------- */
@@ -1122,7 +1122,11 @@ function openTargetModal() {
   const stored = currentDataRef.profitTargets || {};
   const symbols = stored.symbols || {};
   const allProgress = currentDataRef.targetProgress || {};
-  const spots = buildPriceBook(currentDataRef.allAccounts || {});
+  // Held shares only: a spot here means "some account holds it". The fuller
+  // buildPriceBook also prices option-only names (the delta panel's closes),
+  // which would rank an unheld SOXL as 未设 and show it a price it is not
+  // judged against.
+  const spots = stockMarks(currentDataRef.allAccounts || {});
   const levered = new Set(Array.isArray(stored.levered) ? stored.levered : PROFIT_LEVERED);
   // What still needs a decision comes first, then what has one, then the rest.
   const rank = (u) => {
@@ -1174,7 +1178,7 @@ function renderTargetRows() {
   const stored = currentDataRef.profitTargets || {};
   const symbols = stored.symbols || {};
   const allProgress = currentDataRef.targetProgress || {};
-  const spots = buildPriceBook(currentDataRef.allAccounts || {});
+  const spots = stockMarks(currentDataRef.allAccounts || {});   // held shares only, as above
   const levered = new Set(Array.isArray(stored.levered) ? stored.levered : PROFIT_LEVERED);
   $("target-body").innerHTML = (targetDraft || []).map(({ sym, boxes }) => {
     const live = targetIsLive(symbols[sym], allProgress[sym]);
@@ -1276,7 +1280,7 @@ function wireTargetModal() {
     const bad = targetRowProblem(row.sym, row.boxes);
     // The whole row: fixing the box on one side clears the complaint about the other.
     e.target.closest("tr").querySelectorAll("input").forEach(el => el.classList.toggle("bad", !!bad));
-    const spot = buildPriceBook(currentDataRef.allAccounts || {})[row.sym];
+    const spot = stockMarks(currentDataRef.allAccounts || {})[row.sym];
     $("target-status").textContent = bad || targetRowWarning(row.sym, row.boxes, spot);
   });
 }

@@ -776,20 +776,32 @@ const CONTRACT_MULTIPLIER = 100;
 // strike in pure time value at the DTEs a seller's calendar shows.
 const MARK_ITM_RATIO = 0.10;
 
-// Underlying mark prices, pooled across every loaded account — a price is a
-// market fact, not account data, so a stock held only in U22 still prices a
-// U17 short put. Populated from stock positions first; a name held only
-// through options, which no statement prices, takes the statement-date close
-// the delta panel fetched (fetchedCloses). Until that lands, or if it fails,
-// such a name simply isn't in here and the panels fall back to their
-// estimates ("价?" in the expiry calendar, strike-priced LEAPs in the gate).
-function buildPriceBook(accounts) {
+// Two price books, because there are two questions, and one book answering
+// both is how the take-profit modal came to call an option-only SOXL 未设:
+//
+//   stockMarks      the statements' own stock marks, pooled across accounts
+//                   (a price is a market fact, so U22's shares price U17's
+//                   puts). A name is in here IF AND ONLY IF some account holds
+//                   its shares — "is this held, and at what close?", which is
+//                   what the take-profit modal asks.
+//   buildPriceBook  stockMarks, then for names held only through options the
+//                   statement-date close the delta panel fetched
+//                   (fetchedCloses) — for panels that want a spot for every
+//                   underlying (expiry calendar ITM, risk gate LEAP notional).
+//                   Until that lands, or if it fails, such a name isn't here
+//                   either and those panels fall back to their estimates.
+function stockMarks(accounts) {
   const px = {};
   for (const a of Object.values(accounts || {})) {
     for (const s of a.stocks || []) {
       if (s.close_price > 0 && !(s.symbol in px)) px[s.symbol] = s.close_price;
     }
   }
+  return px;
+}
+
+function buildPriceBook(accounts) {
+  const px = stockMarks(accounts);
   for (const [sym, c] of Object.entries(fetchedCloses())) {
     if (!(sym in px)) px[sym] = c.close;
   }
