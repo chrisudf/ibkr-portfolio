@@ -308,8 +308,9 @@ test("股数显示到 0.1 股，整数不带小数；悬停的乘式能手算对
 const P = new Function([
   "const currentDataRef = { underlyingCloses: null };",
   extract(dash, "dashboard.js", "fetchedCloses"),
+  extract(dash, "dashboard.js", "stockMarks"),
   extract(dash, "dashboard.js", "buildPriceBook"),
-  "return { buildPriceBook, set: (q) => { currentDataRef.underlyingCloses = q; } };",
+  "return { buildPriceBook, stockMarks, set: (q) => { currentDataRef.underlyingCloses = q; } };",
 ].join("\n"))();
 
 test("价格簿：报表里的正股价优先，只有期权的标的用取到的收盘价；没取到时跟以前一样", () => {
@@ -334,6 +335,23 @@ test("价格簿：两个账户报表日期不同时，用较新那天的收盘�
   assert.equal(book.SOXL, 40.87);
   assert.equal(book.COHR, 195.09);       // 只有旧日期有的，照用
   P.set(null);
+});
+
+test("「有没有持股」只看报表里的正股价：只做期权的名字取到了收盘价，也不算持有", () => {
+  // #35 的目标价弹窗把「价格簿里有价」当成「有账户持股」。#36 让价格簿带上了只做期权
+  // 的标的的收盘价，弹窗就把没持股的 SOXL 标成「未设」。持股要问 stockMarks。
+  const accounts = { U1111111: { stocks: [stock("NVDL", 100, 23.71)] } };
+  P.set({ closes: { [ASOF]: { SOXL: { close: 45.97, bar: ASOF } } } });
+  assert.deepEqual(P.stockMarks(accounts), { NVDL: 23.71 });
+  assert.deepEqual(P.buildPriceBook(accounts), { NVDL: 23.71, SOXL: 45.97 });
+  P.set(null);
+  // 目标价弹窗的三处（排序 / 「未设」和现价 / 输入时的提示）都用 stockMarks
+  const risk = read("static", "js", "risk.js");
+  for (const fn of ["openTargetModal", "renderTargetRows", "wireTargetModal"]) {
+    const body = extract(risk, "risk.js", fn);
+    assert.match(body, /stockMarks\(currentDataRef\.allAccounts/, `${fn} 要用 stockMarks`);
+    assert.doesNotMatch(body, /buildPriceBook\(/, `${fn} 不能用 buildPriceBook`);
+  }
 });
 
 // --- Copilot 审查（PR #36）提的三处 -------------------------------------------------
