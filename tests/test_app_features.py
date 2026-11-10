@@ -8,11 +8,23 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from parser.snapshots import (  # noqa: E402
     MAX_KEEP, build_snapshot, load_snapshots, record_snapshot,
 )
+
+
+@pytest.fixture(autouse=True)
+def _scratch_pending_file(tmp_path, monkeypatch):
+    """Every test gets its own kept-reference-code file. Every refresh pass and
+    /api/refresh/status read it, and an expired entry is pruned by REWRITING
+    it — the suite must never touch the real uploads/."""
+    import app as app_mod
+
+    monkeypatch.setattr(app_mod, "PENDING_FILE", tmp_path / ".flex_pending.json")
 
 
 def _acct(nav_date="2026-08-19", qty=100.0):
@@ -355,10 +367,12 @@ def test_fetch_one_defaults_track_the_module_constants():
     import inspect
     from parser import flex_fetch
 
-    defaults = inspect.signature(flex_fetch.fetch_one).parameters
-    assert defaults["max_polls"].default == flex_fetch.FLEX_MAX_POLLS
-    assert defaults["poll_interval"].default == flex_fetch.FLEX_POLL_INTERVAL
-    assert defaults["max_poll_retries"].default == flex_fetch.FLEX_MAX_POLL_RETRIES
+    # poll_statement too: app.py calls it directly for a kept reference code.
+    for fn in (flex_fetch.fetch_one, flex_fetch.poll_statement):
+        defaults = inspect.signature(fn).parameters
+        assert defaults["max_polls"].default == flex_fetch.FLEX_MAX_POLLS, fn.__name__
+        assert defaults["poll_interval"].default == flex_fetch.FLEX_POLL_INTERVAL, fn.__name__
+        assert defaults["max_poll_retries"].default == flex_fetch.FLEX_MAX_POLL_RETRIES, fn.__name__
 
 
 # ---------------------------------------------------------------------------
@@ -983,3 +997,377 @@ def test_env_flag_tolerates_the_quotes_env_files_ship(monkeypatch):
         assert app_mod._env_flag("SOME_FLAG") is False, raw
     monkeypatch.delenv("SOME_FLAG", raising=False)
     assert app_mod._env_flag("SOME_FLAG") is False
+
+
+# ---------------------------------------------------------------------------
+# Reference codes kept across a timeout (lesson #26). 2026-11-03 and 2026-11-10
+# each ran out of poll budget while IBKR was still generating, and threw the
+# reference code away with the exception — a statement already paid for with
+# the day's single generation, which GetStatement would have fetched for free
+# once it was ready. Every test here talks to a fake IBKR; nothing leaves the
+# process.
+# ---------------------------------------------------------------------------
+
+SEND_OK = "<Status>Success</Status><ReferenceCode>987654</ReferenceCode>"
+ERROR_1001 = ("<FlexStatementResponse><Status>Fail</Status><ErrorCode>1001</ErrorCode>"
+              "<ErrorMessage>Statement could not be generated at this time. "
+              "Please try again shortly.</ErrorMessage></FlexStatementResponse>")
+
+
+def _ibkr(monkeypatch, script, *, then=IN_PROGRESS):
+    """A fake IBKR for whole passes. SendRequest issues code 987654; each
+    GetStatement plays the next entry of `script`, then `then` for good — so a
+    default-budget poll runs out exactly the way 11-03 and 11-10 did, only
+    instantly. Returns every URL requested."""
+    from parser import flex_fetch
+
+    calls = []
+    queue = list(script)
+
+    def fake_get(url, timeout=30.0):
+        calls.append(url)
+        if "SendRequest" in url:
+            return SEND_OK
+        nxt = queue.pop(0) if queue else then
+        if isinstance(nxt, BaseException):
+            raise nxt
+        return nxt
+
+    monkeypatch.setattr(flex_fetch, "_http_get", fake_get)
+    monkeypatch.setattr(flex_fetch.time, "sleep", lambda *_: None)
+    return calls
+
+
+def _resume_rig(tmp_path, monkeypatch, tags=("test",)):
+    """app.py wired to the fake IBKR, a scratch state file and a fake account
+    store. Returns (app module, list of account ids saved)."""
+    import app as app_mod
+    from parser import flex_fetch
+
+    # The budget tests above importlib.reload(flex_fetch), which mints a new
+    # FlexFetchError class while app.py still holds the one it imported — its
+    # `except FlexFetchError` would miss what the reloaded fetcher raises.
+    for name in ("FlexFetchError", "fetch_one", "poll_statement"):
+        monkeypatch.setattr(app_mod, name, getattr(flex_fetch, name))
+    specs = [SimpleNamespace(tag=t, token="tok", query_id="123") for t in tags]
+    monkeypatch.setattr(app_mod, "parse_accounts_env", lambda _: specs)
+    monkeypatch.setenv("ACCOUNTS", "tok:123")
+    monkeypatch.setattr(app_mod, "SYNC_STATE_FILE", tmp_path / ".auto_sync_state.json")
+    monkeypatch.setattr(app_mod, "parse_ibkr_auto",
+                        lambda body: {"accounts": {"U0000001": {"csv": body}}})
+    saved: list[str] = []
+
+    def save(payload):
+        saved.extend(payload["accounts"])
+        return list(payload["accounts"]), []
+
+    monkeypatch.setattr(app_mod, "_save_accounts", save)
+    app_mod._refresh_state.update({"last_finished": 0.0, "in_progress": False,
+                                   "last_result": None})
+    return app_mod, saved
+
+
+def _hold(app_mod, tag, *, requested, last_try=None, ref="555111", looks=1):
+    """Put a kept code on disk the way a timed-out pass leaves it."""
+    path = app_mod.PENDING_FILE
+    data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    data[tag] = {"ref": ref, "requested_at": requested.isoformat(timespec="seconds"),
+                 "trigger": "auto", "looks": looks,
+                 "last_try_at": (last_try or requested).isoformat(timespec="seconds"),
+                 "last_error": "IBKR still generating after 1800s — try again later"}
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _state(tmp_path):
+    return json.loads((tmp_path / ".auto_sync_state.json").read_text(encoding="utf-8"))
+
+
+def test_a_timeout_hands_back_the_reference_code(monkeypatch):
+    from parser import flex_fetch
+
+    spec = flex_fetch.AccountSpec(token="SECRET123", query_id="100001")
+    _ibkr(monkeypatch, [])                       # in progress, all the way
+    with pytest.raises(flex_fetch.FlexFetchError) as excinfo:
+        flex_fetch.fetch_one(spec, max_polls=3, poll_interval=0)
+    # Out of OUR budget while IBKR still said "in progress": the generation is
+    # alive and already paid for, so the code is the one thing worth keeping.
+    assert excinfo.value.code == "timeout"
+    assert excinfo.value.reference == "987654"
+
+    # A network that stayed down never got an answer at all — nothing was
+    # decided about the statement, so the code survives that too.
+    _ibkr(monkeypatch, [OSError("[Errno 104] Connection reset by peer")] * 4)
+    with pytest.raises(flex_fetch.FlexFetchError) as excinfo:
+        flex_fetch.fetch_one(spec, max_polls=10, poll_interval=0, max_poll_retries=2)
+    assert excinfo.value.code == "network"
+    assert excinfo.value.reference == "987654"
+
+
+def test_a_coded_ibkr_answer_ends_the_code(monkeypatch):
+    from parser import flex_fetch
+
+    spec = flex_fetch.AccountSpec(token="SECRET123", query_id="100001")
+    # 1001's own text says "try again shortly", and nine of them in a row once
+    # escalated into a 1025 lockout (lesson #11). A coded answer is IBKR's
+    # verdict on this generation; asking again every half hour is not free.
+    _ibkr(monkeypatch, [ERROR_1001])
+    with pytest.raises(flex_fetch.FlexFetchError) as excinfo:
+        flex_fetch.fetch_one(spec, max_polls=10, poll_interval=0)
+    assert excinfo.value.code == "1001"
+    assert excinfo.value.reference == ""
+
+    # Refused at SendRequest: no generation was started, so there is no code.
+    monkeypatch.setattr(flex_fetch, "_http_get", lambda url, timeout=30.0: ERROR_1001)
+    with pytest.raises(flex_fetch.FlexFetchError) as excinfo:
+        flex_fetch.fetch_one(spec, max_polls=10, poll_interval=0)
+    assert "refused request" in str(excinfo.value)
+    assert excinfo.value.reference == ""
+
+
+def test_polling_a_kept_code_never_spends_a_generation(monkeypatch):
+    from parser import flex_fetch
+
+    spec = flex_fetch.AccountSpec(token="SECRET123", query_id="100001")
+    calls = _ibkr(monkeypatch, [IN_PROGRESS, CSV_BODY])
+    assert flex_fetch.poll_statement(spec, "555111", max_polls=5, poll_interval=0) == CSV_BODY
+    # SendRequest is the day's quota; GetStatement against the code is free.
+    assert len(calls) == 2
+    assert all("GetStatement" in u and "q=555111" in u for u in calls)
+
+
+def test_a_timed_out_statement_is_fetched_later_without_a_new_request(tmp_path, monkeypatch):
+    # 2026-11-10 replayed, with the ending it should have had.
+    app_mod, saved = _resume_rig(tmp_path, monkeypatch)
+    monkeypatch.setattr(app_mod, "AUTO_SYNC", "daily")
+
+    # 10:00 — the scheduled pass runs out of budget, IBKR still generating.
+    calls = _ibkr(monkeypatch, [])
+    payload, status = app_mod._run_refresh("auto")
+    assert status == 200
+    (entry,) = payload["results"]
+    assert entry["ok"] is False and entry["pending"] is True
+    assert "已保留 reference code" in entry["error"]
+    assert "Z 接着取" in entry["error"], "the scheduler is on, so name the time"
+    kept = json.loads(app_mod.PENDING_FILE.read_text(encoding="utf-8"))
+    assert kept["test"]["ref"] == "987654"
+    assert kept["test"]["looks"] == 1 and kept["test"]["trigger"] == "auto"
+    state = _state(tmp_path)
+    assert state["ok"] is False and state["waiting"] is True
+    first_run_at = state["last_run_at"]
+
+    # A rebuild: nothing in memory survives, only the file on the volume.
+    app_mod._refresh_state.update({"last_finished": 0.0, "in_progress": False,
+                                   "last_result": None})
+
+    # 10:30 — the scheduler looks again; IBKR has finished.
+    calls += _ibkr(monkeypatch, [IN_PROGRESS, CSV_BODY])
+    payload, status = app_mod._run_refresh("resume")
+    assert status == 200
+    (entry,) = payload["results"]
+    assert entry["ok"] is True and entry["resumed"] is True
+    assert saved == ["U0000001"]
+    # One generation paid for, one statement delivered.
+    assert sum("SendRequest" in u for u in calls) == 1
+    assert json.loads(app_mod.PENDING_FILE.read_text(encoding="utf-8")) == {}
+
+    state = _state(tmp_path)
+    assert state["ok"] is True and state["waiting"] is False
+    assert state["last_success"] and state["last_resume_at"]
+    # last_run_at is what the quota warning reads as "IBKR last saw a
+    # request". A resume sent none, so it must not move.
+    assert state["last_run_at"] == first_run_at
+    assert state["last_run_trigger"] == "auto"
+
+
+def test_a_button_press_while_a_code_is_kept_fetches_that_code(tmp_path, monkeypatch):
+    app_mod, saved = _resume_rig(tmp_path, monkeypatch)
+    now = datetime.now(timezone.utc)
+    _hold(app_mod, "test", requested=now - timedelta(hours=2),
+          last_try=now - timedelta(minutes=5))
+    calls = _ibkr(monkeypatch, [CSV_BODY])
+
+    payload, _status = app_mod._run_refresh("button")
+    # A fresh SendRequest two hours after the last one is a 1001 that also
+    # spends tomorrow's generation. The paid-for statement is right there.
+    assert not any("SendRequest" in u for u in calls)
+    assert payload["results"][0]["ok"] is True
+    assert saved == ["U0000001"]
+    assert json.loads(app_mod.PENDING_FILE.read_text(encoding="utf-8")) == {}
+    assert _state(tmp_path)["last_run_trigger"] == "button"
+
+
+def test_a_look_that_times_out_again_keeps_the_original_request_time(tmp_path, monkeypatch):
+    app_mod, _ = _resume_rig(tmp_path, monkeypatch)
+    now = datetime.now(timezone.utc)
+    requested = now - timedelta(hours=1)
+    _hold(app_mod, "test", requested=requested, last_try=now - timedelta(minutes=31),
+          looks=2)
+    calls = _ibkr(monkeypatch, [])
+
+    payload, _status = app_mod._run_refresh("resume")
+    assert payload["results"][0]["pending"] is True
+    # A resume look is short (PENDING_RESUME_POLLS), not a whole budget.
+    assert len(calls) == app_mod.PENDING_RESUME_POLLS
+    kept = json.loads(app_mod.PENDING_FILE.read_text(encoding="utf-8"))["test"]
+    assert kept["looks"] == 3
+    # The age limit runs from the SendRequest that paid for the generation,
+    # not from the latest look — or a stuck code would never age out.
+    assert kept["requested_at"] == requested.isoformat(timespec="seconds")
+
+
+def test_an_ibkr_error_on_a_kept_code_drops_it_and_says_why(tmp_path, monkeypatch):
+    app_mod, _ = _resume_rig(tmp_path, monkeypatch)
+    now = datetime.now(timezone.utc)
+    _hold(app_mod, "test", requested=now - timedelta(hours=3),
+          last_try=now - timedelta(minutes=31))
+    calls = _ibkr(monkeypatch, [ERROR_1001])
+
+    payload, _status = app_mod._run_refresh("resume")
+    (entry,) = payload["results"]
+    assert entry["ok"] is False and not entry.get("pending")
+    assert "code=1001" in entry["error"] and "已失效" in entry["error"]
+    assert not any("SendRequest" in u for u in calls)
+    assert json.loads(app_mod.PENDING_FILE.read_text(encoding="utf-8")) == {}
+    # A plain failure again: the page goes back to red, not "waiting".
+    assert _state(tmp_path)["waiting"] is False
+
+
+def test_a_code_past_its_age_limit_is_forgotten(tmp_path, monkeypatch):
+    app_mod, _ = _resume_rig(tmp_path, monkeypatch)
+    now = datetime.now(timezone.utc)
+    _hold(app_mod, "test",
+          requested=now - timedelta(seconds=app_mod.PENDING_MAX_AGE_SEC + 60),
+          last_try=now - timedelta(hours=1))
+
+    # Not due, and gone from the file rather than merely skipped: the next
+    # day's run must ask IBKR for fresh data, not wait on yesterday's.
+    assert app_mod._pending_due(now) is False
+    assert json.loads(app_mod.PENDING_FILE.read_text(encoding="utf-8")) == {}
+
+    # A resume with nothing left to look at touches neither IBKR nor the
+    # verdict on disk.
+    calls = _ibkr(monkeypatch, [CSV_BODY])
+    payload, status = app_mod._run_refresh("resume")
+    assert (payload["results"], status) == ([], 200)
+    assert calls == []
+    assert not (tmp_path / ".auto_sync_state.json").exists()
+
+
+def test_a_kept_code_is_looked_at_every_half_hour(tmp_path, monkeypatch):
+    app_mod, _ = _resume_rig(tmp_path, monkeypatch)
+    last = datetime(2026, 11, 10, 10, 30, 5, tzinfo=timezone.utc)
+    _hold(app_mod, "test", requested=last - timedelta(minutes=30), last_try=last)
+    gap = timedelta(seconds=app_mod.PENDING_RESUME_EVERY_SEC)
+    assert app_mod._pending_due(last + gap - timedelta(seconds=1)) is False
+    assert app_mod._pending_due(last + gap) is True
+
+
+def test_the_scheduler_looks_again_between_daily_runs(tmp_path, monkeypatch):
+    app_mod, _ = _resume_rig(tmp_path, monkeypatch)
+    monkeypatch.setattr(app_mod, "AUTO_SYNC", "daily")
+    monkeypatch.setattr(app_mod, "AUTO_SYNC_UTC_HOUR", 10)
+    state_path = tmp_path / ".auto_sync_state.json"
+    state_path.write_text(json.dumps({"last_attempt_date": "2026-11-10",
+                                      "last_run_at": "2026-11-10T10:00:05+00:00"}),
+                          encoding="utf-8")
+    last = datetime(2026, 11, 10, 10, 30, 5, tzinfo=timezone.utc)
+    _hold(app_mod, "test", requested=last - timedelta(minutes=30), last_try=last)
+    runs = []
+    monkeypatch.setattr(app_mod, "_run_refresh",
+                        lambda trigger: (runs.append(trigger), ({"ok": False}, 200))[1])
+
+    assert app_mod._auto_sync_tick(last + timedelta(minutes=10)) == ""
+    assert app_mod._auto_sync_tick(last + timedelta(minutes=30)) == "resume"
+    assert runs == ["resume"]
+    # A look is not the day's attempt: that slot belongs to tomorrow's run.
+    assert json.loads(state_path.read_text(encoding="utf-8"))["last_attempt_date"] == "2026-11-10"
+
+    # The slot is busy (a button pass, the cool-down): just wait a tick.
+    monkeypatch.setattr(app_mod, "_run_refresh",
+                        lambda trigger: ({"error": "refresh already in progress"}, 429))
+    assert app_mod._auto_sync_tick(last + timedelta(minutes=31)) == "refused"
+
+    # Tomorrow's scheduled run still comes first while a code is held.
+    monkeypatch.setattr(app_mod, "_run_refresh",
+                        lambda trigger: (runs.append(trigger), ({"ok": False}, 200))[1])
+    assert app_mod._auto_sync_tick(datetime(2026, 11, 11, 10, 0, 30, tzinfo=timezone.utc)) == "run"
+    assert runs[-1] == "auto"
+
+
+def test_a_resume_keeps_the_other_accounts_verdict(tmp_path, monkeypatch):
+    app_mod, _ = _resume_rig(tmp_path, monkeypatch)
+    app_mod._record_sync_outcome({"ok": False, "results": [
+        {"tag": "aaa", "ok": False, "error": "IBKR refused request: code=1015"},
+        {"tag": "bbb", "ok": False, "pending": True,
+         "error": "IBKR still generating · 已保留 reference code"},
+    ]}, "auto")
+    state = _state(tmp_path)
+    # aaa failed for good, so this is a failure, not a wait.
+    assert state["ok"] is False and state["waiting"] is False
+
+    # bbb's code delivers. A resume only looked at bbb; judged on its own it
+    # would print a green ✓ over aaa's broken token.
+    app_mod._record_sync_outcome(
+        {"ok": True, "results": [{"tag": "bbb", "ok": True, "resumed": True}]}, "resume")
+    state = _state(tmp_path)
+    assert state["ok"] is False
+    assert "aaa: IBKR refused request" in state["detail"] and "bbb: ok" in state["detail"]
+    assert "last_success" not in state
+
+
+def test_status_reports_kept_codes_but_never_the_code(tmp_path, monkeypatch):
+    app_mod, _ = _resume_rig(tmp_path, monkeypatch, tags=("test", "other"))
+    now = datetime.now(timezone.utc)
+    (tmp_path / ".auto_sync_state.json").write_text(json.dumps({
+        "last_run_at": (now - timedelta(hours=2)).isoformat(timespec="seconds"),
+    }), encoding="utf-8")
+    _hold(app_mod, "test", requested=now - timedelta(hours=2),
+          last_try=now - timedelta(minutes=10))
+    client = app_mod.app.test_client()
+
+    # The scheduler is off: nobody will look at a set time, so none is shown.
+    monkeypatch.setattr(app_mod, "AUTO_SYNC", "off")
+    st = client.get("/api/refresh/status").get_json()
+    (held,) = st["pending"]
+    assert held["tag"] == "test" and held["looks"] == 1
+    assert held["next_try_at"] == "" and held["gives_up_at"]
+    # The code is a capability for this account's statement; the page needs
+    # only to know one exists.
+    assert "555111" not in json.dumps(st)
+    # "other" holds nothing, so a press still sends its SendRequest.
+    assert st["manual"]["risky"] is True
+
+    monkeypatch.setattr(app_mod, "AUTO_SYNC", "daily")
+    _hold(app_mod, "other", requested=now - timedelta(hours=2),
+          last_try=now - timedelta(minutes=10))
+    st = client.get("/api/refresh/status").get_json()
+    assert all(p["next_try_at"] for p in st["pending"])
+    # Every query holds a code: a press only fetches those, nothing to spend.
+    assert st["manual"] == {"risky": False, "held": True}
+
+
+def test_portfolio_carries_the_kept_codes_for_the_banner(tmp_path, monkeypatch):
+    app_mod, _ = _resume_rig(tmp_path, monkeypatch)
+    monkeypatch.setattr(app_mod, "_load_all_accounts", lambda *a, **k: {"U0000001": {}})
+    monkeypatch.setattr(app_mod, "PROFIT_TARGETS_FILE", tmp_path / ".profit_targets.json")
+    monkeypatch.setattr(app_mod, "AUTO_SYNC", "daily")
+    now = datetime.now(timezone.utc)
+    _hold(app_mod, "test", requested=now - timedelta(hours=1),
+          last_try=now - timedelta(minutes=10))
+
+    body = app_mod.app.test_client().get("/api/portfolio").get_json()
+    assert [p["tag"] for p in body["sync"]["pending"]] == ["test"]
+    assert "555111" not in json.dumps(body["sync"])
+
+
+def test_a_hand_edited_pending_file_never_breaks_the_page(tmp_path, monkeypatch):
+    app_mod, _ = _resume_rig(tmp_path, monkeypatch)
+    client = app_mod.app.test_client()
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    for broken in ("not json", "[]", json.dumps({"test": "x"}),
+                   json.dumps({"test": {"ref": "1", "requested_at": "yesterday"}}),
+                   json.dumps({"test": {"ref": "1", "requested_at": now, "looks": "many"}})):
+        app_mod.PENDING_FILE.write_text(broken, encoding="utf-8")
+        res = client.get("/api/refresh/status")
+        assert res.status_code == 200, broken
+        assert all(p["looks"] == 0 for p in res.get_json()["pending"]), broken

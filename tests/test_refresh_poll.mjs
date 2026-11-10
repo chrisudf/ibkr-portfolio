@@ -567,6 +567,78 @@ test("手点起的那一趟叫「手动同步」—— 说成自动就是伪造�
   assert.equal(el.textContent, "⟳ 手动同步进行中 · 已运行 45秒");
 });
 
+// ---- 超时后保留 reference code（lesson #26）-----------------------------------
+// 2026-11-03、11-10 两次都是轮询预算用完、IBKR 还在生成，code 跟着异常一起
+// 丢了。现在服务器留着 code、每半小时用 GetStatement 接着取（不花配额）——
+// 这段时间是在等 IBKR，不是管子断了：和「进行中」同色，不是红色。
+const heldSync = (over = {}) => ({
+  ok: false, waiting: true, mode: "daily", last_run_trigger: "auto",
+  last_success: "2026-11-09T10:08:04+00:00",
+  detail: "q1: IBKR still generating after 1800s — try again later"
+    + " · 已保留 reference code，10:30Z 接着取（不花配额）",
+  pending: [{ tag: "q1", requested_at: "2026-11-10T10:00:05+00:00", looks: 1,
+              next_try_at: "2026-11-10T10:30:05+00:00",
+              gives_up_at: "2026-11-11T06:00:05+00:00" }],
+  ...over,
+});
+const heldAt = { nowMs: Date.UTC(2026, 10, 10, 10, 20, 0), period: "2025-11-10 → 2026-11-09" };
+
+test("保留着 reference code：和进行中同色的「接着取」，不报红", () => {
+  const el = bannerSandbox({ ...heldAt, sync: heldSync() });
+  assert.equal(el.hidden, false);
+  assert.equal(el.className, "stale-banner busy");
+  assert.equal(el.textContent,
+    "⟳ 报表还没取到 · 已保留 reference code，10:30Z 接着取（不花配额）");
+  assert.match(el.title, /已保留 reference code/);
+});
+
+test("code 过期或失效（pending 空了）：回到红色 —— 等的东西已经没了", () => {
+  const el = bannerSandbox({ ...heldAt, sync: heldSync({ pending: [] }) });
+  assert.match(el.className, /bad/);
+  assert.match(el.textContent, /同步失败中/);
+  assert.doesNotMatch(el.textContent, /接着取/);
+});
+
+test("另一个账户是硬失败（waiting=false）：即使有 code 在等也报红", () => {
+  // 不能让一个账户的「还在等」盖住另一个账户 token 坏了。
+  const el = bannerSandbox({ ...heldAt, sync: heldSync({ waiting: false }) });
+  assert.match(el.className, /bad/);
+  assert.match(el.textContent, /同步失败中/);
+});
+
+test("调度器关着（没有 next_try_at）：不编一个时间，说下次刷新时接着取", () => {
+  const sync = heldSync();
+  sync.pending = sync.pending.map(p => ({ ...p, next_try_at: "" }));
+  const el = bannerSandbox({ ...heldAt, sync });
+  assert.equal(el.textContent,
+    "⟳ 报表还没取到 · 已保留 reference code，下次刷新时接着取（不花配额）");
+});
+
+test("正在接着取：说进行中，叫「接着取」不叫「手动同步」", () => {
+  const el = bannerSandbox({
+    ...heldAt, sync: heldSync(),
+    inFlight: { active: true, trigger: "resume", elapsedSec: 75 },
+  });
+  assert.equal(el.className, "stale-banner busy");
+  assert.equal(el.textContent, "⟳ 接着取进行中 · 已运行 1分15秒");
+});
+
+test("跟到的 pass 全部是保留了 code 的超时：黄色「还在生成」，不是红色同步失败", async () => {
+  const error = "IBKR still generating after 1800s — try again later"
+    + " · 已保留 reference code，10:30Z 接着取（不花配额）";
+  const s = pollSandbox({
+    status: { in_progress: false,
+              last: { run_id: 7, ok: false,
+                      results: [{ tag: "q1", ok: false, pending: true, error }] } },
+    tracked: 7,
+  });
+  await s.run();
+  assert.equal(s.calls.toasts[0].kind, "warn");
+  assert.equal(s.calls.toasts[0].title, "IBKR 还在生成");
+  assert.equal(s.calls.toasts[0].detail, error);
+  assert.equal(s.calls.loads, 1, "表头的 ⏳ 只有重取 portfolio 才会出现");
+});
+
 test("首屏数据还没到就被轮询调用：什么都不说", () => {
   const el = bannerSandbox({
     sync: failedYesterday, noData: true,

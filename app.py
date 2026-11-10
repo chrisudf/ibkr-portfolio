@@ -24,7 +24,7 @@ from parser import parse_ibkr_auto, parse_ibkr_pdf
 from parser.flex_fetch import (FLEX_BUDGET_SEC, FLEX_CONFIG_NOTES,
                                FLEX_MAX_POLL_RETRIES, FLEX_MAX_POLLS,
                                FLEX_POLL_INTERVAL, FlexFetchError, fetch_one,
-                               parse_accounts_env)
+                               parse_accounts_env, poll_statement)
 from parser.dataroma import fetch_all as fetch_all_13f
 from parser.quotes import needed_closes, refresh_after, resolve_closes
 from parser.ibkr_flex_csv import describe_sections
@@ -204,7 +204,10 @@ def get_portfolio():
     if AUTO_SYNC in ("daily", "weekly") or state:
         # The LIVE env decides the mode shown — a stale state file from a
         # since-disabled schedule must not keep advertising "每日".
-        payload["sync"] = {**state, "mode": AUTO_SYNC}
+        # pending: a failed pass whose reference code is being fetched again
+        # reads as "waiting", not "broken", in the header and the banner.
+        payload["sync"] = {**state, "mode": AUTO_SYNC,
+                           "pending": _pending_summary(datetime.now(timezone.utc))}
     # The plans and their progress travel with the statements, from one read
     # of the file: progress is derived from both, and a page that paired fresh
     # progress with plans it read earlier (another device has changed them
@@ -1000,13 +1003,18 @@ def _next_scheduled_run(now: datetime) -> datetime | None:
     return None
 
 
-def _manual_refresh_advice(state: dict) -> dict:
+def _manual_refresh_advice(state: dict, all_held: bool = False) -> dict:
     """Would pressing the button now spend quota the scheduler is about to need?
 
     Advisory only — see IBKR_QUERY_WINDOW_SEC. "last request" is read from the
     sync state rather than the in-process clock so a container restart does not
     silently reset the warning.
+
+    all_held: every configured query has a live kept reference code, so a
+    press would only GetStatement those — nothing to warn about.
     """
+    if all_held:
+        return {"risky": False, "held": True}
     last = _parse_iso(state.get("last_run_at"))
     if last is None:
         return {"risky": False}
@@ -1085,6 +1093,136 @@ def _record_refresh_result(payload: dict, trigger: str) -> None:
     _record_sync_outcome(payload, trigger)
 
 
+# --- Reference codes kept across a timeout -----------------------------------
+#
+# SendRequest spends the query's ~24h generation and hands back a reference
+# code; GetStatement against that code is free (lesson #23). Until 2026-11 a
+# pass that ran out of poll budget threw the code away with the exception —
+# and with it a statement IBKR was still generating and would have handed over
+# soon after. 2026-11-03 and 2026-11-10 each lost a day that way (lesson #26).
+#
+# Now the code survives a failure that leaves the generation alive: the poll
+# budget ran out while IBKR still said "in progress", or the network stayed
+# down. (Any coded IBKR error is its verdict on the code and drops it — see
+# poll_statement.) It is written here, on the volume so a rebuild keeps it,
+# and fetched again with GetStatement only:
+#
+#   - by the scheduler, every PENDING_RESUME_EVERY_SEC, each look a short poll
+#     (PENDING_RESUME_POLLS), until the statement arrives or the code dies;
+#   - by any button or scheduled pass for that query while the code is live,
+#     INSTEAD of a fresh SendRequest — so 刷新 after a timeout fetches the
+#     paid-for statement rather than spending tomorrow's quota on a 1001.
+#
+# A code older than PENDING_MAX_AGE_SEC is dropped. A statement that has not
+# come in that long is not coming, and the next day's run (24h after the
+# request) must ask for fresh data rather than wait on yesterday's.
+PENDING_FILE = UPLOAD_DIR / ".flex_pending.json"
+PENDING_RESUME_EVERY_SEC = 30 * 60
+PENDING_RESUME_POLLS = 20          # x FLEX_POLL_INTERVAL: ~5 minutes per look
+PENDING_MAX_AGE_SEC = 20 * 3600
+_pending_lock = Lock()
+
+
+def _read_pending() -> dict:
+    """{tag: entry} as stored; anything unreadable counts as nothing kept."""
+    try:
+        with open(PENDING_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {tag: e for tag, e in data.items() if isinstance(e, dict) and e.get("ref")}
+
+
+def _looks(entry: dict) -> int:
+    """How many passes have tried the code; a hand-edited file must not 500."""
+    try:
+        return int(entry.get("looks") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _live_pending(now: datetime) -> dict:
+    """The kept codes still worth asking about. Expired ones leave the file."""
+    with _pending_lock:
+        stored = _read_pending()
+        live = {}
+        for tag, entry in stored.items():
+            at = _parse_iso(entry.get("requested_at"))
+            if at is not None and (now - at).total_seconds() < PENDING_MAX_AGE_SEC:
+                live[tag] = entry
+            else:
+                app.logger.warning("[%s] gave up on the reference code kept since %s "
+                                   "after %d looks", tag, entry.get("requested_at", "?"),
+                                   _looks(entry))
+        if live != stored:
+            _atomic_write_json(PENDING_FILE, live)
+        return live
+
+
+def _keep_pending(tag: str, ref: str, requested_at: str, trigger: str,
+                  error: str, now: datetime) -> dict:
+    with _pending_lock:
+        stored = _read_pending()
+        prev = stored.get(tag) or {}
+        entry = {
+            "ref": ref,
+            # The SendRequest's time, not this look's: the age limit and the
+            # quota window both run from when the generation was paid for.
+            "requested_at": requested_at,
+            "trigger": prev.get("trigger") or trigger,
+            "looks": _looks(prev) + 1,
+            "last_try_at": now.isoformat(timespec="seconds"),
+            "last_error": error[:300],
+        }
+        stored[tag] = entry
+        _atomic_write_json(PENDING_FILE, stored)
+        return entry
+
+
+def _drop_pending(tag: str) -> None:
+    with _pending_lock:
+        stored = _read_pending()
+        if tag in stored:
+            del stored[tag]
+            _atomic_write_json(PENDING_FILE, stored)
+
+
+def _next_look_at(entry: dict) -> datetime | None:
+    last = _parse_iso(entry.get("last_try_at"))
+    return last + timedelta(seconds=PENDING_RESUME_EVERY_SEC) if last else None
+
+
+def _scheduled_look_at(entry: dict) -> datetime | None:
+    """When the scheduler will look again — None when only the button will:
+    the scheduler thread runs only under AUTO_SYNC daily/weekly, and a time
+    nobody is going to keep must not be printed on the page."""
+    return _next_look_at(entry) if AUTO_SYNC in ("daily", "weekly") else None
+
+
+def _pending_due(now: datetime) -> bool:
+    """Is a kept code waiting for its next look?"""
+    return any((_next_look_at(e) or now) <= now for e in _live_pending(now).values())
+
+
+def _pending_summary(now: datetime) -> list[dict]:
+    """What the page may know about kept codes — never the code itself."""
+    out = []
+    for tag, entry in sorted(_live_pending(now).items()):
+        nxt = _scheduled_look_at(entry)
+        at = _parse_iso(entry.get("requested_at"))
+        out.append({
+            "tag": tag,
+            "requested_at": entry.get("requested_at", ""),
+            "looks": _looks(entry),
+            "next_try_at": nxt.isoformat(timespec="seconds") if nxt else "",
+            "gives_up_at": (at + timedelta(seconds=PENDING_MAX_AGE_SEC)).isoformat(
+                timespec="seconds") if at else "",
+        })
+    return out
+
+
 def _refresh_work(specs: list, trigger: str) -> tuple[dict, int]:
     """One full IBKR sync pass over already-claimed specs.
 
@@ -1093,22 +1231,45 @@ def _refresh_work(specs: list, trigger: str) -> tuple[dict, int]:
     carries a per-account result map so callers can report partial success.
     Does no claiming of its own — the caller holds the slot — which is what
     lets the synchronous scheduler and the async button share one body.
+
+    A query with a live kept reference code is fetched with GetStatement on
+    that code rather than a fresh SendRequest, whoever triggered the pass. The
+    "resume" trigger (the scheduler's periodic look) touches ONLY such queries,
+    with a short poll; the others are not part of a resume at all.
     """
     results: list[dict] = []
+    kept = _live_pending(datetime.now(timezone.utc))
     for spec in specs:
+        held = kept.get(spec.tag)
+        if trigger == "resume" and not held:
+            continue
         # tag only — the UI doesn't need query ids and there's no point
         # echoing config back out of the API.
         entry = {"tag": spec.tag}
+        requested_at = (held["requested_at"] if held
+                        else datetime.now(timezone.utc).isoformat(timespec="seconds"))
         try:
             # A ridden-out reset is not a non-event — it is the difference
             # between today's data and a burnt day of quota, and this callback
             # is the only place it is ever recorded. A silent retry would make
             # the failure that motivated it invisible in exactly the logs
             # where it was first diagnosed.
-            csv_body = fetch_one(
-                spec,
-                on_retry=lambda msg, _tag=spec.tag: app.logger.warning("[%s] %s", _tag, msg),
-            )
+            def on_retry(msg, _tag=spec.tag):
+                app.logger.warning("[%s] %s", _tag, msg)
+
+            if held:
+                # Already paid for: look at that generation again rather than
+                # spend another. A resume looks briefly and comes back in half
+                # an hour; a button or scheduled pass waits the full budget.
+                entry["resumed"] = True
+                app.logger.info("[%s] fetching the reference code kept since %s (look %d)",
+                                spec.tag, held["requested_at"], _looks(held) + 1)
+                csv_body = poll_statement(
+                    spec, held["ref"], on_retry=on_retry,
+                    max_polls=PENDING_RESUME_POLLS if trigger == "resume" else FLEX_MAX_POLLS)
+                _drop_pending(spec.tag)       # delivered: the code has done its job
+            else:
+                csv_body = fetch_one(spec, on_retry=on_retry)
             # A refresh you had to wait out a throttle for is worth one log
             # line: the section list says whether the *query* carries what
             # a panel needs (Cash Transactions for dividends, say), which
@@ -1132,12 +1293,33 @@ def _refresh_work(specs: list, trigger: str) -> tuple[dict, int]:
             app.logger.warning("[%s] refresh failed: %s | code=%s permanent=%s | raw: %s",
                                spec.tag, exc, exc.code or "-", exc.permanent,
                                exc.raw or "<empty>")
-            entry.update({"ok": False, "error": str(exc), "code": exc.code,
+            error = str(exc)
+            if exc.reference:
+                now = datetime.now(timezone.utc)
+                look = _keep_pending(spec.tag, exc.reference, requested_at, trigger, error, now)
+                nxt = _scheduled_look_at(look)
+                when = f"{nxt:%H:%M}Z 接着取" if nxt else "下次刷新时接着取"
+                error = f"{error} · 已保留 reference code，{when}（不花配额）"
+                entry["pending"] = True
+                app.logger.info("[%s] reference code kept (look %d), next look %s",
+                                spec.tag, look["looks"], nxt.isoformat() if nxt else "-")
+            elif held:
+                # IBKR answered with an error: that is its verdict on the
+                # code, so stop asking about it (lesson #11 is what asking
+                # again on a schedule can turn into).
+                _drop_pending(spec.tag)
+                error = f"{error} · 保留的 reference code 已失效"
+            entry.update({"ok": False, "error": error, "code": exc.code,
                           "permanent": exc.permanent, "raw": exc.raw})
         except Exception as exc:  # pragma: no cover - surface parse errors
             app.logger.exception("[%s] parse failed", spec.tag)
             entry.update({"ok": False, "error": f"parse failed: {exc}"})
         results.append(entry)
+
+    if trigger == "resume" and not results:
+        # Every kept code expired between the due check and now: nothing was
+        # looked at, so nothing may be written over the last real verdict.
+        return {"ok": False, "results": []}, 200
 
     any_ok = any(r.get("ok") for r in results)
     out = {"ok": any_ok, "results": results}
@@ -1255,10 +1437,16 @@ def refresh_status():
                        "at": st.get("last_result_at", ""),
                        **st["last_result"]}
     # Read by the button as a pre-flight: IBKR hands out about one generation
-    # of this query a day and the scheduler already has a claim on it.
+    # of this query a day and the scheduler already has a claim on it. A
+    # query holding a kept code would not spend any, so when they all do, the
+    # press is safe.
     sync_state = _read_sync_state()
+    pending = _pending_summary(datetime.now(timezone.utc))
+    held_tags = {p["tag"] for p in pending}
     out["last_run_at"] = sync_state.get("last_run_at", "")
-    out["manual"] = _manual_refresh_advice(sync_state)
+    out["pending"] = pending
+    out["manual"] = _manual_refresh_advice(
+        sync_state, all_held=bool(specs) and all(s.tag in held_tags for s in specs))
     # So the button can be dead on arrival rather than dead on press: a dev
     # copy should look inert, not look ready and then 409.
     out["manual_allowed"] = ALLOW_MANUAL_REFRESH
@@ -1387,16 +1575,14 @@ def _record_sync_outcome(payload: dict, trigger: str) -> None:
     the only honest source for "how long have we been flying blind", since the
     statement's own period end lags the fetch by a couple of days.
     """
-    results = payload.get("results", [])
-    # payload["ok"] means "at least one spec succeeded" — the right rule for
-    # the partial-success toast, the wrong one to persist as health. One
-    # account failing forever would hide behind another's success: green ✓ in
-    # the header, no banner, and last_success creeping forward the whole time.
-    ok = bool(results) and all(r.get("ok") for r in results)
-    detail = "; ".join(
-        f"{r.get('tag', '?')}: {'ok' if r.get('ok') else (r.get('error') or '?')}"
-        for r in results
-    ) or (payload.get("error") or "")
+    verdicts = {
+        str(r.get("tag", "?")): {
+            "ok": bool(r.get("ok")),
+            "pending": bool(r.get("pending")),
+            "detail": "ok" if r.get("ok") else str(r.get("error") or "?"),
+        }
+        for r in payload.get("results", [])
+    }
     now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with _sync_state_lock:
         state = _read_sync_state()
@@ -1407,16 +1593,94 @@ def _record_sync_outcome(payload: dict, trigger: str) -> None:
             legacy = state.get("last_run_at") or state.get("last_attempt")
             if legacy:
                 state["last_success"] = legacy
-        state.update({
-            "mode": AUTO_SYNC,
-            "ok": ok,
-            "detail": detail[:500],
-            "last_run_at": now_iso,
-            "last_run_trigger": trigger,
-        })
+        if trigger == "resume":
+            # A resume looks only at the queries still holding a code; the
+            # rest keep the verdict their last full pass gave them. Judged on
+            # its own, one account's late delivery would paint a green ✓ over
+            # another account's hard failure.
+            prior = state.get("verdicts")
+            if isinstance(prior, dict):
+                verdicts = {**{t: v for t, v in prior.items() if isinstance(v, dict)},
+                            **verdicts}
+        # payload["ok"] means "at least one spec succeeded" — the right rule for
+        # the partial-success toast, the wrong one to persist as health. One
+        # account failing forever would hide behind another's success: green ✓ in
+        # the header, no banner, and last_success creeping forward the whole time.
+        ok = bool(verdicts) and all(v.get("ok") for v in verdicts.values())
+        detail = "; ".join(
+            f"{tag}: {v.get('detail') or '?'}" for tag, v in verdicts.items()
+        ) or (payload.get("error") or "")
+        # Everything that failed kept its reference code: waiting on IBKR, not
+        # broken. The page shows it as waiting, not red, only while the codes
+        # are still live.
+        waiting = not ok and bool(verdicts) and all(
+            v.get("ok") or v.get("pending") for v in verdicts.values())
+        state.update({"mode": AUTO_SYNC, "ok": ok, "detail": detail[:500],
+                      "verdicts": verdicts, "waiting": waiting})
+        if trigger == "resume":
+            # A resume sent no SendRequest. last_run_at is what the quota
+            # warning reads as "IBKR last saw a request" and the header as
+            # "the last pass that asked"; moving it here would make the button
+            # warn for 23 hours after every half-hourly look.
+            state["last_resume_at"] = now_iso
+        else:
+            state.update({"last_run_at": now_iso, "last_run_trigger": trigger})
         if ok:
             state["last_success"] = now_iso
         _write_sync_state(state)
+
+
+def _auto_sync_tick(now: datetime) -> str:
+    """One minute of the scheduler. Returns what it did, for the log and tests:
+    "" (nothing due), "run", "refused" (our own slot said no — retried next
+    tick), or "resume" (a kept reference code was looked at again).
+    """
+    state = _read_sync_state()
+    if _auto_sync_due(now, AUTO_SYNC, AUTO_SYNC_UTC_HOUR,
+                      AUTO_SYNC_UTC_DAY, state.get("last_attempt_date", "")):
+        # Stamp the attempt BEFORE running: a crash mid-pull must not
+        # turn into a retry loop against a throttled endpoint.
+        prev = _stamp_sync_attempt(now)
+        payload, status = _run_refresh("auto")
+        if status == 429:
+            # Our OWN throttle/lock refused — zero requests reached IBKR,
+            # so this must not consume the day's single attempt (a button
+            # press at 08:57 would otherwise skip a whole daily/weekly
+            # slot). Roll the attempt marker back; the next 60s tick
+            # retries once the cool-down passes. The one-attempt-per-day
+            # rule guards IBKR quota, and this branch never spent any.
+            #
+            # Writing a fresh last_attempt here would be a lie in the
+            # header: ok/detail still describe the PREVIOUS run, so the
+            # top bar would pair a just-now timestamp with an older ✓ and
+            # claim a sync that never reached IBKR. Only the two attempt
+            # fields are rolled back — whoever refused us is very likely a
+            # button pass still in flight, and its outcome must survive.
+            _restore_sync_attempt(prev)
+            return "refused"
+        if status != 200:
+            # A pass that never reached _refresh_work (bad ACCOUNTS, say)
+            # recorded nothing, so the header would pair this run's fresh
+            # timestamp with the PREVIOUS run's verdict. Record it here.
+            _record_sync_outcome(payload, "auto")
+        # Otherwise the outcome fields are already in — _refresh_work wrote
+        # them through the same helper the button uses. Re-writing them
+        # here would only give the two copies room to drift; the
+        # attempt-slot fields stamped above stay exactly as they are.
+        state = _read_sync_state()
+        ok = bool(state.get("ok"))
+        app.logger.info("[auto-sync] %s: %s", "ok" if ok else "FAILED", state.get("detail", ""))
+        return "run"
+    # Between scheduled runs: look again at a kept reference code whose half
+    # hour is up. GetStatement only — no attempt stamp, no quota — and a
+    # refusal (a pass in flight, the cool-down) simply waits for a later tick.
+    if _pending_due(now):
+        payload, status = _run_refresh("resume")
+        if status != 200:
+            return "refused"
+        app.logger.info("[auto-sync] resume: %s", _read_sync_state().get("detail", ""))
+        return "resume"
+    return ""
 
 
 def _auto_sync_loop() -> None:
@@ -1426,44 +1690,7 @@ def _auto_sync_loop() -> None:
     while True:
         time.sleep(60)
         try:
-            now = datetime.now(timezone.utc)
-            state = _read_sync_state()
-            if not _auto_sync_due(now, AUTO_SYNC, AUTO_SYNC_UTC_HOUR,
-                                  AUTO_SYNC_UTC_DAY, state.get("last_attempt_date", "")):
-                continue
-            # Stamp the attempt BEFORE running: a crash mid-pull must not
-            # turn into a retry loop against a throttled endpoint.
-            prev = _stamp_sync_attempt(now)
-            payload, status = _run_refresh("auto")
-            if status == 429:
-                # Our OWN throttle/lock refused — zero requests reached IBKR,
-                # so this must not consume the day's single attempt (a button
-                # press at 08:57 would otherwise skip a whole daily/weekly
-                # slot). Roll the attempt marker back; the next 60s tick
-                # retries once the cool-down passes. The one-attempt-per-day
-                # rule guards IBKR quota, and this branch never spent any.
-                #
-                # Writing a fresh last_attempt here would be a lie in the
-                # header: ok/detail still describe the PREVIOUS run, so the
-                # top bar would pair a just-now timestamp with an older ✓ and
-                # claim a sync that never reached IBKR. Only the two attempt
-                # fields are rolled back — whoever refused us is very likely a
-                # button pass still in flight, and its outcome must survive.
-                _restore_sync_attempt(prev)
-                continue
-            if status != 200:
-                # A pass that never reached _refresh_work (bad ACCOUNTS, say)
-                # recorded nothing, so the header would pair this run's fresh
-                # timestamp with the PREVIOUS run's verdict. Record it here.
-                _record_sync_outcome(payload, "auto")
-            # Otherwise the outcome fields are already in — _refresh_work wrote
-            # them through the same helper the button uses. Re-writing them
-            # here would only give the two copies room to drift; the
-            # attempt-slot fields stamped above stay exactly as they are.
-            state = _read_sync_state()
-            ok = bool(state.get("ok"))
-            detail = state.get("detail", "")
-            app.logger.info("[auto-sync] %s: %s", "ok" if ok else "FAILED", detail)
+            _auto_sync_tick(datetime.now(timezone.utc))
         except Exception:
             app.logger.exception("[auto-sync] loop error")
 

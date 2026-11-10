@@ -39,14 +39,23 @@ class FlexFetchError(Exception):
     parsed code/message throw away everything IBKR said around them, which is
     exactly what you want to read when a refresh fails for a reason the code
     list doesn't explain.
+
+    `reference` is set when the failure came AFTER IBKR accepted the request
+    and the generation may still finish: the poll budget ran out while IBKR
+    was still answering "in progress", or the network stayed down so IBKR
+    never answered at all. That generation already cost the day's quota and
+    fetching it is free, so the caller can keep the code and fetch it later
+    instead of throwing a paid-for statement away (lesson #26). Empty when
+    IBKR answered with an error code — that answer is its verdict on the code.
     """
 
     def __init__(self, message: str, *, permanent: bool = False, code: str = "",
-                 raw: str = ""):
+                 raw: str = "", reference: str = ""):
         super().__init__(message)
         self.permanent = permanent
         self.code = code
         self.raw = raw
+        self.reference = reference
 
 
 @dataclass
@@ -220,27 +229,18 @@ if FLEX_MAX_POLLS * FLEX_POLL_INTERVAL > BUDGET_CEILING_SEC:
 FLEX_BUDGET_SEC = int(FLEX_MAX_POLLS * FLEX_POLL_INTERVAL)
 
 
-def fetch_one(
-    spec: AccountSpec,
-    *,
-    max_polls: int = FLEX_MAX_POLLS,
-    poll_interval: float = FLEX_POLL_INTERVAL,
-    max_poll_retries: int = FLEX_MAX_POLL_RETRIES,
-    on_retry: Optional[Callable[[str], None]] = None,
-) -> str:
-    """Block until IBKR delivers the CSV for this query, or raise.
+def request_statement(spec: AccountSpec) -> str:
+    """SendRequest: spend the query's generation and return its reference code.
 
-    Mirrors the bash script: SendRequest gets a reference code, then
-    GetStatement is polled until the body is no longer the
-    "in-progress" XML envelope.
+    The expensive half — IBKR allows about one generation of a query a day —
+    and so never retried here (see below). Everything after it is free.
     """
-    # --- Step 1: queue the report ---------------------------------------------
     send_url = f"{API_BASE}.SendRequest?{urllib.parse.urlencode({'t': spec.token, 'q': spec.query_id, 'v': 3})}"
     # Deliberately NOT retried, unlike the GetStatement poll below. IBKR's
     # ~24h-per-query allowance is anchored on the *request*, and a request that
     # reaches them counts even when the reply never reaches us — so a blind
     # retry here can spend two days of quota on one sync. A failed SendRequest
-    # is the cheap failure: nothing was generated, so tomorrow 06:00 is intact.
+    # is the cheap failure: nothing was generated, so tomorrow's run is intact.
     try:
         send_resp = _http_get(send_url, timeout=30)
     except Exception as exc:  # network blip
@@ -263,7 +263,26 @@ def fetch_one(
         raise FlexFetchError("SendRequest succeeded but no ReferenceCode in response",
                              raw=_snippet(send_resp, spec.token))
 
-    # --- Step 2: poll GetStatement until ready --------------------------------
+    return ref
+
+
+def poll_statement(
+    spec: AccountSpec,
+    ref: str,
+    *,
+    max_polls: int = FLEX_MAX_POLLS,
+    poll_interval: float = FLEX_POLL_INTERVAL,
+    max_poll_retries: int = FLEX_MAX_POLL_RETRIES,
+    on_retry: Optional[Callable[[str], None]] = None,
+) -> str:
+    """GetStatement against `ref` until the CSV arrives, or raise.
+
+    Free to call as often as needed — the generation was paid for by the
+    SendRequest that issued `ref` — which also makes it how a code kept across
+    a timeout gets fetched later (app.py). A failure that leaves the
+    generation possibly alive carries `ref` on the exception
+    (FlexFetchError.reference); one that does not, carries nothing.
+    """
     # First poll fires immediately — small queries are often ready by the
     # time SendRequest returns the reference code. Subsequent iterations
     # sleep between attempts.
@@ -293,6 +312,9 @@ def fetch_one(
                     redact(f"network error on GetStatement, {consecutive_errors} in a row "
                            f"at poll {attempt + 1}/{max_polls}: {exc}", spec.token),
                     code="network",
+                    # Our side went quiet, not theirs: the generation is as
+                    # alive as it was before the first reset.
+                    reference=ref,
                 ) from exc
             if on_retry:
                 on_retry(redact(
@@ -305,6 +327,11 @@ def fetch_one(
         if "Statement generation in progress" in body:
             continue
         # An XML error response (not the in-progress one) means we should bail.
+        # It ends the reference code too: a coded answer is IBKR's verdict on
+        # this generation (lesson #23), and asking it again every half hour
+        # is the repeated-failure pattern that once escalated into a 1025
+        # lockout (lesson #11) — even when the message says "try again
+        # shortly", as 1001's own text does.
         if "<ErrorCode>" in body and "<FlexStatementResponse" in body:
             code = _find_tag(body, "ErrorCode") or ""
             msg = _find_tag(body, "ErrorMessage") or "unknown error"
@@ -327,7 +354,31 @@ def fetch_one(
         f"IBKR still generating after {int(max_polls * poll_interval)}s{limped} — try again later",
         code="timeout",
         raw=_snippet(body, spec.token),
+        # Out of OUR budget, not out of IBKR's generation: 2026-11-03 and -10
+        # both gave up on a statement that was still being made. The code is
+        # the only way back to it without spending another day's quota.
+        reference=ref,
     )
+
+
+def fetch_one(
+    spec: AccountSpec,
+    *,
+    max_polls: int = FLEX_MAX_POLLS,
+    poll_interval: float = FLEX_POLL_INTERVAL,
+    max_poll_retries: int = FLEX_MAX_POLL_RETRIES,
+    on_retry: Optional[Callable[[str], None]] = None,
+) -> str:
+    """Block until IBKR delivers the CSV for this query, or raise.
+
+    SendRequest gets a reference code (request_statement), then GetStatement
+    is polled until the body is no longer the "in-progress" XML envelope
+    (poll_statement). When the poll fails in a way that leaves the generation
+    alive, the exception carries the code so the caller can fetch it later.
+    """
+    ref = request_statement(spec)
+    return poll_statement(spec, ref, max_polls=max_polls, poll_interval=poll_interval,
+                          max_poll_retries=max_poll_retries, on_retry=on_retry)
 
 
 def fetch_all(specs: list[AccountSpec], **kwargs) -> Iterator[tuple[AccountSpec, str]]:
