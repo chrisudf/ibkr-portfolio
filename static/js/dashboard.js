@@ -690,6 +690,10 @@ function render(data) {
   // Position rules are judged against THIS view — recompute before the
   // treemap reads it per tile.
   currentDataRef._exposures = computeExposures(data);
+  // So is the sold puts' delta (static/js/delta.js): it keeps a name its puts
+  // already fill from reading 欠配. Guarded — a failure there must not cost
+  // the panels below; they then judge on capital alone, as before.
+  currentDataRef._delta = typeof computeDeltaView === "function" ? computeDeltaView() : null;
 
   // Treemap (tiles carry the core-holding ring / over-under badge)
   renderTreemap(stocks);
@@ -707,10 +711,6 @@ function render(data) {
   // Cluster exposure (mapping loads async from static/clusters.json; the
   // panel re-renders once it arrives)
   renderClusters(data, currentDataRef.clusters);
-
-  // Margin — prices are pooled across every loaded account, so pass the whole
-  // set rather than just the account being viewed.
-  renderMargin(data, currentDataRef.allAccounts);
 
   // Holdings — show all positions including cash equivalents (tagged)
   renderHoldings(data.stocks);
@@ -737,26 +737,23 @@ function render(data) {
   // Called last on purpose: it sits at the top of the page, but a throw in it
   // must not cost any panel rendered before it.
   renderRiskGate();
+
+  // Delta exposure (static/js/delta.js), after the gate for the same reason.
+  // Closes for names held only through options arrive async from
+  // /api/underlying-closes; the panel re-renders itself when they land.
+  renderDeltaExposure();
 }
 
 /* ---------------------------------------------------------------------------
- * Margin — estimated, not reported.
+ * Shared constants and the underlying price book.
  *
- * IBKR's Flex Web Service does not export margin requirements in any section
- * (they only exist in TWS and the rendered Activity Statement), so we
- * reconstruct the standard Reg-T initial requirement from the positions we do
- * have. Per share, for an uncovered short option:
- *
- *   put  → max(0.20 × underlying − OTM amount, 0.10 × strike,     $2.50)
- *   call → max(0.20 × underlying − OTM amount, 0.10 × underlying, $2.50)
- *
- * plus the contract's current market value (the premium you'd pay to close).
- * Short calls backed by stock in the same account are covered — the shares are
- * the collateral, so they consume no margin.
- *
- * Long options need no margin (the premium is already paid), and stock bought
- * with cash needs none either — this account only borrows to back short puts,
- * which is exactly what the panel reports.
+ * There used to be a 保证金占用 panel here: a Reg-T requirement rebuilt from
+ * the positions, since the Flex Web Service exports no margin figures. It was
+ * removed in 2026-11 — neither account is margined under Reg-T (one is
+ * portfolio margin, priced by IBKR's stress scans, which widen by the leverage
+ * factor for leveraged ETFs; the other is a cash account), so the estimate was
+ * the real requirement for neither, and IBKR shows the real one live. README,
+ * 关于「保证金占用」, has the rest.
  * ------------------------------------------------------------------------- */
 
 // Ex-date capture: what a payout stream collected, against what a steady
@@ -771,8 +768,6 @@ function render(data) {
 const CAPTURE_FLAG_RATIO = 0.8;
 const CAPTURE_FLAG_DOLLARS = 10;
 
-// Reg-T floor for an uncovered contract: $250, i.e. $2.50/share.
-const MARGIN_FLOOR_PER_SHARE = 2.5;
 // Fallback deliverable for JSONs saved before the parser exported the
 // contract's own Multiplier column; standard US equity options are 100.
 const CONTRACT_MULTIPLIER = 100;
@@ -783,8 +778,11 @@ const MARK_ITM_RATIO = 0.10;
 
 // Underlying mark prices, pooled across every loaded account — a price is a
 // market fact, not account data, so a stock held only in U22 still prices a
-// U17 short put. Populated from stock positions; underlyings we hold no
-// shares of simply aren't in here.
+// U17 short put. Populated from stock positions first; a name held only
+// through options, which no statement prices, takes the statement-date close
+// the delta panel fetched (fetchedCloses). Until that lands, or if it fails,
+// such a name simply isn't in here and the panels fall back to their
+// estimates ("价?" in the expiry calendar, strike-priced LEAPs in the gate).
 function buildPriceBook(accounts) {
   const px = {};
   for (const a of Object.values(accounts || {})) {
@@ -792,325 +790,28 @@ function buildPriceBook(accounts) {
       if (s.close_price > 0 && !(s.symbol in px)) px[s.symbol] = s.close_price;
     }
   }
+  for (const [sym, c] of Object.entries(fetchedCloses())) {
+    if (!(sym in px)) px[sym] = c.close;
+  }
   return px;
 }
 
-// Reg-T requirement for one short contract, per share of underlying.
-function regTPerShare(right, strike, underlying) {
-  const otm = right === "P"
-    ? Math.max(0, underlying - strike)   // put is OTM when spot is above strike
-    : Math.max(0, strike - underlying);  // call is OTM when spot is below strike
-  const floorPct = right === "P" ? 0.10 * strike : 0.10 * underlying;
-  return Math.max(0.20 * underlying - otm, floorPct, MARGIN_FLOOR_PER_SHARE);
-}
-
-// shock: uniform gap applied to every underlying spot AND the stock sleeve
-// (e.g. -0.2 = everything opens 20% down). Option premiums are NOT repriced —
-// in a real gap the short-put mark explodes, so the stressed requirement here
-// is a floor, not a forecast. shock=0 is the live estimate.
-function computeMargin(data, priceBook, shock = 0) {
-  const stocks = data.stocks || [];
-  const options = data.options || [];
-  const nav = data.nav || {};
-  // Cash equivalents (SGOV/BOXX) are T-bill parking, not equity — the rest
-  // of the dashboard already reclassifies them as cash, and "T-bills gap
-  // −30%" is not the scenario this table models. Only the true equity
-  // sleeve takes the shock.
-  const cashEq = stocks.reduce(
-    (s, x) => s + (CASH_EQUIVALENTS.has(x.symbol) ? (x.value || 0) : 0), 0);
-  const equitySleeve = (nav.stock || 0) - cashEq;
-  // Stressed NAV moves by the equity sleeve only (options unrepriced, cash fixed).
-  const totalNav = (nav.total || (nav.cash + nav.stock + nav.options))
-    + equitySleeve * shock;
-
-  // Shares available to cover short calls, spent longest-dated first.
-  const sharesLeft = {};
-  for (const s of stocks) sharesLeft[s.symbol] = (sharesLeft[s.symbol] || 0) + s.quantity;
-
-  const byUnderlying = {};
-  let requirement = 0, notional = 0, premium = 0, assumedContracts = 0;
-  // How much of the total leans on an assumed spot. Counting contracts
-  // understates it — the assumed ones are often the biggest requirements,
-  // because assuming at-the-money is the most expensive guess you can make.
-  let assumedRequirement = 0;
-
-  // Short calls before puts so covering shares go to the calls that need them.
-  const shorts = options.filter(o => o.quantity < 0)
-    .sort((a, b) => (a.right === "C" ? 0 : 1) - (b.right === "C" ? 0 : 1));
-
-  // Contracts whose strike/right didn't parse (adjusted symbols the Activity
-  // Statement path couldn't read) must NOT fall through the formula: with
-  // strike 0 and no right, regTPerShare degenerates to the $2.50 floor and a
-  // multi-thousand-dollar requirement quietly prints as ~$250. Exclude their
-  // Reg-T leg and say so — but their market value is parsed independently of
-  // the symbol, and it is a hard lower bound on the liability, so it still
-  // belongs in the premium total and comes off the excess.
-  let unparsedContracts = 0, unparsedMv = 0;
-  for (const o of shorts) {
-    if (!(o.strike > 0) || (o.right !== "P" && o.right !== "C")) {
-      unparsedContracts += Math.abs(o.quantity);
-      unparsedMv += Math.abs(o.value || 0);
-      continue;
-    }
-    const qty = Math.abs(o.quantity);
-    const mult = o.multiplier || CONTRACT_MULTIPLIER;
-    const shares = qty * mult;
-    const known = priceBook[o.underlying];
-    // No price anywhere in the portfolio → assume the contract sits at the
-    // money. That lands the estimate on 20% of strike, the middle of the
-    // Reg-T range, and every such contract is counted so the UI can say so.
-    // The gap shock hits the assumed spot the same as a real one.
-    const spot = (known || o.strike) * (1 + shock);
-    if (!known) assumedContracts += qty;
-    // Premium leg. In STRESS scenarios only, the mark is floored at intrinsic
-    // value — an option is never worth less than intrinsic, so after a gap
-    // the unrepriced mark would otherwise make the requirement SHRINK as the
-    // 20%-of-spot leg deflates while a deep-ITM put's real liability
-    // explodes. At shock=0 the floor must stay OFF: the price book pools
-    // spots across accounts refreshed on different dates, and intrinsic
-    // against a stale spot would silently overwrite the statement's own
-    // mark — the live estimate belongs to the statement, gaps belong to
-    // the stress table.
-    const intrinsicPS = o.right === "P"
-      ? Math.max(0, o.strike - spot)
-      : Math.max(0, spot - o.strike);
-    const mv = shock !== 0
-      ? Math.max(Math.abs(o.value), intrinsicPS * shares)
-      : Math.abs(o.value);
-
-    let covered = 0;
-    if (o.right === "C") {
-      // Reg-T covers by whole 100-share lots: a call is either backed by its
-      // full deliverable or it is naked. 80 shares against one short call earn
-      // no per-share credit — IBKR charges the full uncovered requirement.
-      // Prorating per share would understate exactly the odd-lot cases
-      // (fractional ETF positions) where the panel matters most.
-      const lots = Math.floor(Math.max(sharesLeft[o.underlying] || 0, 0) / mult);
-      const coveredContracts = Math.min(qty, lots);
-      covered = coveredContracts * mult;
-      sharesLeft[o.underlying] = (sharesLeft[o.underlying] || 0) - covered;
-    }
-    const nakedShares = shares - covered;
-    // mv is the whole position's market value, so only the naked slice of the
-    // premium belongs in the requirement — a call half covered by stock would
-    // otherwise carry the covered half's premium too.
-    const req = nakedShares > 0
-      ? regTPerShare(o.right, o.strike, spot) * nakedShares + mv * (nakedShares / shares)
-      : 0;
-    const notionalHere = o.right === "P" ? o.strike * shares : 0;
-
-    requirement += req;
-    if (!known) assumedRequirement += req;
-    premium += mv;
-    notional += notionalHere;
-
-    const b = byUnderlying[o.underlying] || (byUnderlying[o.underlying] = {
-      underlying: o.underlying, contracts: 0, puts: 0, calls: 0, covered: 0,
-      requirement: 0, notional: 0, premium: 0, spot, priceKnown: !!known,
-    });
-    b.contracts += qty;
-    b[o.right === "P" ? "puts" : "calls"] += qty;
-    b.covered += covered / mult;
-    b.requirement += req;
-    b.notional += notionalHere;
-    b.premium += mv;
-  }
-
-  // Excess liquidity the way IBKR actually computes it under Reg-T, not
-  // NAV − requirement. Two things NAV counts are not collateral: long US
-  // equity options have no loan value (a LEAP book cannot back new short
-  // puts), and long stock carries ~25% maintenance. NAV − requirement would
-  // overstate "can I sell another put" headroom by the whole LEAP sleeve
-  // plus a quarter of the stock — the dangerous direction for this panel.
-  //   excess ≈ cash + 75% × long stock − 130% × |short stock| − requirement
-  // Short stock gets a charge, not a credit: its sale proceeds already sit
-  // in cash at 100%, and Reg-T maintenance adds ~30% on top — folding it
-  // into a single 75% haircut would turn the maintenance into a credit.
-  // Unparsed short options also come off: their Reg-T leg is unknown (see
-  // above) but their market value is a known lower bound on the liability.
-  const stockValue = cashEq + equitySleeve * (1 + shock);
-  const longStock = Math.max(stockValue, 0);
-  const shortStock = Math.min(stockValue, 0);
-  const excess = (nav.cash || 0) + longStock * 0.75 + shortStock * 1.3
-    - requirement - unparsedMv;
-  return {
-    requirement,
-    notional,
-    premium: premium + unparsedMv,
-    totalNav,
-    pctOfNav: totalNav > 0 ? requirement / totalNav : 0,
-    excess,
-    // Worst single account — for the merged view's margin-call flag, since
-    // IBKR never lets one account's surplus bail out another's deficit.
-    minExcess: excess,
-    // Negative cash is a real margin loan — that part accrues interest, unlike
-    // collateral tied up behind short options.
-    borrowed: Math.max(0, -(nav.cash || 0)),
-    assumedContracts,
-    assumedRequirement,
-    assumedShare: requirement > 0 ? assumedRequirement / requirement : 0,
-    unparsedContracts,
-    unparsedMv,
-    // Magnitude of the short-stock deduction, so the panel can name the term
-    // only when it actually applies.
-    shortStockCharge: -shortStock * 1.3,
-    rows: Object.values(byUnderlying).sort((a, b) => b.requirement - a.requirement),
-  };
-}
-
-// Margin is per account: IBKR does not let one account's shares cover another
-// account's short call, nor its credit balance offset another's debit. So the
-// merged view sums separately-computed requirements rather than computing one
-// requirement over pooled positions.
-function mergeMargin(parts) {
-  const out = {
-    requirement: 0, notional: 0, premium: 0, totalNav: 0, excess: 0, borrowed: 0,
-    assumedContracts: 0, assumedRequirement: 0, unparsedContracts: 0,
-    unparsedMv: 0, shortStockCharge: 0, rows: [],
-  };
-  const byU = {};
-  out.minExcess = Infinity;
-  for (const m of parts) {
-    for (const k of ["requirement", "notional", "premium", "totalNav", "excess",
-                     "borrowed", "assumedContracts", "assumedRequirement",
-                     "unparsedContracts", "unparsedMv", "shortStockCharge"]) {
-      out[k] += m[k] || 0;
-    }
-    // The sum can look fine while one account is under water — margin calls
-    // fire per account, so the flag must track the worst one.
-    out.minExcess = Math.min(out.minExcess, m.minExcess != null ? m.minExcess : m.excess);
-    for (const r of m.rows) {
-      // First sight of an underlying seeds the bucket with a copy of the row;
-      // that copy already carries the row's values, so it must NOT be added
-      // into again. (Comparing `b !== r` doesn't express that — the spread
-      // copy is never === the source row, so it re-added the first account.)
-      const b = byU[r.underlying];
-      if (!b) {
-        byU[r.underlying] = { ...r };
-        continue;
-      }
-      for (const k of ["contracts", "puts", "calls", "covered", "requirement",
-                       "notional", "premium"]) b[k] += r[k];
-      b.priceKnown = b.priceKnown && r.priceKnown;
+// The closes /api/underlying-closes returned, one per name like the stock
+// marks: the latest statement date's when accounts differ. {} until they
+// arrive. static/js/delta.js keeps on currentDataRef.underlyingCloses only
+// the (date, name) pairs the LOADED statements asked for, so these are the
+// same day as the option marks on screen — never a later price, even when the
+// server's files moved on between the two requests.
+function fetchedCloses() {
+  const q = typeof currentDataRef === "object" ? currentDataRef.underlyingCloses : null;
+  const out = {};
+  if (!q || !q.closes) return out;
+  for (const day of Object.keys(q.closes).sort()) {
+    for (const [sym, c] of Object.entries(q.closes[day] || {})) {
+      if (c && c.close > 0) out[sym] = c;
     }
   }
-  out.pctOfNav = out.totalNav > 0 ? out.requirement / out.totalNav : 0;
-  out.assumedShare = out.requirement > 0 ? out.assumedRequirement / out.requirement : 0;
-  out.rows = Object.values(byU).sort((a, b) => b.requirement - a.requirement);
   return out;
-}
-
-function renderMargin(data, accounts) {
-  const panel = $("margin-panel");
-  const book = buildPriceBook(accounts);
-  const merged = (data.account || {}).Account === "ALL";
-  const m = merged
-    ? mergeMargin(Object.values(accounts || {}).map(a => computeMargin(a, book)))
-    : computeMargin(data, book);
-  if (!m.rows.length && !m.unparsedContracts) { panel.hidden = true; return; }
-  panel.hidden = false;
-
-  $("margin-amount").textContent = fmtMoney(m.requirement);
-  $("margin-pct").textContent = fmtPct(m.pctOfNav, 1);
-  $("margin-basis").textContent = m.borrowed > 0
-    ? `其中融资借款 ${fmtMoney(m.borrowed)}（这部分计息）`
-    : "仅为卖出期权抵押，不付利息（现金为正，无融资借款）";
-
-  // Gauge: requirement against net liquidation value.
-  const gauge = $("margin-gauge");
-  const pct = Math.min(100, Math.max(0, m.pctOfNav * 100));
-  // Bands mirror how the cushion actually behaves: under 30% there's plenty of
-  // room, past 60% a gap-down starts eating into excess liquidity fast.
-  const tone = pct >= 60 ? "var(--red)" : pct >= 30 ? "var(--amber)" : "var(--green)";
-  gauge.innerHTML = `<div class="margin-gauge-fill" style="width:${pct}%;background:${tone}"></div>`;
-  const gaugeNote = $("margin-gauge-note");
-  // The printed formula has to list every term actually deducted, or an
-  // account carrying short stock / unparsed contracts sees a number that
-  // can't be reconciled with the text sitting next to it. Both extra terms
-  // are conditional, so they only show when they're non-zero.
-  const excessTerms = "现金 + 75% 正股"
-    + (m.shortStockCharge > 0 ? " − 130% 做空正股" : "")
-    + (m.unparsedMv > 0 ? " − 未解析合约权利金" : "")
-    + " − 占用";
-  gaugeNote.textContent =
-    `账户总值 ${fmtMoney(m.totalNav)} · 估算剩余流动性 ${fmtMoney(m.excess)}`
-    + `（${excessTerms}）`;
-  gaugeNote.title =
-    "近似 IBKR 的 Excess Liquidity：Reg-T 下长期权（含 LEAP）没有抵押价值、"
-    + "正股按 25% 维持保证金扣减，所以不是「净值 − 占用」。"
-    + "做空正股不是抵押品 —— 卖出所得已 100% 记在现金里，Reg-T 再加约 30% "
-    + "维持保证金，故按 130% 扣减。";
-
-  const note = $("margin-note");
-  note.textContent = (m.assumedContracts > 0
-    ? `Reg-T 估算 · ${m.assumedContracts} 张合约无正股报价，按平值估算`
-      + `（占估算额 ${fmtPct(m.assumedShare, 0)}）`
-    : "Reg-T 估算 · 正股价格取自当前持仓")
-    + (m.unparsedContracts > 0
-      ? ` · ${m.unparsedContracts} 张合约读不出行权价/方向，其权利金负债`
-        + `（${fmtMoney(m.unparsedMv)}）已计入并从剩余流动性扣除，`
-        + `Reg-T 腿未计 —— 实际占用高于显示`
-      : "");
-  note.title = m.assumedContracts > 0
-    ? "平值假设对价外的卖put偏保守 —— 实际保证金通常低于此。"
-      + "买入这些标的的正股后，价格会自动接入，数字随之收紧。"
-    : "";
-
-  // Gap stress: same estimator, spot and stock sleeve shocked together.
-  // Premiums are not repriced, so every stressed number is a FLOOR — the
-  // honest headline is "at least this bad", which is the side a crisis
-  // dashboard should err on.
-  const stressFor = (shock) => merged
-    ? mergeMargin(Object.values(accounts || {}).map(a => computeMargin(a, book, shock)))
-    : computeMargin(data, book, shock);
-  const scenarios = [0, -0.10, -0.20, -0.30];
-  const stressRows = scenarios.map(s => ({ s, m: s === 0 ? m : stressFor(s) }));
-  $("margin-stress").innerHTML = `
-    <table class="stress-table">
-      <thead><tr>
-        <th>跳空情景</th><th class="num">保证金占用</th>
-        <th class="num">剩余流动性</th><th class="num">占用/净值</th>
-      </tr></thead>
-      <tbody>${stressRows.map(({ s, m: sm }) => {
-        // Margin calls fire per account: the merged sum can be positive
-        // while one account is already under water.
-        const worst = sm.minExcess != null ? sm.minExcess : sm.excess;
-        const busted = worst < 0;
-        const partial = busted && sm.excess >= 0;
-        return `<tr class="${busted ? "stress-bust" : ""}">
-          <td>${s === 0 ? "现价" : `全线 ${fmtPct(s, 0)}`}</td>
-          <td class="num">${fmtMoney(sm.requirement)}</td>
-          <td class="num ${busted ? "down" : ""}">${fmtMoney(sm.excess)}${
-            busted ? (partial ? ` <span title="跨账户不共享抵押品：至少一个账户的剩余流动性已为负">⚠ 单账户</span>` : " ⚠") : ""
-          }</td>
-          <td class="num">${sm.totalNav > 0 ? fmtPct(sm.requirement / sm.totalNav, 1) : "—"}</td>
-        </tr>`;
-      }).join("")}</tbody>
-    </table>
-    <div class="margin-foot">正股与期权标的同步跳空；权利金负债取 max(现价, 跳空后内在价值) ——
-      不含时间价值与 IV 爆炸，所以每一行仍是下界（实际会更糟）。剩余流动性转负 ⚠ ≈ 追保/强平区。</div>`;
-
-  const tbody = $("margin-body");
-  tbody.innerHTML = "";
-  for (const r of m.rows) {
-    const kinds = [r.puts ? `${r.puts} PUT` : "", r.calls ? `${r.calls} CALL` : ""].filter(Boolean).join(" · ");
-    const priceTag = r.priceKnown ? "" : ` <span class="tag tag-short">估算价</span>`;
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td><b>${r.underlying}</b>${priceTag}</td>
-      <td>${kinds}${r.covered ? ` <span class="tag tag-flow-in">${r.covered} 张有正股覆盖</span>` : ""}</td>
-      <td class="num">${fmtMoney(r.spot, 2)}</td>
-      <td class="num muted">${r.notional ? fmtMoney(r.notional, 0) : "—"}</td>
-      <td class="num">${fmtMoney(r.premium, 0)}</td>
-      <td class="num"><b>${fmtMoney(r.requirement, 0)}</b></td>
-      <td class="num">${fmtPct(m.requirement ? r.requirement / m.requirement : 0, 1)}</td>
-    `;
-    tbody.appendChild(tr);
-  }
-
-  $("margin-foot").textContent =
-    `卖出看跌名义抵押合计 ${fmtMoney(m.notional)}（若全部现金担保需要的资金）· `
-    + `当前卖方权利金负债 ${fmtMoney(m.premium)}`;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1743,7 +1444,7 @@ function renderExpiries(data, accounts) {
               + `权利金已超行权价的 ${fmtPct(MARK_ITM_RATIO, 0)}，几乎不可能是纯时间价值">`
               + `<b>可能 ${w.likelyItm}</b></span>`
             : "",
-          `<span class="muted" title="组合里没有该标的正股，无法用现价判定价内外">`
+          `<span class="muted" title="组合里没有该标的正股，报表当天的收盘价也还没取到（或取价失败），判定不了价内外">`
             + `价? ${w.unpriced}</span>`,
         ].filter(Boolean).join(" · ")
       : (w.itm ? `<span class="down"><b>${w.itm}</b></span>` : "0");
@@ -1920,7 +1621,9 @@ function renderNavHistory(data) {
  *
  * So an underlying you are only short puts on reads as 0% here. That is the
  * definition working as intended, not a gap: assignment risk is a different
- * question, and 保证金占用 + 卖方到期日历 are the panels that answer it.
+ * question, and the risk gate (put notional, the PM floor, cash per expiry
+ * week) and 卖方到期日历 are what answer it; the delta panel says how much of
+ * it moves with the stock today.
  * ------------------------------------------------------------------------- */
 
 // Both ends of the band are free numbers typed as percentages of total NAV
@@ -2013,24 +1716,48 @@ function positionStatus(weight, cfg) {
   return "ok";
 }
 
-const POS_STATUS_LABEL = { over: "超上限", under: "欠配", ok: "区间内" };
+// The status a row is shown with. 仓位区间 stays judged on capital — what you
+// mean to hold — and sold puts are not capital: most are written for the
+// premium, not to be assigned. But a name whose sold puts already carry more
+// delta than the band's upper bound is no room to add, whatever its capital
+// says: 0% capital and 40% of NAV in put delta would otherwise read 欠配,
+// an invitation the book cannot take. Only 欠配 gives way — it is the one
+// status that says "add". putWeight is the puts' delta $ ÷ the view's NAV.
+function coreStatus(weight, cfg, putWeight) {
+  const status = positionStatus(weight, cfg);
+  if (status !== "under" || !(putWeight > 0)) return status;
+  const [, hi] = resolveBounds(cfg);
+  return weight + putWeight > hi ? "putfilled" : status;
+}
+
+// The sold puts' delta for the view on screen as a share of its NAV, from the
+// delta book render() computed (static/js/delta.js); 0 when there is none.
+function putWeightOf(symbol) {
+  const v = currentDataRef._delta;
+  return (v && v.putWeight && v.putWeight[symbol]) || 0;
+}
+
+const POS_STATUS_LABEL = { over: "超上限", putfilled: "卖 put 已折过上限", under: "欠配", ok: "区间内" };
 
 function exposureTip(r) {
   const bits = [];
   if (r.stockMV) bits.push(`正股 ${fmtMoney(r.stockMV, 0)}`);
   if (r.longOptMV) bits.push(`期权多头 ${fmtMoney(r.longOptMV, 0)}`);
-  return bits.join(" + ") || "无投入资本";
+  const capital = bits.join(" + ") || "无投入资本";
+  return r.putWeight > 0
+    ? `${capital}；另有卖 put 按 delta 折净值的 ${fmtPct(r.putWeight, 1)}（不算投入资本）`
+    : capital;
 }
 
 // Row order on the panel, picked by clicking the 状态 or 占总资产 header and
-// flipped by clicking it again. 状态 (the default) puts what needs adjusting
-// first — over the cap, then under the floor — core holdings first within
-// each; 占总资产 ranks by weight. Each comparator gives the ▼ order; ties go
-// by ticker in either direction, so two renders that agree on the key never
-// reshuffle.
-const CORE_STATUS_RANK = { over: 0, under: 1, ok: 2 };
+// flipped by clicking it again. 状态 (the default) puts what needs attention
+// first — over the cap, then names whose sold puts already fill the band,
+// then under the floor — core holdings first within each; 占总资产 ranks by
+// weight. Each comparator gives the ▼ order; ties go by ticker in either
+// direction, so two renders that agree on the key never reshuffle.
+const CORE_STATUS_RANK = { over: 0, putfilled: 1, under: 2, ok: 3 };
 const CORE_SORTS = {
-  status: (a, b) => (CORE_STATUS_RANK[a.status] ?? 3) - (CORE_STATUS_RANK[b.status] ?? 3)
+  status: (a, b) => (CORE_STATUS_RANK[a.status] ?? 4) - (CORE_STATUS_RANK[b.status] ?? 4)
     || b.core - a.core || b.weight - a.weight,
   weight: (a, b) => b.weight - a.weight,
 };
@@ -2074,11 +1801,13 @@ function positionRows() {
   const rows = Object.keys(cfg).map(sym => {
     const ex = bySymbol[sym] || empty;
     const c = cfg[sym];
+    const putWeight = putWeightOf(sym);
     return {
       symbol: sym, ...ex,
       core: !!c.core,
       min: c.min, max: c.max,
-      status: positionStatus(ex.weight, c),
+      putWeight,
+      status: coreStatus(ex.weight, c, putWeight),
       held: !!bySymbol[sym],
       elsewhere: !bySymbol[sym] && universe.has(sym),
     };
@@ -2096,11 +1825,15 @@ function renderCorePositions(scopeLabel) {
   updateSortIndicators("core-body", coreSort);
 
   const alerts = rows.filter(r => r.status === "over" || r.status === "under");
+  const filled = rows.filter(r => r.status === "putfilled").length;
   const coreCount = rows.filter(r => r.core).length;
-  $("core-note").textContent =
-    `${coreCount} 个核心持仓 · ${rows.length} 条规则 · `
-    + (alerts.length ? `${alerts.length} 项需要调整` : "全部在区间内")
-    + ` · 口径 ${scopeLabel || "当前账号"}（总净值 ${fmtMoney(totalNav)}）`;
+  $("core-note").textContent = [
+    `${coreCount} 个核心持仓`,
+    `${rows.length} 条规则`,
+    alerts.length ? `${alerts.length} 项需要调整` : filled ? "" : "全部在区间内",
+    filled ? `${filled} 只欠配但卖 put 已折过上限` : "",
+    `口径 ${scopeLabel || "当前账号"}（总净值 ${fmtMoney(totalNav)}）`,
+  ].filter(Boolean).join(" · ");
 
   const tbody = $("core-body");
   tbody.innerHTML = "";
@@ -2126,6 +1859,11 @@ function renderCorePositions(scopeLabel) {
     let verdict = '<span class="muted">未设区间</span>';
     if (r.status === "over") {
       verdict = `<span class="tag tag-over">超上限 +${((r.weight - hi) * 100).toFixed(1)}pp</span>`;
+    } else if (r.status === "putfilled") {
+      verdict = `<span class="tag tag-short" title="${esc(
+        `按投入资本是欠配 −${((lo - r.weight) * 100).toFixed(1)}pp；但卖 put 按 delta 已折净值的 `
+        + `${fmtPct(r.putWeight, 1)}，加上现有仓位超过了上限 ${fmtPct(hi, 1)}，不算可以加仓`)}">`
+        + `卖 put 已折 ${fmtPct(r.putWeight, 1)}</span>`;
     } else if (r.status === "under") {
       verdict = `<span class="tag tag-under">欠配 −${((lo - r.weight) * 100).toFixed(1)}pp</span>`;
     } else if (r.status === "ok") {
@@ -2166,7 +1904,8 @@ function tileFlag(symbol) {
   if (!cfg) return { core: false, status: null };
   const row = currentExposures().bySymbol[symbol];
   const weight = row ? row.weight : 0;
-  const status = positionStatus(weight, cfg);
+  const putWeight = putWeightOf(symbol);
+  const status = coreStatus(weight, cfg, putWeight);
   const scope = currentDataRef.selected === "ALL" ? "全账户合并" : "本账号";
   const parts = [cfg.core ? "核心持仓" : "已设区间", `${scope}敞口占比 ${fmtPct(weight, 1)}`];
   if (cfg.min != null || cfg.max != null) {
@@ -2175,6 +1914,8 @@ function tileFlag(symbol) {
       : `目标区间 ${fmtPct(cfg.min, 1)} – ${fmtPct(cfg.max, 1)}`);
   }
   if (status === "over" || status === "under") parts.push(POS_STATUS_LABEL[status]);
+  // No badge: the tile is not under-weight in any sense that invites adding.
+  if (status === "putfilled") parts.push(`卖 put 按 delta 已折 ${fmtPct(putWeight, 1)}，不算欠配`);
   return {
     core: !!cfg.core,
     status,

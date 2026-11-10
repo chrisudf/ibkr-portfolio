@@ -12,6 +12,8 @@
   <script src="/static/js/f13.js" defer></script>
   <!-- Risk gate: same arrangement — after dashboard.js, whose helpers it uses. -->
   <script src="/static/js/risk.js" defer></script>
+  <!-- Delta exposure: likewise. -->
+  <script src="/static/js/delta.js" defer></script>
 </head>
 <body>
   <header class="topbar">
@@ -192,10 +194,60 @@
           <span class="panel-note">方块面积 = 持仓市值 · 颜色 = 浮动盈亏</span>
         </div>
         <div id="treemap" class="treemap"></div>
-        <div class="margin-foot">白圈 = 核心持仓 · <b class="down">▲</b> 超上限 · <b class="amber">▼</b> 欠配。
+        <div class="margin-foot">白圈 = 核心持仓 · <b class="down">▲</b> 超上限 · <b class="amber">▼</b> 欠配（卖 put 已折过上限的不标）。
           角标判定的是<b>当前账号</b>的敞口，跟方块同一本账；但方块面积只是正股市值，
           角标算的是正股 + 期权多头，所以主要靠 call 持有的标的可能小方块挂超上限角标，hover 看两个数。
           没有正股的标的不在地图上，看下面那张表。</div>
+      </section>
+
+      <!-- Delta exposure: every position as the shares it moves like, sold puts included -->
+      <section class="panel" id="delta-panel" hidden>
+        <div class="panel-head">
+          <h2 class="risk-title">
+            <button id="delta-toggle" class="risk-toggle" type="button"
+                    aria-expanded="true" aria-controls="delta-body" title="收起 / 展开">
+              <span class="risk-chevron" aria-hidden="true">▾</span>Delta 敞口
+            </button>
+          </h2>
+          <span class="panel-note" id="delta-note"></span>
+        </div>
+        <!-- Folded, one line stays: the total, its multiple of NAV, a 1% drop. -->
+        <div class="risk-summary" id="delta-summary" hidden></div>
+        <div id="delta-body">
+          <div class="delta-hero" id="delta-hero"></div>
+          <div class="delta-warn" id="delta-warn" hidden></div>
+          <div class="table-wrap">
+            <table class="holdings delta-table">
+              <thead>
+                <tr>
+                  <th>标的</th>
+                  <th class="num">收盘价</th>
+                  <th class="num">正股</th>
+                  <th class="num">卖 put</th>
+                  <th class="num">其他期权</th>
+                  <th class="num">合计 Δ 股数</th>
+                  <th class="num">Delta 市值</th>
+                  <th class="num">占净值</th>
+                  <th class="delta-bar-cell"><span class="delta-key"><i class="delta-dot stock"></i>正股
+                    <i class="delta-dot shortPut"></i>卖 put <i class="delta-dot other"></i>其他期权</span></th>
+                </tr>
+              </thead>
+              <tbody id="delta-rows"></tbody>
+            </table>
+          </div>
+          <div class="margin-foot">把每个持仓折成「跟着涨跌的股数」：<b>Delta 股数</b> = 正股股数 + 每张合约的 delta × 张数 × 合约乘数，
+            <b>Delta 市值</b> = Delta 股数 × 收盘价。<b>卖 put 的 delta 是正的</b> —— 跌的时候它跟正股一起亏，越价内越接近一张顶 100 股；
+            「核心持仓与仓位区间」按投入资本算，只卖 put 的标的在那里是 0%，在这里按 delta 算进来。
+            delta 用 Black-Scholes，隐含波动率从每张合约自己的收盘价反推（利率按 4%），崩盘日抬高的波动率已经在里面；
+            没算分红和美式提前行权，深度价内的 put 会少算一点（对过美式二叉树：多数差 0.01，期限长的深度价内 put 差到 0.05，合计约少 2%）。
+            正股价：有账户持有正股的用 IBKR 报表里的收盘价；只有期权的标的（价格旁标 <span class="delta-src">Y</span>）从 Yahoo 取<b>报表同一天</b>的收盘价，
+            不用之后的价格 —— 期权价是那天的，正股价也得是那天的。只把代码发给 Yahoo，不带数量和账户。
+            「每跌 1%」是线性估算；卖 put 越跌 delta 越大，跌得多时实际亏得比线性多，
+            「全线跌 10%」按原隐含波动率把每张合约重算了一遍，但真跌的时候隐含波动率通常会涨，所以仍是下界。
+            杠杆 ETF 按 ETF 自己的价格算，没再乘杠杆倍数；BOXX / SGOV 当现金，不计。点标的展开每张合约。
+            股数显示到 0.1 股，Delta 市值用的是没取整的股数，拿表里的股数手算会差一点；鼠标停在 Delta 市值上看精确的乘式。
+            点标题可以收起，收起后留一行合计（收起状态记在当前浏览器）。</div>
+        </div>
       </section>
 
       <!-- Core holdings vs caps -->
@@ -223,7 +275,10 @@
           期权多头按<b>市值</b>而不是名义计入（LEAPS call 按 strike×100 会虚报成几倍的仓位）；
           卖方期权两边都不计 —— 卖 put 本身没投入资本（担保金已经算在现金里），
           卖 call 压的是上面已经算过的正股的上涨空间。所以<b>只卖 put 的标的在这里是 0%</b>，
-          那是定义本身，不是漏算：被行权风险是另一个问题，「保证金占用」和「卖方到期日历」两张表管它。
+          那是定义本身，不是漏算：被行权风险是另一个问题，风险闸门（卖 put 名义、组合保证金线、到期周 vs 现金）和「卖方到期日历」管它；
+          把卖 put 按 delta 折成正股的敞口，看上面的「Delta 敞口」。
+          区间照样按投入资本判，只有一个例外：<b>欠配的标的，如果卖 put 按 delta 折出的敞口加上现有仓位已经超过区间上限</b>，
+          不再标欠配，改标「卖 put 已折 X%」—— 卖 put 多半是收租、不打算接股，所以不算进投入资本，但那也不是还能加仓的意思。
           分母是<b>当前账号</b>的总净值，切换账号这一列的数字会跟着变；「总账户」页签下算的是合并后的账。
           区间规则本身是<b>全局共享</b>的一套，同一个 5% – 10% 分别套在每本账上 ——
           所以一个标的只在另一个账号里持有时，这里会显示 0% 并打「本账号无持仓」。
@@ -334,45 +389,8 @@
             <tbody id="expiry-body"></tbody>
           </table>
         </div>
-        <div class="margin-foot">只列卖出（空头）合约，按到期所在周分组。ITM 按当前正股价判定，
-          无报价的合约计入「价?」。权利金负债 = 平仓需付的当前市值；卖put名义 = 全部被行权需接货的资金。</div>
-      </section>
-
-      <!-- Margin usage -->
-      <section class="panel" id="margin-panel" hidden>
-        <div class="panel-head">
-          <h2>保证金占用</h2>
-          <span class="panel-note" id="margin-note"></span>
-        </div>
-        <div class="margin-hero">
-          <div>
-            <div class="margin-hero-label">Margin 占用</div>
-            <div class="margin-hero-pct"><span id="margin-pct">—</span><small>占整个账户</small></div>
-          </div>
-          <div class="margin-hero-amount" id="margin-amount">$0</div>
-        </div>
-        <div class="margin-gauge" id="margin-gauge"></div>
-        <div class="margin-gauge-note" id="margin-gauge-note"></div>
-        <div class="margin-basis" id="margin-basis"></div>
-        <div class="margin-stress" id="margin-stress"></div>
-        <div class="table-wrap" style="margin-top:16px">
-          <table class="holdings">
-            <thead>
-              <tr>
-                <th>标的</th><th>卖出合约</th>
-                <th class="num">正股价</th>
-                <th class="num">名义抵押</th>
-                <th class="num">权利金负债</th>
-                <th class="num">保证金占用</th>
-                <th class="num">占比</th>
-              </tr>
-            </thead>
-            <tbody id="margin-body"></tbody>
-          </table>
-        </div>
-        <div class="margin-foot" id="margin-foot"></div>
-        <div class="margin-foot">垂直价差按裸卖估算（Reg-T 下价差风险以最大价差损失封顶），
-          当前持仓无价差组合；跨账户不共享抵押品，合并视图为各账户分别计算后相加。</div>
+        <div class="margin-foot">只列卖出（空头）合约，按到期所在周分组。ITM 按报表当天的正股收盘价判定
+          （只有期权的标的用「Delta 敞口」从 Yahoo 取的收盘价），取不到价的合约计入「价?」。权利金负债 = 平仓需付的当前市值；卖put名义 = 全部被行权需接货的资金。</div>
       </section>
 
       <!-- Dividends -->

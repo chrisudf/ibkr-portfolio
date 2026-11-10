@@ -4,8 +4,8 @@
 // 和两个纯函数原样抽出来执行，改名/改签名时抽取直接报错。
 //
 // 锁这几件事：
-//   1. 「状态」▼（默认）：超上限 → 欠配 → 区间内 → 未设区间，同一状态核心优先、再按占比；
-//      ▲ 整个倒过来；
+//   1. 「状态」▼（默认）：超上限 → 卖 put 已折过上限 → 欠配 → 区间内 → 未设区间，
+//      同一状态核心优先、再按占比；▲ 整个倒过来；
 //   2. 「占总资产」▼ 从高到低，▲ 从低到高；
 //   3. 占比相同按代码 A→Z，正反向都一样，刷新不会乱跳；
 //   4. 浏览器里存的排序读回来时，看不懂的一律回到默认；
@@ -67,6 +67,47 @@ test("状态 ▼：要调整的排前面，同一状态核心优先、再按占�
   assert.deepEqual(order("status", "asc"), [...desc].reverse());
   const mixed = [row("A", 0.05, null), row("B", 0.30, "over"), row("C", 0.20, "ok"), row("D", 0.01, "under")];
   assert.deepEqual(order("status", "desc", mixed), ["B", "D", "C", "A"]);   // 未设区间排最后
+});
+
+test("「卖 put 已折过上限」排在超上限之后、欠配之前", () => {
+  const rows = [row("A", 0.05, null), row("B", 0.30, "over"), row("C", 0.20, "ok"),
+                row("D", 0.01, "under"), row("E", 0, "putfilled")];
+  assert.deepEqual(order("status", "desc", rows), ["B", "E", "D", "C", "A"]);
+  assert.deepEqual(order("status", "asc", rows), ["A", "C", "D", "E", "B"]);
+});
+
+// --- 欠配的保护：区间按投入资本判，卖 put 折出的 delta 已经超过上限时不标欠配 ----------
+
+const G = new Function([
+  extractConst(dash, /const BOUND_FLOOR = [^;]+;/, "BOUND_FLOOR"),
+  extractConst(dash, /const resolveBounds = \(cfg\) => \[[\s\S]*?\];/, "resolveBounds"),
+  extract(dash, "positionStatus"),
+  extract(dash, "coreStatus"),
+  "return { coreStatus };",
+].join("\n"))();
+const band = (min, max) => ({ min, max });
+
+test("欠配 + 卖 put 的 delta 加上现有仓位超过上限 → 不标欠配", () => {
+  assert.equal(G.coreStatus(0, band(0.05, 0.10), 0.40), "putfilled");       // 0% 资本，put 折 40%
+  assert.equal(G.coreStatus(0.03, band(0.05, 0.10), 0.08), "putfilled");    // 3% + 8% > 10%
+});
+
+test("加起来没超过上限、没有卖 put：照旧是欠配", () => {
+  assert.equal(G.coreStatus(0.02, band(0.05, 0.10), 0.07), "under");        // 2% + 7% 还在上限内
+  assert.equal(G.coreStatus(0, band(0.05, 0.5), 0.5), "under");             // 正好压线不算超（二进制精确的数）
+  assert.equal(G.coreStatus(0.02, band(0.05, 0.10), 0), "under");
+});
+
+test("只有欠配会改：超上限、区间内、没设区间都照旧", () => {
+  assert.equal(G.coreStatus(0.30, band(0.05, 0.10), 0.50), "over");
+  assert.equal(G.coreStatus(0.07, band(0.05, 0.10), 0.50), "ok");
+  assert.equal(G.coreStatus(0.07, band(null, null), 0.50), null);
+  assert.equal(G.coreStatus(0.07, null, 0.50), null);
+});
+
+test("上限留空按 100% 算：卖 put 要折过整个净值才算", () => {
+  assert.equal(G.coreStatus(0, band(0.05, null), 0.60), "under");
+  assert.equal(G.coreStatus(0, band(0.05, null), 1.20), "putfilled");
 });
 
 test("占总资产 ▼ 从高到低、▲ 从低到高，状态和核心都不管", () => {

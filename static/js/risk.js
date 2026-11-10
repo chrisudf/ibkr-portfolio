@@ -162,7 +162,7 @@ function riskBook(data, cfg, priceBook) {
     }
     if (o.quantity < 0) {
       // A short whose strike or right did not parse could be a put of any
-      // size. Leave it out of the sums and count it, as the margin panel does.
+      // size. Leave it out of the sums and count it, as the delta panel does.
       if (!(o.strike > 0) || (o.right !== "P" && o.right !== "C")) {
         unparsed += qty;
         continue;
