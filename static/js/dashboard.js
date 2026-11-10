@@ -616,7 +616,10 @@ function render(data) {
     const ranBy = sync.last_run_trigger === "button"
       ? "手动刷新" : `自动同步(${cadence})`;
     syncLabel = ran
-      ? `${ranBy} ${ran.slice(5, 16).replace("T", " ")}Z ${sync.ok ? "✓" : "✗"}`
+      // ⏳ for a failed pass whose reference code is being fetched again: it
+      // is waiting on IBKR, not broken, and may land with nobody pressing.
+      ? `${ranBy} ${ran.slice(5, 16).replace("T", " ")}Z ${sync.ok ? "✓"
+        : (syncWaiting(sync) ? "⏳ 接着取" : "✗")}`
       : `自动同步(${cadence}) 待首跑`;
   }
   const line = $("account-line");
@@ -2803,6 +2806,11 @@ function reportRefreshOutcome(last) {
   } else if (ok.length && failed.length) {
     showToast("warn", "部分成功",
       `成功: ${okAccts.join(", ")} / 失败: ${failed.map(f => `${f.tag} (${f.error})`).join("; ")}`);
+  } else if (failed.length && failed.every(r => r.pending)) {
+    // Not a dead end: IBKR is still generating a statement that is already
+    // paid for, and the server kept its reference code to fetch it later.
+    // The error text says when; a red 同步失败 would say the opposite.
+    showToast("warn", "IBKR 还在生成", failed[0].error || "已保留 reference code，稍后接着取", 9000);
   } else {
     showToast("error", "同步失败", (failed[0] || {}).error || "未知错误", 9000);
   }
@@ -2830,7 +2838,8 @@ async function pollRefreshStatus() {
   if (st.manual_allowed === false) lockRefreshButton(REFRESH_LOCK_MSG);
   if (st.in_progress) {
     if (trackedRunId === null) trackedRunId = st.run_id;
-    const who = st.trigger === "auto" ? "自动同步" : "同步中";
+    const who = st.trigger === "auto" ? "自动同步"
+      : st.trigger === "resume" ? "接着取" : "同步中";
     setRefreshBusy(true, `${who} ${fmtElapsed(st.elapsed_sec)}`);
     noteRefreshInFlight(true, st.trigger, st.elapsed_sec);
     refreshPollTimer = setTimeout(pollRefreshStatus, 3000);
@@ -3055,6 +3064,18 @@ function oldestPeriodEnd(period) {
   return ends.reduce((a, b) => (key(a) <= key(b) ? a : b));
 }
 
+// A failed pass whose every failing query kept its reference code, and the
+// server still holds at least one live: waiting on IBKR rather than broken.
+// The statement is paid for and is fetched again every half hour (GetStatement,
+// no quota), so it may land with nobody pressing anything. Both halves are
+// needed: `waiting` is the last pass's verdict, `pending` is whether the codes
+// are still alive now — one that aged out or died turns this back into a
+// plain failure.
+function syncWaiting(sync) {
+  return !!(sync && sync.ok === false && sync.waiting === true
+    && Array.isArray(sync.pending) && sync.pending.length > 0);
+}
+
 function renderStaleBanner(data = currentDataRef.data) {
   const el = $("stale-banner");
   if (!el) return;
@@ -3088,7 +3109,11 @@ function renderStaleBanner(data = currentDataRef.data) {
   // screen are three trading days old" stays true while a pass runs, and it is
   // the half of the banner a running sync does not answer.
   const running = refreshInFlight.active;
-  const syncFailing = !running && !!(sync && sync.ok === false) && (
+  // Waiting on a kept reference code (syncWaiting): drawn like a pass in
+  // flight, not red. It ends by itself the moment the code is fetched, dies or
+  // ages out.
+  const held = !running && syncWaiting(sync);
+  const syncFailing = !running && !held && !!(sync && sync.ok === false) && (
     sync.last_run_trigger !== "button"
     || sinceSuccess === null
     || sinceSuccess >= syncGraceMs(sync.mode)
@@ -3102,7 +3127,8 @@ function renderStaleBanner(data = currentDataRef.data) {
     // Name the trigger for the same reason the header line does: a pass the
     // scheduler started is evidence the unattended pipe is alive, and calling
     // a button press 自动同步 would forge exactly that evidence.
-    const who = refreshInFlight.trigger === "auto" ? "自动同步" : "手动同步";
+    const who = refreshInFlight.trigger === "auto" ? "自动同步"
+      : refreshInFlight.trigger === "resume" ? "接着取" : "手动同步";
     const ran = fmtElapsed(refreshInFlight.elapsedSec);
     parts.push(`${who}进行中${ran ? ` · 已运行 ${ran}` : ""}`);
   }
@@ -3111,16 +3137,22 @@ function renderStaleBanner(data = currentDataRef.data) {
       ? `同步失败中 · 最近一次成功 ${fmtSince(sinceSuccess)}`
       : "同步失败中 · 尚无成功记录");
   }
+  if (held) {
+    // No time when the scheduler is off: then only the button picks it up.
+    const next = sync.pending.map(p => p.next_try_at || "").filter(Boolean).sort()[0];
+    parts.push("报表还没取到 · 已保留 reference code，"
+      + `${next ? `${next.slice(11, 16)}Z 接着取` : "下次刷新时接着取"}（不花配额）`);
+  }
   if (!parts.length) {
     el.hidden = true;
     return;
   }
   el.hidden = false;
   el.className = "stale-banner"
-    + (syncFailing ? " bad" : (running ? " busy" : ""));
+    + (syncFailing ? " bad" : (running || held ? " busy" : ""));
   // ⟳ only when waiting is the whole message. With a stale-data line next to
   // it there is still something wrong, and the icon should not soften that.
-  const icon = running && parts.length === 1 ? "⟳" : "⚠";
+  const icon = (running || held) && parts.length === 1 ? "⟳" : "⚠";
   // textContent, not innerHTML: detail carries IBKR's own error strings.
   el.textContent = `${icon} ${parts.join("　·　")}`;
   // While a pass runs, detail describes the PREVIOUS one. Keeping it is worth

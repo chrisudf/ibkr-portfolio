@@ -370,6 +370,8 @@ def client(tmp_path, monkeypatch):
 
     monkeypatch.setattr(app_mod, "UPLOAD_DIR", tmp_path)
     monkeypatch.setattr(app_mod, "PROFIT_TARGETS_FILE", tmp_path / ".profit_targets.json")
+    # /api/portfolio reads (and prunes by rewriting) the kept-code file.
+    monkeypatch.setattr(app_mod, "PENDING_FILE", tmp_path / ".flex_pending.json")
     return app_mod.app.test_client()
 
 
