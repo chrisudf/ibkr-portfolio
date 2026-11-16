@@ -26,10 +26,14 @@
 uploads 是 docker 具名卷 `app_data`，挂在容器的 `/app/uploads`：
 
 ```bash
-for f in U17456181.json U17456181.snapshots.jsonl          U22846783.json U22846783.snapshots.jsonl .position_settings.json; do
-  ssh deploy@167.71.193.42     "cd /opt/ibkr-portfolio/deploy && docker compose exec -T app cat /app/uploads/$f"     > "uploads/$f"
-done
+bash scripts/pull_from_droplet.sh
 ```
+
+拉两个账户的 JSON + snapshots、`.position_settings.json`、`.risk_settings.json`，覆盖前把本地旧文件
+备份到 `uploads/.backup-before-pull/`；某个文件拉失败（ssh 不通、文件不存在）就保留本地那份。
+
+**droplet 上没有 `deploy` 用户**，只能用 `root@167.71.193.42`（脚本默认值；要换主机就设
+`DROPLET_HOST=user@host`）。下面「一次性配置」里的 `deploy@` 是给新建 droplet 的建议，不是现状。
 
 `exec -T cat` 而不是 `docker compose cp`：不在 droplet 上落中间文件，也就不会忘了删。
 
