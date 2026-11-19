@@ -684,6 +684,30 @@ function render(data) {
   kpiUnr.classList.toggle("down", unr < 0);
   $("kpi-realized").textContent = `已实现 ${fmtMoney(performance.realized_total)}`;
 
+  // YTD P&L (flow-stripped). Hidden tile, not a fake $0, when there's no
+  // usable NAV series (legacy Activity Statement uploads).
+  const ytd = ytdStats(data.nav_history, data.cash_flows);
+  const ytdCard = $("kpi-ytd-card");
+  ytdCard.hidden = !ytd;
+  if (ytd) {
+    const signed = (v) => `${v >= 0 ? "+" : "−"}${fmtMoney(Math.abs(v))}`;
+    const kpiYtd = $("kpi-ytd");
+    kpiYtd.textContent = signed(ytd.pnl);
+    kpiYtd.classList.toggle("up", ytd.pnl >= 0);
+    kpiYtd.classList.toggle("down", ytd.pnl < 0);
+    $("kpi-ytd-label").textContent = ytd.partial
+      ? `今年盈亏（自 ${ytd.baseDate.slice(5)}）` : "今年盈亏 YTD";
+    const parts = [];
+    if (ytd.ret != null) parts.push(`${ytd.ret >= 0 ? "+" : ""}${fmtPct(ytd.ret, 1)}`);
+    if (Math.abs(ytd.netFlow) >= 1) {
+      parts.push(`已扣净${ytd.netFlow > 0 ? "入" : "出"}金 ${fmtMoney(Math.abs(ytd.netFlow))}`);
+    }
+    $("kpi-ytd-sub").textContent = parts.join(" · ") || "无出入金";
+    ytdCard.title = `${ytd.baseDate} 净值 ${fmtMoney(ytd.baseNav)} → ${ytd.lastDate}，`
+      + `扣除期间出入金 ${fmtMoney(ytd.netFlow)}`
+      + (ytd.partial ? "（今年才开始有净值，从首个注资日起算）" : "");
+  }
+
   // NAV history (equity curve + drawdown/vol stats)
   renderNavHistory(data);
 
@@ -1068,6 +1092,41 @@ function positionTag(r) {
 function netFlowBetween(flows, afterDate, upToDate) {
   return (flows || []).reduce(
     (s, f) => (f.date > afterDate && f.date <= upToDate ? s + (f.amount || 0) : s), 0);
+}
+
+// Year-to-date P&L: latest NAV − last NAV of the previous year − deposits and
+// withdrawals in between. The baseline is the last funded point dated before
+// Jan 1 of the latest point's year (12-31, or the last trading day before it).
+// An account funded this year has no such point; it then counts from its
+// first funded day and says so (partial), rather than calling the funding a
+// gain. The return is Modified Dietz — pnl ÷ (base NAV + each flow weighted by
+// the share of the window it was invested) — not the TWR chain: TWR can carry
+// the opposite sign to the dollar figure (U228 2026: −$2.3k next to TWR +2.7%,
+// gains made on a small base, losses after the deposits landed), which on a
+// P&L tile reads as a bug.
+function ytdStats(navHistory, flows) {
+  const series = fundedSeries(navHistory);
+  if (series.length < 2) return null;
+  const last = series[series.length - 1];
+  const jan1 = `${last.date.slice(0, 4)}-01-01`;
+  let bi = -1;
+  for (let i = 0; i < series.length && series[i].date < jan1; i++) bi = i;
+  const partial = bi < 0;
+  if (partial) bi = 0;
+  const base = series[bi];
+  if (base === last) return null;
+  const netFlow = netFlowBetween(flows, base.date, last.date);
+  const pnl = last.total - base.total - netFlow;
+  const t0 = Date.parse(base.date), span = Date.parse(last.date) - t0;
+  const capital = base.total + (flows || []).reduce((s, f) =>
+    (f.date > base.date && f.date <= last.date
+      ? s + (f.amount || 0) * (1 - (Date.parse(f.date) - t0) / span) : s), 0);
+  return {
+    pnl,
+    ret: capital > 0 ? pnl / capital : null,
+    netFlow, baseDate: base.date, baseNav: base.total,
+    lastDate: last.date, partial,
+  };
 }
 
 // The raw delta stays because it is what the account balance really did, but on
