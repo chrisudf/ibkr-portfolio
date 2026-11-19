@@ -19,9 +19,9 @@ function extract(name) {
 }
 const constSrc = src.match(/const FUNDED_MIN_RATIO = [^;]+;/)[0];
 
-const { ytdStats } = new Function(
-  [constSrc, ...["fundedSeries", "navStats", "netFlowBetween", "ytdStats"].map(extract)]
-    .join("\n") + "\nreturn { ytdStats };")();
+const { ytdStats, ytdMerged } = new Function(
+  [constSrc, ...["fundedSeries", "netFlowBetween", "ytdStats", "ytdMerged"].map(extract)]
+    .join("\n") + "\nreturn { ytdStats, ytdMerged };")();
 
 const hist = [
   { date: "2025-12-29", total: 100000 },
@@ -72,6 +72,38 @@ test("今年才注资的账户从首个注资日起算，注资不算盈利", ()
   assert.equal(y.partial, true);
   assert.equal(y.baseDate, "2026-03-02");
   assert.equal(y.pnl, 2000);
+});
+
+test("今年涨了 100 倍以上，去年的基准也不能被 fundedSeries 的 1% 线裁掉", () => {
+  const h = [
+    { date: "2025-12-31", total: 500 },
+    { date: "2026-02-02", total: 800 },
+    { date: "2026-03-02", total: 100800 },
+    { date: "2026-11-16", total: 101000 },
+  ];
+  const y = ytdStats(h, [{ date: "2026-03-01", amount: 100000 }]);
+  assert.equal(y.partial, false);
+  assert.equal(y.baseDate, "2025-12-31");
+  assert.equal(y.pnl, 101000 - 500 - 100000);
+});
+
+test("总账户 = 各户相加；新开户不会抹掉老账户的去年基准", () => {
+  const old = { nav_history: hist, cash_flows: [] };
+  const fresh = {
+    nav_history: [
+      { date: "2026-06-01", total: 20000 },
+      { date: "2026-11-16", total: 21000 },
+    ],
+    cash_flows: [{ date: "2026-05-29", amount: 20000 }],
+  };
+  const a = ytdStats(old.nav_history, old.cash_flows);
+  const b = ytdStats(fresh.nav_history, fresh.cash_flows);
+  const m = ytdMerged([old, fresh]);
+  assert.equal(m.pnl, a.pnl + b.pnl);
+  assert.equal(m.baseDate, "2025-12-31");
+  assert.equal(m.partial, false);
+  assert.ok(Math.abs(m.ret - (a.pnl + b.pnl) / (a.capital + b.capital)) < 1e-12);
+  assert.equal(ytdMerged([old, { nav_history: [], cash_flows: [] }]), null);
 });
 
 test("没有净值序列时返回 null", () => {
