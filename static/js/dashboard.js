@@ -704,10 +704,13 @@ function render(data) {
     if (Math.abs(ytd.netFlow) >= 1) {
       parts.push(`已扣净${ytd.netFlow > 0 ? "入" : "出"}金 ${fmtMoney(Math.abs(ytd.netFlow))}`);
     }
+    if (ytd.staleUntil) parts.push(`截至 ${ytd.lastDate.slice(5)}`);
     $("kpi-ytd-sub").textContent = parts.join(" · ") || "无出入金";
     ytdCard.title = `${ytd.baseDate} 净值 ${fmtMoney(ytd.baseNav)} → ${ytd.lastDate}，`
       + `扣除期间出入金 ${fmtMoney(ytd.netFlow)}`
-      + (ytd.partial ? "（今年才开始有净值，从首个注资日起算）" : "");
+      + (ytd.partial ? "（今年才开始有净值，从首个注资日起算）" : "")
+      + (ytd.staleUntil ? `。两户数据日期不一致（较新的到 ${ytd.staleUntil}），`
+        + `总账户按两户共同的最后一天 ${ytd.lastDate} 算` : "");
   }
 
   // NAV history (equity curve + drawdown/vol stats)
@@ -1109,8 +1112,8 @@ function netFlowBetween(flows, afterDate, upToDate) {
 // opposite sign to the dollar figure (U228 2026: −$2.3k next to TWR +2.7%,
 // gains made on a small base, losses after the deposits landed), which on a
 // P&L tile reads as a bug.
-function ytdStats(navHistory, flows) {
-  const pos = (navHistory || []).filter(p => p.total > 0);
+function ytdStats(navHistory, flows, upTo = "") {
+  const pos = (navHistory || []).filter(p => p.total > 0 && (!upTo || p.date <= upTo));
   if (pos.length < 2) return null;
   const last = pos[pos.length - 1];
   const jan1 = `${last.date.slice(0, 4)}-01-01`;
@@ -1141,16 +1144,26 @@ function ytdStats(navHistory, flows) {
 // every account is: an account that didn't exist last year has nothing to
 // count before it opened. Any account without a NAV series → null, the same
 // stance mergeAccounts takes on the merged curve.
+// Every account is cut at the SAME end date — the earliest of their latest
+// points, as mergeAccounts truncates the curve — so one account refreshed on
+// 11-18 and another stuck at 11-12 don't get added as if they were the same
+// day. The tile flags the cut (staleUntil) instead of silently going stale.
 function ytdMerged(accounts) {
-  const ys = (accounts || []).map(a => ytdStats(a.nav_history, a.cash_flows));
-  if (!ys.length || ys.some(y => !y)) return null;
+  const latest = (accounts || []).map(a => ytdStats(a.nav_history, a.cash_flows));
+  if (!latest.length || latest.some(y => !y)) return null;
+  const common = latest.map(y => y.lastDate).reduce((a, b) => (a < b ? a : b));
+  const newest = latest.map(y => y.lastDate).reduce((a, b) => (a > b ? a : b));
+  const ys = (accounts || []).map(a => ytdStats(a.nav_history, a.cash_flows, common));
+  if (ys.some(y => !y)) return null;
   const sum = (k) => ys.reduce((s, y) => s + y[k], 0);
   const pnl = sum("pnl"), capital = sum("capital");
   return {
     pnl, capital, ret: capital > 0 ? pnl / capital : null,
     netFlow: sum("netFlow"), baseNav: sum("baseNav"),
     baseDate: ys.map(y => y.baseDate).reduce((a, b) => (a < b ? a : b)),
-    lastDate: ys.map(y => y.lastDate).reduce((a, b) => (a > b ? a : b)),
+    lastDate: common,
+    // Set only when the accounts disagree: the newest date we cut back from.
+    staleUntil: newest > common ? newest : "",
     partial: ys.every(y => y.partial),
   };
 }

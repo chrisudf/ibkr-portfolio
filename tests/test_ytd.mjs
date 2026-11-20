@@ -104,6 +104,25 @@ test("总账户 = 各户相加；新开户不会抹掉老账户的去年基准",
   assert.equal(m.partial, false);
   assert.ok(Math.abs(m.ret - (a.pnl + b.pnl) / (a.capital + b.capital)) < 1e-12);
   assert.equal(ytdMerged([old, { nav_history: [], cash_flows: [] }]), null);
+  assert.equal(m.staleUntil, "");
+});
+
+test("两户数据日期不一致时，总账户截到共同的最后一天", () => {
+  const a = { nav_history: hist, cash_flows: [] };          // 到 11-16
+  const b = {
+    nav_history: [
+      { date: "2025-12-31", total: 50000 },
+      { date: "2026-06-01", total: 55000 },
+      { date: "2026-11-16", total: 60000 },
+      { date: "2026-11-18", total: 70000 },                 // 只有 B 有
+    ],
+    cash_flows: [{ date: "2026-11-17", amount: 5000 }],     // 截断日之后，不扣
+  };
+  const m = ytdMerged([a, b]);
+  assert.equal(m.lastDate, "2026-11-16");
+  assert.equal(m.staleUntil, "2026-11-18");
+  assert.equal(m.pnl, (140000 - 100000) + (60000 - 50000));
+  assert.equal(m.netFlow, 0);
 });
 
 test("没有净值序列时返回 null", () => {
