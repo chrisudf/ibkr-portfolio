@@ -684,6 +684,35 @@ function render(data) {
   kpiUnr.classList.toggle("down", unr < 0);
   $("kpi-realized").textContent = `已实现 ${fmtMoney(performance.realized_total)}`;
 
+  // YTD P&L (flow-stripped). Hidden tile, not a fake $0, when there's no
+  // usable NAV series (legacy Activity Statement uploads).
+  const ytd = acct === "ALL"
+    ? ytdMerged(Object.values(currentDataRef.allAccounts || {}))
+    : ytdStats(data.nav_history, data.cash_flows);
+  const ytdCard = $("kpi-ytd-card");
+  ytdCard.hidden = !ytd;
+  if (ytd) {
+    const signed = (v) => `${v >= 0 ? "+" : "−"}${fmtMoney(Math.abs(v))}`;
+    const kpiYtd = $("kpi-ytd");
+    kpiYtd.textContent = signed(ytd.pnl);
+    kpiYtd.classList.toggle("up", ytd.pnl >= 0);
+    kpiYtd.classList.toggle("down", ytd.pnl < 0);
+    $("kpi-ytd-label").textContent = ytd.partial
+      ? `今年盈亏（自 ${ytd.baseDate.slice(5)}）` : "今年盈亏 YTD";
+    const parts = [];
+    if (ytd.ret != null) parts.push(`${ytd.ret >= 0 ? "+" : ""}${fmtPct(ytd.ret, 1)}`);
+    if (Math.abs(ytd.netFlow) >= 1) {
+      parts.push(`已扣净${ytd.netFlow > 0 ? "入" : "出"}金 ${fmtMoney(Math.abs(ytd.netFlow))}`);
+    }
+    if (ytd.staleUntil) parts.push(`截至 ${ytd.lastDate.slice(5)}`);
+    $("kpi-ytd-sub").textContent = parts.join(" · ") || "无出入金";
+    ytdCard.title = `${ytd.baseDate} 净值 ${fmtMoney(ytd.baseNav)} → ${ytd.lastDate}，`
+      + `扣除期间出入金 ${fmtMoney(ytd.netFlow)}`
+      + (ytd.partial ? "（今年才开始有净值，从首个注资日起算）" : "")
+      + (ytd.staleUntil ? `。两户数据日期不一致（较新的到 ${ytd.staleUntil}），`
+        + `总账户按两户共同的最后一天 ${ytd.lastDate} 算` : "");
+  }
+
   // NAV history (equity curve + drawdown/vol stats)
   renderNavHistory(data);
 
@@ -1068,6 +1097,75 @@ function positionTag(r) {
 function netFlowBetween(flows, afterDate, upToDate) {
   return (flows || []).reduce(
     (s, f) => (f.date > afterDate && f.date <= upToDate ? s + (f.amount || 0) : s), 0);
+}
+
+// Year-to-date P&L: latest NAV − last NAV of the previous year − deposits and
+// withdrawals in between. The baseline is the last POSITIVE point dated before
+// Jan 1 of the latest point's year (12-31, or the last trading day before it)
+// — read off the raw history, not fundedSeries: that chart filter drops leading
+// points under 1% of the all-time high, so an account that grew 100x this year
+// would lose its real baseline and its Jan-to-funding P&L with it.
+// An account with no positive point last year counts from its first funded
+// day this year and says so (partial), rather than calling the funding a gain.
+// The return is Modified Dietz — pnl ÷ (base NAV + each flow weighted by the
+// share of the window it was invested) — not the TWR chain: TWR can carry the
+// opposite sign to the dollar figure (U228 2026: −$2.3k next to TWR +2.7%,
+// gains made on a small base, losses after the deposits landed), which on a
+// P&L tile reads as a bug.
+function ytdStats(navHistory, flows, upTo = "") {
+  const pos = (navHistory || []).filter(p => p.total > 0 && (!upTo || p.date <= upTo));
+  if (pos.length < 2) return null;
+  const last = pos[pos.length - 1];
+  const jan1 = `${last.date.slice(0, 4)}-01-01`;
+  const prior = pos.filter(p => p.date < jan1);
+  const partial = !prior.length;
+  const base = partial ? fundedSeries(navHistory)[0] : prior[prior.length - 1];
+  if (!base || base.date >= last.date) return null;
+  const netFlow = netFlowBetween(flows, base.date, last.date);
+  const pnl = last.total - base.total - netFlow;
+  const t0 = Date.parse(base.date), span = Date.parse(last.date) - t0;
+  const capital = base.total + (flows || []).reduce((s, f) =>
+    (f.date > base.date && f.date <= last.date
+      ? s + (f.amount || 0) * (1 - (Date.parse(f.date) - t0) / span) : s), 0);
+  return {
+    pnl,
+    ret: capital > 0 ? pnl / capital : null, capital,
+    netFlow, baseDate: base.date, baseNav: base.total,
+    lastDate: last.date, partial,
+  };
+}
+
+// 总账户 YTD = the per-account results added up, NOT ytdStats over the merged
+// NAV curve: that curve only starts once EVERY account reports, so a second
+// account opened this year would strip the older one's 2025 baseline and its
+// Jan-to-opening P&L — the total would stop matching the two single cards.
+// The return pools Modified Dietz capital, so it is the household's dollar-
+// weighted rate, not an average of the two percentages. Partial only when
+// every account is: an account that didn't exist last year has nothing to
+// count before it opened. Any account without a NAV series → null, the same
+// stance mergeAccounts takes on the merged curve.
+// Every account is cut at the SAME end date — the earliest of their latest
+// points, as mergeAccounts truncates the curve — so one account refreshed on
+// 11-18 and another stuck at 11-12 don't get added as if they were the same
+// day. The tile flags the cut (staleUntil) instead of silently going stale.
+function ytdMerged(accounts) {
+  const latest = (accounts || []).map(a => ytdStats(a.nav_history, a.cash_flows));
+  if (!latest.length || latest.some(y => !y)) return null;
+  const common = latest.map(y => y.lastDate).reduce((a, b) => (a < b ? a : b));
+  const newest = latest.map(y => y.lastDate).reduce((a, b) => (a > b ? a : b));
+  const ys = (accounts || []).map(a => ytdStats(a.nav_history, a.cash_flows, common));
+  if (ys.some(y => !y)) return null;
+  const sum = (k) => ys.reduce((s, y) => s + y[k], 0);
+  const pnl = sum("pnl"), capital = sum("capital");
+  return {
+    pnl, capital, ret: capital > 0 ? pnl / capital : null,
+    netFlow: sum("netFlow"), baseNav: sum("baseNav"),
+    baseDate: ys.map(y => y.baseDate).reduce((a, b) => (a < b ? a : b)),
+    lastDate: common,
+    // Set only when the accounts disagree: the newest date we cut back from.
+    staleUntil: newest > common ? newest : "",
+    partial: ys.every(y => y.partial),
+  };
 }
 
 // The raw delta stays because it is what the account balance really did, but on
